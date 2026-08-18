@@ -1,0 +1,34 @@
+[
+  {
+    "unit_id": "text-000",
+    "source_type": "text",
+    "text": "A supplied text unit.",
+    "start_time": null,
+    "end_time": null,
+    "frame_id": null,
+    "frame_path": null,
+    "bbox": null,
+    "confidence": 1.0,
+    "producer": "fixture",
+    "provenance": {"source_uri": null, "source_index": 0, "extraction_method": "fixture", "details": {}},
+    "eligible_for_frozen_g1": true,
+    "selection_score": null,
+    "logits": null
+  },
+  {
+    "unit_id": "visual-000",
+    "source_type": "visual_observation",
+    "text": "A visual-only observation.",
+    "start_time": null,
+    "end_time": null,
+    "frame_id": "frame-001",
+    "frame_path": "frames/frame-001.jpg",
+    "bbox": null,
+    "confidence": 0.8,
+    "producer": "fixture-vlm",
+    "provenance": {"source_uri": "frames/frame-001.jpg", "source_index": 0, "extraction_method": "mock_vlm", "details": {}},
+    "eligible_for_frozen_g1": false,
+    "selection_score": null,
+    "logits": null
+  }
+]

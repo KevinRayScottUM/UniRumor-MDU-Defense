@@ -1,0 +1,16 @@
+{
+  "claim": "The campus library opened a new study hall.",
+  "request_id": "fixture-session",
+  "media_path": "demo_videos/mock.mp4",
+  "transcript_segments": [
+    {"text": "The new study hall opened on Monday.", "start_time": 1.0, "end_time": 3.5},
+    {"text": "Students can enter from the east gate.", "start_time": 4.0, "end_time": 6.0}
+  ],
+  "ocr_observations": [
+    {"text": "NEW STUDY HALL", "frame_id": "frame-001", "bbox": [10, 20, 180, 60], "confidence": 0.96}
+  ],
+  "visual_inputs": [
+    {"frame_id": "frame-001", "frame_path": "frames/frame-001.jpg", "observation": "A building entrance is visible."}
+  ],
+  "metadata": {"fixture": true}
+}

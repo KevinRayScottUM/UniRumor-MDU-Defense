@@ -1,0 +1,11 @@
+profile: local
+implementation: deterministic_mock_only
+backbone: microsoft/deberta-v3-base
+max_units: 24
+max_length: 256
+pooling: max
+fake_label: 0
+real_label: 1
+top_k: 5
+cache_root: cache
+output_root: outputs
