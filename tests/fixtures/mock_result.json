@@ -1,0 +1,70 @@
+{
+  "session_id": "fixture-result",
+  "claim": "The campus library opened a new study hall.",
+  "model_verdict": "fake",
+  "display_verdict": "Fake",
+  "evidence_status": "sufficient",
+  "sample_logits": {"fake": 1.25, "real": 0.25},
+  "probabilities": {"fake": 0.73105857863, "real": 0.26894142137},
+  "all_units": [
+    {
+      "unit_id": "text-000",
+      "source_type": "text",
+      "text": "A stable contract example.",
+      "start_time": null,
+      "end_time": null,
+      "frame_id": null,
+      "frame_path": null,
+      "bbox": null,
+      "confidence": 1.0,
+      "producer": "fixture",
+      "provenance": {
+        "source_uri": null,
+        "source_index": 0,
+        "extraction_method": "fixture",
+        "details": {}
+      },
+      "eligible_for_frozen_g1": true,
+      "selection_score": 0.75,
+      "logits": {"fake": 1.25, "real": 0.25}
+    }
+  ],
+  "top_k_units": [
+    {
+      "unit_id": "text-000",
+      "source_type": "text",
+      "text": "A stable contract example.",
+      "start_time": null,
+      "end_time": null,
+      "frame_id": null,
+      "frame_path": null,
+      "bbox": null,
+      "confidence": 1.0,
+      "producer": "fixture",
+      "provenance": {
+        "source_uri": null,
+        "source_index": 0,
+        "extraction_method": "fixture",
+        "details": {}
+      },
+      "eligible_for_frozen_g1": true,
+      "selection_score": 0.75,
+      "logits": {"fake": 1.25, "real": 0.25}
+    }
+  ],
+  "class_winners": {"fake": "text-000", "real": "text-000"},
+  "pipeline_stages": [
+    {"name": "request", "sequence": 0, "status": "completed", "runtime_ms": 0.0, "detail": "request accepted"},
+    {"name": "session", "sequence": 1, "status": "completed", "runtime_ms": 0.0, "detail": "deterministic session created"},
+    {"name": "asr", "sequence": 2, "status": "completed", "runtime_ms": 0.0, "detail": "1 transcript units"},
+    {"name": "ocr", "sequence": 3, "status": "completed", "runtime_ms": 0.0, "detail": "0 OCR units"},
+    {"name": "visual_retrieval", "sequence": 4, "status": "completed", "runtime_ms": 0.0, "detail": "0 visual candidates"},
+    {"name": "vlm", "sequence": 5, "status": "completed", "runtime_ms": 0.0, "detail": "0 visual observations"},
+    {"name": "runtime_unit_pool", "sequence": 6, "status": "completed", "runtime_ms": 0.0, "detail": "1 total units"},
+    {"name": "mock_g1", "sequence": 7, "status": "completed", "runtime_ms": 0.0, "detail": "1 eligible units evaluated"},
+    {"name": "result", "sequence": 8, "status": "completed", "runtime_ms": 0.0, "detail": "result assembled"}
+  ],
+  "warnings": ["MOCK_NON_SCIENTIFIC_OUTPUT"],
+  "checkpoint_sha256": null,
+  "runtime_ms": 0.0
+}
