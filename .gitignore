@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime cache
+cache/*
+!cache/.gitkeep
+
+# Runtime outputs
+outputs/*
+!outputs/.gitkeep
+
+# User/demo uploads
+demo_videos/*
+!demo_videos/.gitkeep
+
+# Model weights and large ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# Large media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Secrets / environment
+.env
+.env.*
+*.pem
+*.key
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local links to the parent UniRumor research repository.
+# Useful on DICC, but intentionally not version-controlled because
+# they would be broken in a standalone GitHub clone.
+shared_src
+shared_scripts
+shared_configs
+shared_resources
