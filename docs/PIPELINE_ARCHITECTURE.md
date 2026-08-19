@@ -69,5 +69,20 @@ services. It cannot change Frozen G1 scientific constants or authorize visual
 observations for G1.
 
 Production configuration parsing is portable and side-effect free: it neither
-loads models nor requires external assets to exist. Task06B will perform
-preflight checks and construct the production service graph from this contract.
+loads models nor requires external assets to exist.
+
+## Production Service Factory
+
+```text
+ProductionRuntimeConfig
+  -> ProductionRuntimeFactory
+  -> existing real service graph
+  -> VideoMultimodalRunner
+```
+
+Factory construction is lazy: models load only when later runtime execution
+demands them. Its optional preflight checks filesystem deployment prerequisites
+only; it does not load or hash model weights, and the existing services retain
+ownership of frozen-asset verification. The Frozen G1 scientific contract is
+unchanged, and visual observations remain excluded from Frozen G1 candidate
+units. Task06C will manage runtime lifecycle and execution-wrapper behavior.
