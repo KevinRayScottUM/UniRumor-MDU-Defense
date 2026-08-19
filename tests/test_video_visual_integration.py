@@ -718,6 +718,32 @@ class VideoVisualIntegrationTests(unittest.TestCase):
         self.assertEqual(["invalid_observation_type"], rejected[0]["reasons"])
         self.assertEqual(invalid, rejected[0]["observation"])
 
+    def test_speech_topic_inference_is_rejected_but_visible_description_is_accepted(self):
+        inferred_speech = (
+            "The person is speaking about the topic '汉语取代英语' "
+            "(Chinese replacing English)."
+        )
+        generic_speech = "The person is talking about a political topic."
+        for text in (inferred_speech, generic_speech):
+            with self.subTest(text=text):
+                accepted, rejected = QwenVisualObserver.filter_observations(
+                    [valid_observation(observation=text)], ["F000"]
+                )
+                self.assertEqual([], accepted)
+                self.assertIn(
+                    "risky_inference_or_ocr_language",
+                    rejected[0]["reasons"],
+                )
+
+        visible = valid_observation(
+            observation="The person has long dark hair."
+        )
+        accepted, rejected = QwenVisualObserver.filter_observations(
+            [visible], ["F000"]
+        )
+        self.assertEqual([visible], accepted)
+        self.assertEqual([], rejected)
+
     def test_qwen_result_retains_raw_generation_once_with_sha_and_rejections(self):
         raw = json.dumps(
             {
