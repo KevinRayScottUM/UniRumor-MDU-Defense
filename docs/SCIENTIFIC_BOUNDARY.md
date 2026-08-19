@@ -1,6 +1,6 @@
 # Scientific Boundary
 
-This repository contains three distinct runtime capabilities:
+This repository contains four distinct runtime capabilities:
 
 - A deterministic mock regression runtime. Its SHA-256 scores and logits are
   non-scientific placeholders, every mock result includes
@@ -10,6 +10,8 @@ This repository contains three distinct runtime capabilities:
   scientific decision engine without changing its contract or checkpoint.
 - A real pretrained Whisper ASR engineering service. It converts video audio
   into transcript evidence upstream of Frozen G1.
+- A real pretrained PP-OCRv5 engineering service. It converts sampled video
+  frames into frame-level OCR evidence in an ABI-isolated worker subprocess.
 
 ## Frozen G1 Boundary
 
@@ -23,7 +25,10 @@ This repository contains three distinct runtime capabilities:
 - NEI remains an engineering insufficient-evidence/abstention display state,
   never a learned model class.
 
-Whisper ASR is upstream engineering preprocessing. It is not part of the Frozen
-G1 research performance claim and does not change the scientific model. These
-integrations perform no model training or tuning and must never access
-Validation/Test data for engineering tuning. External assets remain outside Git.
+Whisper ASR and PP-OCRv5 are upstream engineering preprocessing. They are not
+part of the Frozen G1 research performance claim and do not change the scientific
+model. The transcript/OCR exposure policy (normally at most 12 plus 6) is an
+engineering composition policy, not a replacement for the official Phase4A
+`max_units=24` boundary. These integrations perform no model training or tuning
+and must never access Validation/Test data for engineering tuning. External
+assets remain outside Git.

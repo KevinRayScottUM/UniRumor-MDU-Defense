@@ -30,9 +30,13 @@
 ### B. Real Engineering Integrations
 - The repository includes an external Frozen G1 Phase4A inference bridge and an
   external pretrained Whisper ASR integration.
-- Future OCR and vision integrations are allowed only when explicitly scoped.
+- PP-OCRv5 runs only in its dedicated subprocess worker because Paddle requires
+  the isolated cuDNN8 runtime; the main Defense process must never import Paddle
+  or PaddleOCR or mutate its own `LD_LIBRARY_PATH`.
+- Future vision integrations are allowed only when explicitly scoped.
 - Keep every external model asset outside Git and access it only through
   configurable local or deployment paths.
+- Never implicitly download external model assets.
 - Do not train or tune models unless explicitly authorized.
 - Never access Validation/Test data for engineering tuning or integration work.
 - Never alter the Frozen G1 scientific constants, contract, or evaluation
