@@ -1,14 +1,29 @@
 # Scientific Boundary
 
-This branch implements an engineering contract and a deterministic mock
-runtime. It does not implement or evaluate the frozen scientific model.
+This repository contains three distinct runtime capabilities:
 
-- No checkpoint is loaded, inspected, downloaded, or modified.
-- No Validation or Test data is accessed.
-- Mock SHA-256 scores and logits are non-scientific placeholders.
-- Every mock result includes `MOCK_NON_SCIENTIFIC_OUTPUT`.
-- Mock outputs are not accuracy, quality, calibration, or performance evidence.
-- The only model classes are fake and real.
-- NEI means engineering insufficient evidence/abstention, not a learned class.
-- Visual/VLM observations are retained for display but excluded from frozen G1
-  unless a later, separately authorized scientific change says otherwise.
+- A deterministic mock regression runtime. Its SHA-256 scores and logits are
+  non-scientific placeholders, every mock result includes
+  `MOCK_NON_SCIENTIFIC_OUTPUT`, and mock outputs are never accuracy, quality,
+  calibration, performance, or other scientific evidence.
+- A real external Frozen G1 Phase4A inference bridge. It invokes the frozen
+  scientific decision engine without changing its contract or checkpoint.
+- A real pretrained Whisper ASR engineering service. It converts video audio
+  into transcript evidence upstream of Frozen G1.
+
+## Frozen G1 Boundary
+
+- Frozen G1 remains a binary `fake`/`real` model.
+- `max_units=24` and `max_length=256` remain fixed.
+- Sample pooling remains the class-wise maximum over every evaluated eligible
+  unit.
+- Top-5 remains explanation-only; selection scores never determine the sample
+  prediction pool.
+- Visual/VLM observations remain excluded from Frozen G1.
+- NEI remains an engineering insufficient-evidence/abstention display state,
+  never a learned model class.
+
+Whisper ASR is upstream engineering preprocessing. It is not part of the Frozen
+G1 research performance claim and does not change the scientific model. These
+integrations perform no model training or tuning and must never access
+Validation/Test data for engineering tuning. External assets remain outside Git.
