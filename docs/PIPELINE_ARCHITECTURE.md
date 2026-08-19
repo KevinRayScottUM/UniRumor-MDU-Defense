@@ -32,8 +32,15 @@ video
         -> raw OCR detections
         -> frame-level OCR RuntimeUnits (at most 6)
   |
+  |-- historical CLIP12 candidate extraction
+        -> local frozen SigLIP2 claim retrieval
+        -> relevance Top-4 restored chronologically
+        -> local frozen claim-blind Qwen2.5-VL observer
+        -> grounded visual_observation RuntimeUnits (G1-ineligible)
+  |
   -> transcript exposure first, then OCR exposure (normally at most 18)
-  -> optional existing FrozenG1Runner
+  -> append supplemental visual observations
+  -> existing FrozenG1Runner filters visual units before Phase4A
   -> external Phase4A Frozen G1
   -> VerificationResult
 ```
@@ -42,8 +49,10 @@ The real path integrates video audio decoding, pretrained Whisper ASR, isolated
 pretrained PP-OCRv5, and the existing external Frozen G1 bridge. Full raw ASR
 segments and raw OCR artifacts remain available independently from the bounded
 G1 exposure. The normal engineering exposure of 18 is not a new model limit;
-official Phase4A `max_units=24` remains unchanged. Real CLIP/VLM integration is
-**not yet integrated**, and visual observations remain G1-ineligible.
+official Phase4A `max_units=24` remains unchanged. The real visual path is
+supplemental: SigLIP ranks frames, Qwen observes them without the claim, and all
+visual observations remain G1-ineligible. Visual-only evidence yields engineering
+NEI/NOT_RUN rather than a fake/real prediction.
 
 Across both paths, selection scores order explanatory units while fake/real
 logits from every evaluated eligible unit determine the sample verdict. The mock

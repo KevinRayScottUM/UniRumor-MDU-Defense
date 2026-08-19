@@ -9,8 +9,8 @@ been inspected, loaded, downloaded, or resolved by this runtime foundation.
 | g1_tokenizer | microsoft/deberta-v3-base tokenizer | TBD | TBD | TBD | TBD | TBD | TBD | TBD | identity_only_not_loaded |
 | ocr_detector | PaddlePaddle/PP-OCRv5_server_det | ca867c897ecbca8873081573a802ad70d499cb94 | Hugging Face frozen revision; external DICC asset | /scr/user/kevin2002/TensorCat/model_assets/PP-OCRv5_server_det (deployment metadata only; runtime-configurable) | isolated Paddle CUDA worker | model runtime default | a6e8aae048291ebff5d6b604ccda060ccf516ed82d5f8e5f4f4421e762395983 (runtime tree) | TBD | verified external asset |
 | ocr_recognizer | PaddlePaddle/PP-OCRv5_server_rec | b26c3587fda8da3c8ec0ce357214b4d661ff1558 | Hugging Face frozen revision; external DICC asset | /scr/user/kevin2002/TensorCat/model_assets/PP-OCRv5_server_rec (deployment metadata only; runtime-configurable) | isolated Paddle CUDA worker | model runtime default | 248824aeede7ff94190ff2b82cce0679d89868713c749cc8cd3f6678006be259 (runtime tree) | TBD | verified external asset |
-| visual_retrieval | CLIP/SigLIP2 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | not_integrated |
-| vlm | Qwen2.5-VL | TBD | TBD | TBD | TBD | TBD | TBD | TBD | not_integrated |
+| visual_retrieval | google/siglip2-base-patch16-384 | f775b65a79762255128c981547af89addcfe0f88 | frozen external local asset | runtime-configured external path | runtime-configured CUDA or CPU | bfloat16 on supported CUDA, float16 CUDA fallback, float32 CPU; embeddings scored in float32 | 5179f3193de143151f8062760999e8af4a1f3aa7885808b9a4aa5e855e2389e8 (runtime tree identity) | TBD | verified external asset |
+| vlm | Qwen/Qwen2.5-VL-7B-Instruct | cc594898137f460bfe9f0759e9844b3ce807cfb5 | frozen external local asset | runtime-configured external path | runtime-configured CUDA | bfloat16 on supported CUDA | d9ba83a668c72098d9e952eac7da926164c6a87c2c46bbc9a8ffe7306945ee87 (runtime tree) | TBD | verified external asset |
 | asr | openai/whisper-large-v3-turbo | 41f01f3fe87f28c78e2fbf8b568835947dd65ed9 | Hugging Face frozen revision; external DICC asset | /scr/user/kevin2002/TensorCat/model_assets/openai__whisper-large-v3-turbo (deployment metadata only; runtime-configurable) | runtime-configured CUDA | float16 | 542566a422ae4f3fd23f1ba11add198fca01bbf82e66e6a2857b3f608b1eb9d1 (model.safetensors) | TBD | verified external asset |
 
 The deterministic mock runtime does not resolve paths, inspect hashes, access
@@ -25,3 +25,10 @@ and verifies the exact runtime tree (`config.json`, `inference.json`,
 `inference.pdiparams`, and `inference.yml`) without hashing Hugging Face cache
 metadata. PP-OCRv5 is a pretrained upstream OCR engine, not a project-trained
 checkpoint.
+SigLIP2 performs claim-to-frame retrieval only. Qwen2.5-VL observes the selected
+frames without receiving the claim and produces supplemental grounded visual
+observations. Neither visual model predicts veracity or contributes units to the
+Frozen G1 candidate pool.
+Both visual services verify their exact frozen runtime-file manifests before
+the first local-only model load; unrelated repository and Hugging Face metadata
+do not participate in those runtime-tree identities.

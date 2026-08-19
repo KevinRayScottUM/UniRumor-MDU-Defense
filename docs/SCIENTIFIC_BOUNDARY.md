@@ -1,6 +1,6 @@
 # Scientific Boundary
 
-This repository contains four distinct runtime capabilities:
+This repository contains five distinct runtime capabilities:
 
 - A deterministic mock regression runtime. Its SHA-256 scores and logits are
   non-scientific placeholders, every mock result includes
@@ -12,6 +12,9 @@ This repository contains four distinct runtime capabilities:
   into transcript evidence upstream of Frozen G1.
 - A real pretrained PP-OCRv5 engineering service. It converts sampled video
   frames into frame-level OCR evidence in an ABI-isolated worker subprocess.
+- A real supplemental visual service. Frozen SigLIP2 ranks candidate frames by
+  claim relevance, then frozen Qwen2.5-VL observes only the selected frames under
+  a claim-blind, no-OCR, no-veracity prompt and grounded automatic filter.
 
 ## Frozen G1 Boundary
 
@@ -32,3 +35,8 @@ engineering composition policy, not a replacement for the official Phase4A
 `max_units=24` boundary. These integrations perform no model training or tuning
 and must never access Validation/Test data for engineering tuning. External
 assets remain outside Git.
+
+Visual observations are engineering UI/evidence artifacts, not Frozen G1 inputs
+or visual-veracity predictions. Adding them must leave the Phase4A candidate list
+identical to the corresponding text/transcript/OCR-only request. Visual-only
+evidence cannot produce a binary model verdict and returns engineering NEI.
