@@ -373,6 +373,10 @@ class VideoOCRIntegrationTests(unittest.TestCase):
         noise = metadata / "ignored"
         noise.write_text("one", encoding="utf-8")
         first = runtime_tree_sha256(model_path)
+        self.assertEqual(
+            "cf382228f46cdd0ce36b28ab1f260254f15e353f719a627530e556ccd8857043",
+            first,
+        )
         noise.write_text("two", encoding="utf-8")
         self.assertEqual(first, runtime_tree_sha256(model_path))
         (model_path / "config.json").write_text("changed", encoding="utf-8")

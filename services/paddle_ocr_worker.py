@@ -29,22 +29,35 @@ RUNTIME_TREE_FILES = (
 
 
 def runtime_tree_sha256(model_path: Path) -> str:
-    """Hash exact runtime filenames and bytes, excluding all other metadata."""
+    """Hash the canonical manifest for the exact frozen runtime files."""
     root = Path(model_path)
     if not root.is_dir():
         raise FileNotFoundError(f"OCR model directory not found: {root}")
-    digest = hashlib.sha256()
+    rows = []
     for name in RUNTIME_TREE_FILES:
         path = root / name
         if not path.is_file():
             raise FileNotFoundError(f"OCR runtime asset missing: {path}")
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
+        file_digest = hashlib.sha256()
+        file_size = 0
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
+                file_digest.update(chunk)
+                file_size += len(chunk)
+        rows.append(
+            {
+                "path": name,
+                "size": file_size,
+                "sha256": file_digest.hexdigest(),
+            }
+        )
+    canonical_manifest = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_manifest).hexdigest()
 
 
 def _validate_model(
