@@ -33,7 +33,10 @@
 - PP-OCRv5 runs only in its dedicated subprocess worker because Paddle requires
   the isolated cuDNN8 runtime; the main Defense process must never import Paddle
   or PaddleOCR or mutate its own `LD_LIBRARY_PATH`.
-- Future vision integrations are allowed only when explicitly scoped.
+- The real visual path uses local-only SigLIP2 retrieval followed by a claim-blind
+  Qwen2.5-VL observer. Its visual observations are supplemental UI evidence and
+  must always remain ineligible for Frozen G1.
+- Future vision changes are allowed only when explicitly scoped.
 - Keep every external model asset outside Git and access it only through
   configurable local or deployment paths.
 - Never implicitly download external model assets.

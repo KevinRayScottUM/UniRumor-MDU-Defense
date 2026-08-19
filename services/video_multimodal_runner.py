@@ -1,0 +1,124 @@
+"""Compose text/OCR verification with supplemental real visual observations."""
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List
+
+from schemas import (
+    DisplayVerdict,
+    EvidenceStatus,
+    ModelVerdict,
+    RuntimeUnit,
+    SourceType,
+    VerificationResult,
+)
+from services.video_text_ocr_runner import VideoTextOCRResult
+from services.video_visual_runner import VideoVisualResult
+
+
+@dataclass
+class VideoMultimodalResult:
+    session_id: str
+    claim: str
+    text_ocr_result: VideoTextOCRResult
+    visual_result: VideoVisualResult
+    g1_exposure_units: List[RuntimeUnit]
+    visual_units: List[RuntimeUnit]
+    all_runtime_units: List[RuntimeUnit]
+    verification_result: VerificationResult
+    warnings: List[str] = field(default_factory=list)
+    runtime_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "claim": self.claim,
+            "text_ocr_result": self.text_ocr_result.to_dict(),
+            "visual_result": self.visual_result.to_dict(),
+            "g1_exposure_units": [unit.to_dict() for unit in self.g1_exposure_units],
+            "visual_units": [unit.to_dict() for unit in self.visual_units],
+            "all_runtime_units": [unit.to_dict() for unit in self.all_runtime_units],
+            "verification_result": self.verification_result.to_dict(),
+            "warnings": list(self.warnings),
+            "runtime_ms": self.runtime_ms,
+        }
+
+
+class VideoMultimodalRunner:
+    def __init__(
+        self,
+        video_text_ocr_runner: Any,
+        video_visual_runner: Any,
+        frozen_g1_runner: Any,
+    ) -> None:
+        self.video_text_ocr_runner = video_text_ocr_runner
+        self.video_visual_runner = video_visual_runner
+        self.frozen_g1_runner = frozen_g1_runner
+
+    @staticmethod
+    def _visual_only_nei(
+        session_id: str,
+        claim: str,
+        all_units: List[RuntimeUnit],
+        warnings: List[str],
+    ) -> VerificationResult:
+        return VerificationResult(
+            session_id=session_id,
+            claim=claim,
+            model_verdict=ModelVerdict.NOT_RUN,
+            display_verdict=DisplayVerdict.NEI,
+            evidence_status=EvidenceStatus.INSUFFICIENT,
+            sample_logits={},
+            probabilities={},
+            all_units=all_units,
+            top_k_units=[],
+            class_winners={},
+            pipeline_stages=[],
+            warnings=list(warnings),
+        )
+
+    def run(
+        self, session_id: str, claim: str, video_path: Path
+    ) -> VideoMultimodalResult:
+        started = time.perf_counter()
+        text_ocr_result = self.video_text_ocr_runner.run(
+            session_id, claim, video_path, run_frozen_g1=False
+        )
+        visual_result = self.video_visual_runner.run(session_id, claim, video_path)
+        g1_units = list(text_ocr_result.g1_exposure_units)
+        visual_units = list(visual_result.runtime_units)
+        if any(unit.source_type is SourceType.VISUAL_OBSERVATION for unit in g1_units):
+            raise ValueError("visual observations cannot enter composed G1 exposure")
+        for unit in visual_units:
+            if (
+                unit.source_type is not SourceType.VISUAL_OBSERVATION
+                or unit.eligible_for_frozen_g1
+                or unit.selection_score is not None
+                or unit.logits is not None
+                or unit.confidence is not None
+            ):
+                raise ValueError("invalid supplemental visual RuntimeUnit contract")
+        all_units = g1_units + visual_units
+        warnings = list(text_ocr_result.warnings) + list(visual_result.warnings)
+        if g1_units:
+            verification = self.frozen_g1_runner.run(
+                session_id, claim, all_units
+            )
+        else:
+            warnings.append("visual-only evidence cannot run Frozen G1")
+            verification = self._visual_only_nei(
+                session_id, claim, all_units, warnings
+            )
+        return VideoMultimodalResult(
+            session_id=session_id,
+            claim=claim,
+            text_ocr_result=text_ocr_result,
+            visual_result=visual_result,
+            g1_exposure_units=g1_units,
+            visual_units=visual_units,
+            all_runtime_units=all_units,
+            verification_result=verification,
+            warnings=warnings,
+            runtime_ms=(time.perf_counter() - started) * 1000.0,
+        )
