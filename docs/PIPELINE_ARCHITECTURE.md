@@ -59,3 +59,15 @@ logits from every evaluated eligible unit determine the sample verdict. The mock
 orchestration layer records explicit ordered stage states. Runtime cache entries,
 JSONL logs, and result JSON are restricted to configured `cache/` and `outputs/`
 roots.
+
+## Runtime Configuration Contracts
+
+`pipeline.RuntimeConfig` remains the deterministic mock-runtime configuration.
+`ProductionRuntimeConfig` is a separate deployment-only contract for local
+paths, devices, data types, and subprocess timeouts used by the existing real
+services. It cannot change Frozen G1 scientific constants or authorize visual
+observations for G1.
+
+Production configuration parsing is portable and side-effect free: it neither
+loads models nor requires external assets to exist. Task06B will perform
+preflight checks and construct the production service graph from this contract.
