@@ -4,7 +4,6 @@
 - Work only in this repository and the current branch.
 - Keep runtime writes under configured `cache/` and `outputs/` roots.
 - Do not read or write Validation/Test data.
-- Do not load, inspect, download, or alter real checkpoints.
 - Do not commit, push, merge, or modify `main` unless explicitly requested.
 
 ## Frozen Scientific Contract
@@ -19,13 +18,25 @@
 - Visual/VLM observations default to `eligible_for_frozen_g1=False`.
 - NEI is an engineering abstention display state, never a model class.
 
-## Runtime Boundary
-- The runtime skeleton is deterministic and standard-library-only.
+## Runtime Paths
+
+### A. Deterministic Mock Regression Path
+- Keep mock behavior deterministic and standard-library-oriented.
 - Mock scores and logits must use SHA-256, never Python `hash()`.
 - Mock outputs must carry `MOCK_NON_SCIENTIFIC_OUTPUT`.
-- Do not present mock output as research evidence or model performance.
-- Do not add Torch, Transformers, ASR, OCR, vision, VLM, CUDA, video,
-  web-server, or UI dependencies in this milestone.
+- Never present mock output as scientific evidence, research performance, model
+  quality, accuracy, or calibration.
+
+### B. Real Engineering Integrations
+- The repository includes an external Frozen G1 Phase4A inference bridge and an
+  external pretrained Whisper ASR integration.
+- Future OCR and vision integrations are allowed only when explicitly scoped.
+- Keep every external model asset outside Git and access it only through
+  configurable local or deployment paths.
+- Do not train or tune models unless explicitly authorized.
+- Never access Validation/Test data for engineering tuning or integration work.
+- Never alter the Frozen G1 scientific constants, contract, or evaluation
+  boundaries through an engineering integration.
 
 ## Verification
 - Use standard-library `unittest`.

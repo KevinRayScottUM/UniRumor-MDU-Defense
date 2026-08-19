@@ -1,0 +1,17 @@
+{
+  "text": " 你好，世界。 This is a multilingual transcript. ",
+  "chunks": [
+    {
+      "text": " 你好，世界。 ",
+      "timestamp": [0.0, 1.25]
+    },
+    {
+      "text": "   ",
+      "timestamp": [1.25, 1.5]
+    },
+    {
+      "text": " This is a multilingual transcript. ",
+      "timestamp": [1.5, 3.75]
+    }
+  ]
+}
