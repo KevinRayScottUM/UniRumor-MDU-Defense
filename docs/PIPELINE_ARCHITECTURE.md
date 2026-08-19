@@ -22,17 +22,28 @@ deterministic regression infrastructure, not scientific inference evidence.
 
 ```text
 video
-  -> PyAV 16 kHz mono waveform
-  -> frozen external openai/whisper-large-v3-turbo
-  -> ordered transcript RuntimeUnits
+  |-- PyAV 16 kHz mono waveform
+  |     -> frozen external openai/whisper-large-v3-turbo
+  |     -> raw transcript RuntimeUnits
+  |     -> balanced full-range transcript exposure (at most 12)
+  |
+  |-- historical deterministic 8-frame sampler
+        -> isolated PP-OCRv5 subprocess
+        -> raw OCR detections
+        -> frame-level OCR RuntimeUnits (at most 6)
+  |
+  -> transcript exposure first, then OCR exposure (normally at most 18)
   -> optional existing FrozenG1Runner
   -> external Phase4A Frozen G1
   -> VerificationResult
 ```
 
-The real path currently integrates video audio decoding, pretrained Whisper ASR,
-and the existing external Frozen G1 bridge. Real OCR integration and real
-CLIP/VLM integration are **not yet integrated**.
+The real path integrates video audio decoding, pretrained Whisper ASR, isolated
+pretrained PP-OCRv5, and the existing external Frozen G1 bridge. Full raw ASR
+segments and raw OCR artifacts remain available independently from the bounded
+G1 exposure. The normal engineering exposure of 18 is not a new model limit;
+official Phase4A `max_units=24` remains unchanged. Real CLIP/VLM integration is
+**not yet integrated**, and visual observations remain G1-ineligible.
 
 Across both paths, selection scores order explanatory units while fake/real
 logits from every evaluated eligible unit determine the sample verdict. The mock
