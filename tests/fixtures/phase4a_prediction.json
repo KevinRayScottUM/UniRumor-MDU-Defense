@@ -1,0 +1,59 @@
+{
+  "case_id": "phase4a-session",
+  "checkpoint_sha256": "b694f2d4bb5ba6f72dd8a001bd984d46853546f2a85858a812f2496af1f1a0b9",
+  "claim": "the claim",
+  "contract_version": "1.0.0",
+  "dropped_visual_unit_count": 0,
+  "input_unit_count_before_contract": 3,
+  "max_length": 256,
+  "max_pool_winner_by_class": {
+    "fake": {
+      "modality": "text",
+      "selection_score": 0.9,
+      "unit_id": "text-unit",
+      "veracity_logits": {"fake": 2.0, "real": 0.1}
+    },
+    "real": {
+      "modality": "ocr",
+      "selection_score": 0.7,
+      "unit_id": "ocr-unit",
+      "veracity_logits": {"fake": 1.0, "real": 2.5}
+    }
+  },
+  "maximum_units_per_sample": 24,
+  "model_exposed_unit_count": 3,
+  "pooling": "max",
+  "prediction": "real",
+  "prediction_id": 1,
+  "probabilities": {"fake": 0.3775406688, "real": 0.6224593312},
+  "sample_logits": {"fake": 2.0, "real": 2.5},
+  "selection_head_affects_sample_pooling": false,
+  "top_k_selection_units": [
+    {"selection_score": 0.9, "unit_id": "text-unit"},
+    {"selection_score": 0.8, "unit_id": "transcript-unit"},
+    {"selection_score": 0.7, "unit_id": "ocr-unit"}
+  ],
+  "topk_is_only_prediction_basis": false,
+  "truncated_unit_count": 0,
+  "unit_outputs": [
+    {
+      "modality": "text",
+      "selection_score": 0.9,
+      "unit_id": "text-unit",
+      "veracity_logits": {"fake": 2.0, "real": 0.1}
+    },
+    {
+      "modality": "text",
+      "selection_score": 0.8,
+      "unit_id": "transcript-unit",
+      "veracity_logits": {"fake": 0.2, "real": 1.7}
+    },
+    {
+      "modality": "ocr",
+      "selection_score": 0.7,
+      "unit_id": "ocr-unit",
+      "veracity_logits": {"fake": 1.0, "real": 2.5}
+    }
+  ],
+  "variant": "G1_text_ocr"
+}
