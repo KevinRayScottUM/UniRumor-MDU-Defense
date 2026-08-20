@@ -123,3 +123,22 @@ Visual observations remain supplemental and can never independently make
 evidence sufficient. Operational and model failures remain outside this policy
 and continue to propagate pending Task06F. Task06E will package the assessment
 into an API-ready result.
+
+## API-Ready Production Result
+
+```text
+VideoMultimodalResult + EvidenceSufficiencyAssessment
+  -> ProductionResultBuilder
+  -> ProductionResult
+```
+
+This presentation and serialization layer does not change predictions;
+logits and probabilities are preserved exactly. G1 exposure remains separate
+from supplemental visual evidence, while ordered Top-k explanation IDs refer
+back to the G1 exposure list and never imply a Top-k prediction basis.
+
+The public contract intentionally omits local filesystem paths, raw provenance
+details, and raw internal warning strings. Successful engineering NEI results
+serialize normally. Task06F will define operational failure responses, Task06G
+will consume this contract from the production CLI, and Task07 FastAPI/Gradio
+surfaces may later expose the same contract.
