@@ -26,6 +26,7 @@ from services.production_execution import (
 from services.production_result import ProductionResult
 from webapp.api import _RequestBoundaryMiddleware, create_app
 from webapp.api_config import APIConfig, DEFAULT_MAX_UPLOAD_BYTES
+from webapp.execution_adapter import ProductionExecutionAdapter
 from webapp.job_manager import JobManager
 from webapp.job_types import JobFailureSnapshot, JobSnapshot, JobState
 from webapp.runtime_lifecycle import APIRuntimeLifecycle, APIRuntimeStartupError
@@ -404,17 +405,29 @@ class WebAPILifecycleTests(unittest.TestCase):
             events.append("service.obtain")
             return service
 
+        def adapter_factory(execution_contract):
+            events.append("adapter.construct")
+            self.assertIs(execution_contract, service)
+            return ProductionExecutionAdapter(execution_contract)
+
         app = create_app(
             self.config,
             execution_service_factory=provider,
+            execution_adapter_factory=adapter_factory,
             server_lock_factory=lambda root: RecordingLock(root, events),
             job_manager_factory=lambda value: RecordingManager(value, events),
         )
         with TestClient(app):
-            self.assertIs(app.state.api_runtime_state.execution_service, service)
+            state = app.state.api_runtime_state
+            self.assertIs(state.execution_service, service)
+            self.assertIsInstance(
+                state.execution_adapter,
+                ProductionExecutionAdapter,
+            )
+            self.assertIs(state.execution_adapter.execution_contract, service)
             self.assertIs(
-                app.state.api_runtime_state.manager._execution_service,
-                service,
+                state.manager._execution_adapter,
+                state.execution_adapter,
             )
             self.assertEqual(service.runtime.start_calls, 1)
         self.assertEqual(
@@ -423,6 +436,7 @@ class WebAPILifecycleTests(unittest.TestCase):
                 "lock.acquire",
                 "service.obtain",
                 "runtime.start",
+                "adapter.construct",
                 "manager.construct",
                 "manager.start",
                 "manager.shutdown",
@@ -430,6 +444,60 @@ class WebAPILifecycleTests(unittest.TestCase):
             ],
         )
         self.assertEqual(service.calls, [])
+
+    def test_incompatible_adapter_execute_signature_fails_readiness(self):
+        class IncompatibleAdapter:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self):
+                self.calls += 1
+
+        service = FakeService()
+        adapter = IncompatibleAdapter()
+        lifecycle = APIRuntimeLifecycle(
+            self.config,
+            lambda: service,
+            execution_adapter_factory=lambda execution_contract: adapter,
+        )
+
+        with self.assertRaises(APIRuntimeStartupError):
+            lifecycle.startup()
+
+        readiness = lifecycle.state.readiness()
+        self.assertEqual(readiness.status, "not_ready")
+        self.assertFalse(readiness.accepting_jobs)
+        self.assertEqual(readiness.capacity_state, "unavailable")
+        self.assertTrue(lifecycle.state.startup_failed)
+        self.assertIsNone(lifecycle.state.execution_adapter)
+        self.assertIsNone(lifecycle.state.manager)
+        self.assertEqual(adapter.calls, 0)
+
+    def test_compatible_adapter_execute_signature_passes_readiness(self):
+        class CompatibleAdapter:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, session_id, claim, video_path):
+                self.calls.append((session_id, claim, video_path))
+
+        adapter = CompatibleAdapter()
+        lifecycle = APIRuntimeLifecycle(
+            self.config,
+            FakeService,
+            execution_adapter_factory=lambda execution_contract: adapter,
+        )
+        self.addCleanup(lifecycle.shutdown)
+
+        lifecycle.startup()
+
+        readiness = lifecycle.state.readiness()
+        self.assertEqual(readiness.status, "ready")
+        self.assertTrue(readiness.accepting_jobs)
+        self.assertEqual(readiness.capacity_state, "available")
+        self.assertIs(lifecycle.state.execution_adapter, adapter)
+        self.assertIs(lifecycle.state.manager._execution_adapter, adapter)
+        self.assertEqual(adapter.calls, [])
 
     def test_real_service_construction_from_server_path_is_deferred(self):
         config_path = self.root / "server-config.json"

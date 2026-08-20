@@ -12,6 +12,7 @@ from schemas import ProductionRuntimeConfig
 
 from .api_config import APIConfig, validate_web_runtime_root
 from .api_types import ReadinessPayload
+from .execution_adapter import ProductionExecutionAdapter
 from .job_manager import JobManager
 from .server_lock import ServerLock
 from .workspace import (
@@ -28,18 +29,20 @@ def _require_positional_interface(
     owner: object,
     method_name: str,
     positional_argument_count: int,
+    *,
+    owner_name: str = "workspace manager",
 ) -> None:
     """Validate a bound callable signature without invoking the dependency."""
 
     method = getattr(owner, method_name, None)
     if not callable(method):
-        raise TypeError(f"workspace manager must provide {method_name}")
+        raise TypeError(f"{owner_name} must provide {method_name}")
     try:
         signature = inspect.signature(method)
         signature.bind(*(object() for _ in range(positional_argument_count)))
     except (TypeError, ValueError):
         raise TypeError(
-            f"workspace manager method {method_name} has an incompatible signature"
+            f"{owner_name} method {method_name} has an incompatible signature"
         ) from None
 
 
@@ -54,6 +57,7 @@ class APIRuntimeState:
         self.shutdown_started = False
         self.shutdown_complete = False
         self.shutdown_incomplete = False
+        self.execution_adapter = None
         self.execution_service = None
         self.manager = None
         self.server_lock = None
@@ -106,6 +110,9 @@ class APIRuntimeLifecycle:
         config: APIConfig,
         execution_service_provider: Callable[[], object],
         *,
+        execution_adapter_factory: Callable[[object], object] = (
+            ProductionExecutionAdapter
+        ),
         server_lock_factory: Callable[[Path], object] = ServerLock,
         job_manager_factory: Callable[[object], object] = JobManager,
         workspace_manager_factory: Callable[[Path], object] = WebWorkspaceManager,
@@ -114,6 +121,8 @@ class APIRuntimeLifecycle:
             raise TypeError("config must be an APIConfig")
         if not callable(execution_service_provider):
             raise TypeError("execution_service_provider must be callable")
+        if not callable(execution_adapter_factory):
+            raise TypeError("execution_adapter_factory must be callable")
         if not callable(server_lock_factory):
             raise TypeError("server_lock_factory must be callable")
         if not callable(job_manager_factory):
@@ -122,6 +131,7 @@ class APIRuntimeLifecycle:
             raise TypeError("workspace_manager_factory must be callable")
         self.config = config
         self._execution_service_provider = execution_service_provider
+        self._execution_adapter_factory = execution_adapter_factory
         self._server_lock_factory = server_lock_factory
         self._job_manager_factory = job_manager_factory
         self._uses_default_job_manager = job_manager_factory is JobManager
@@ -216,13 +226,23 @@ class APIRuntimeLifecycle:
                 self.state.execution_service = service
             runtime.start()
 
+            adapter = self._execution_adapter_factory(service)
+            _require_positional_interface(
+                adapter,
+                "execute",
+                3,
+                owner_name="execution adapter",
+            )
+            with self.state._guard:
+                self.state.execution_adapter = adapter
+
             if self._uses_default_job_manager:
                 manager = self._job_manager_factory(
-                    service,
+                    adapter,
                     on_terminal=workspace.cleanup_job,
                 )
             else:
-                manager = self._job_manager_factory(service)
+                manager = self._job_manager_factory(adapter)
             if not callable(getattr(manager, "start", None)):
                 raise TypeError("job manager must provide start")
             with self.state._guard:
