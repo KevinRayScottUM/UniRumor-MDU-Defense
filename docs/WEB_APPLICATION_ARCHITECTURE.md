@@ -22,6 +22,7 @@ demonstration:
 - FastAPI JSON/upload API at `/api/v1`;
 - one bounded in-memory job manager;
 - one GPU execution worker;
+- one injected `ProductionExecutionAdapter` between web orchestration and Task06;
 - one long-lived `ProductionExecutionService` and `ProductionRuntime` per
   server process;
 - polling as the complete status-delivery mechanism;
@@ -60,7 +61,7 @@ must not become the primary frontend or an alternate inference composition.
 
 | Concern | Baseline decision | Rationale |
 | --- | --- | --- |
-| Production integration | Call `ProductionExecutionService.execute()` directly | It owns Task06 runtime and packaging failure semantics. |
+| Production integration | Call an injected `ProductionExecutionAdapter`, which delegates only to `ProductionExecutionService.execute()` | It isolates web orchestration while preserving Task06 runtime and packaging failure semantics. |
 | API server | FastAPI | It provides a typed Python HTTP boundary without changing the production graph. |
 | Frontend | React + TypeScript + Vite static build | It produces an independent, polished frontend deployable through Cloudflare Pages. |
 | Job delivery | Polling | It survives multi-minute inference without a permanently open inference request. |
@@ -109,6 +110,7 @@ The future web worker has exactly one inference dependency:
 FastAPI route
   -> bounded JobManager
   -> single JobWorker
+  -> ProductionExecutionAdapter
   -> ProductionExecutionService.execute(session_id, claim, video_path)
   -> ProductionRuntime.run(...)
   -> existing real service graph
@@ -179,6 +181,7 @@ DICC FastAPI process (one production process)
   |-- upload validator and admission controller
   |-- bounded in-memory JobManager
   |-- one worker thread / execution lane
+  |-- one injected ProductionExecutionAdapter
   |-- one long-lived ProductionExecutionService
   |-- one long-lived ProductionRuntime / real service graph
   `-- dedicated <cache_root>/web-runtime workspaces
@@ -199,7 +202,8 @@ the DICC/UM environment.
 | Upload validator | size, filename syntax, extension/MIME/container policy | Dataset discovery or arbitrary filesystem paths |
 | Admission controller | queue-slot reservation and backpressure | GPU execution |
 | `JobManager` | public state, timestamps, queue position, retention | Scientific stages or fake progress |
-| `JobWorker` | serial call to `ProductionExecutionService.execute()` | Direct model/sub-runner calls |
+| `JobWorker` | serial call to the injected `ProductionExecutionAdapter` | Direct Task06 service, model, or sub-runner calls |
+| Production adapter | validate and forward the server-owned execution request to the injected Task06 contract | Runtime construction, scientific recomputation, or model/sub-runner calls |
 | Task06 service | runtime execution and public-safe result/failure outcome | HTTP state or CORS |
 | Cleanup service | web workspace and expired metadata cleanup | source data, model assets, runtime cache outside its root |
 
@@ -375,8 +379,8 @@ connection loss separately and retries with backoff.
 - The lock is held for the full server lifetime and released on clean shutdown.
 - Lock paths and process IDs are never public. Redis, a database, and
   distributed locking are not baseline dependencies.
-- Exactly one job worker may call `ProductionExecutionService.execute()` at a
-  time.
+- Exactly one job worker may call the `ProductionExecutionAdapter` at a time;
+  that adapter owns the sole call to `ProductionExecutionService.execute()`.
 - Production deployment uses one FastAPI process; multiple Uvicorn/Gunicorn
   workers are forbidden because each would create another in-memory queue and
   model graph.
@@ -416,8 +420,10 @@ On FastAPI lifespan startup, the baseline must:
    runtime configuration;
 6. call the owned runtime's idempotent `start()` once to run Task06 filesystem
    preflight and build the real service graph;
-7. create the bounded manager and one worker; and
-8. mark readiness true only after all startup validation succeeds.
+7. construct exactly one injected `ProductionExecutionAdapter` around that
+   service;
+8. create the bounded manager and one worker; and
+9. mark readiness true only after all startup validation succeeds.
 
 Failure to acquire the singleton lock is a startup failure: no cleanup,
 `JobManager`, Task06 runtime startup, or worker startup may occur, and readiness
@@ -1002,7 +1008,8 @@ deployment; they do not block local Task07 implementation:
 
 Task07 implementation is conformant only if all of the following are true:
 
-- the web worker calls only `ProductionExecutionService` for inference;
+- the web worker calls only the injected `ProductionExecutionAdapter`, and the
+  adapter delegates only to `ProductionExecutionService`;
 - the production CLI remains separate;
 - `/api/v1` uses HTTP 202 plus polling for long-running jobs;
 - GPU concurrency = 1 and the queue is bounded with explicit 429 backpressure;

@@ -134,7 +134,7 @@ class JobManager:
 
     def __init__(
         self,
-        execution_service,
+        execution_adapter,
         *,
         max_queued_jobs: int = DEFAULT_MAX_QUEUED_JOBS,
         terminal_retention: Union[
@@ -146,8 +146,8 @@ class JobManager:
         clock: Optional[Callable[[], datetime]] = None,
         on_terminal: Optional[Callable[[str], None]] = None,
     ) -> None:
-        if not callable(getattr(execution_service, "execute", None)):
-            raise TypeError("execution_service must provide a callable execute method")
+        if not callable(getattr(execution_adapter, "execute", None)):
+            raise TypeError("execution_adapter must provide a callable execute method")
         if isinstance(max_queued_jobs, bool) or not isinstance(max_queued_jobs, int):
             raise TypeError("max_queued_jobs must be an integer")
         if max_queued_jobs <= 0:
@@ -157,7 +157,7 @@ class JobManager:
         if on_terminal is not None and not callable(on_terminal):
             raise TypeError("on_terminal must be callable or None")
 
-        self._execution_service = execution_service
+        self._execution_adapter = execution_adapter
         self._max_queued_jobs = max_queued_jobs
         self._terminal_retention_seconds = _duration_seconds(
             terminal_retention,
@@ -390,7 +390,7 @@ class JobManager:
         """Invoke the closed Task06 boundary, catching ordinary failures only."""
 
         try:
-            outcome = self._execution_service.execute(job_id, claim, video_path)
+            outcome = self._execution_adapter.execute(job_id, claim, video_path)
         except Exception:
             return _ExecutionDisposition(
                 outcome=None,

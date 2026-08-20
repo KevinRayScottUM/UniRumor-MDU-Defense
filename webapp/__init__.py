@@ -3,6 +3,11 @@
 from .api import create_app
 from .api_config import APIConfig, WebAPIConfig
 from .api_types import API_VERSION
+from .execution_adapter import (
+    ProductionExecutionAdapter,
+    ProductionExecutionContract,
+    ProductionExecutionRequest,
+)
 
 from .job_manager import (
     CapacityReservation,
@@ -39,6 +44,9 @@ __all__ = [
     "JobManagerNotAcceptingError",
     "JobSnapshot",
     "JobState",
+    "ProductionExecutionAdapter",
+    "ProductionExecutionContract",
+    "ProductionExecutionRequest",
     "QueueFullError",
     "ReservationError",
     "ServerLock",

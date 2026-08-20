@@ -19,6 +19,11 @@ from services.production_execution import (
 )
 from services.production_result import ProductionResult
 from services.session_manager import SAFE_SESSION
+from webapp.execution_adapter import (
+    ADAPTER_FAILURE_EXCEPTION_TYPE,
+    ProductionExecutionAdapter,
+    ProductionExecutionRequest,
+)
 from webapp.job_manager import (
     WEB_WORKER_FAILURE_CODE,
     WEB_WORKER_FAILURE_MESSAGE,
@@ -192,6 +197,94 @@ class WebJobManagerTests(unittest.TestCase):
             [state.value for state in JobState],
             ["accepted", "queued", "running", "completed", "failed", "expired"],
         )
+
+    def test_adapter_forwards_exact_request_to_injected_contract(self):
+        outcome = self._success(ModelVerdict.REAL)
+        contract = ConstantService(outcome)
+        adapter = ProductionExecutionAdapter(contract)
+        request = ProductionExecutionRequest(
+            session_id="job_0123456789abcdef0123456789abcdef",
+            claim="  exact focal claim  ",
+            video_path=self.PRIVATE_VIDEO,
+        )
+
+        returned = adapter.execute_request(request)
+
+        self.assertIs(adapter.execution_contract, contract)
+        self.assertIs(returned, outcome)
+        self.assertEqual(
+            contract.calls,
+            [(request.session_id, request.claim, request.video_path)],
+        )
+
+    def test_adapter_runtime_exception_becomes_safe_failure_outcome(self):
+        private_detail = "/private/model/cache runtime exploded"
+        contract = ConstantService(error=RuntimeError(private_detail))
+        adapter = ProductionExecutionAdapter(contract)
+
+        outcome = adapter.execute(
+            "job_0123456789abcdef0123456789abcdef",
+            "claim",
+            self.PRIVATE_VIDEO,
+        )
+
+        self.assertIs(outcome.status, ProductionExecutionStatus.FAILURE)
+        self.assertIsNone(outcome.result)
+        self.assertEqual(
+            outcome.failure.code,
+            OperationalFailureCode.RUNTIME_EXECUTION_FAILED,
+        )
+        self.assertEqual(
+            outcome.failure.public_message,
+            RUNTIME_FAILURE_PUBLIC_MESSAGE,
+        )
+        self.assertEqual(
+            outcome.failure.exception_type,
+            ADAPTER_FAILURE_EXCEPTION_TYPE,
+        )
+        serialized = outcome.to_json()
+        self.assertNotIn(private_detail, serialized)
+        self.assertNotIn("RuntimeError", serialized)
+
+    def test_adapter_invalid_contract_output_becomes_safe_failure_outcome(self):
+        adapter = ProductionExecutionAdapter(
+            ConstantService(outcome={"status": "success"})
+        )
+
+        outcome = adapter.execute(
+            "job_0123456789abcdef0123456789abcdef",
+            "claim",
+            self.PRIVATE_VIDEO,
+        )
+
+        self.assertIs(outcome.status, ProductionExecutionStatus.FAILURE)
+        self.assertEqual(
+            outcome.failure.exception_type,
+            ADAPTER_FAILURE_EXCEPTION_TYPE,
+        )
+
+    def test_adapter_source_has_only_closed_execution_contract_dependency(self):
+        source = inspect.getsource(
+            __import__("webapp.execution_adapter", fromlist=["*"])
+        )
+        prohibited = (
+            "ProductionExecutionService",
+            "ProductionRuntime",
+            "ProductionResultBuilder",
+            "FrozenG1Runner",
+            "VideoMultimodalRunner",
+            "Whisper",
+            "PaddleOCR",
+            "SigLIP",
+            "Qwen",
+            "production_runtime",
+            "subprocess",
+            "shell=True",
+        )
+        for name in prohibited:
+            with self.subTest(name=name):
+                self.assertNotIn(name, source)
+        self.assertIn("services.production_execution", source)
 
     def test_construction_is_side_effect_free(self):
         service = ConstantService(self._success())

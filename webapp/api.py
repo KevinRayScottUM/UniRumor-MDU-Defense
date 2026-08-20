@@ -16,6 +16,7 @@ from services.production_execution import ProductionExecutionService
 
 from .api_config import APIConfig
 from .api_types import API_VERSION, error_envelope
+from .execution_adapter import ProductionExecutionAdapter
 from .job_manager import (
     JobManager,
     JobManagerNotAcceptingError,
@@ -173,6 +174,7 @@ def create_app(
     *,
     execution_service=None,
     execution_service_factory: Optional[Callable[[], object]] = None,
+    execution_adapter_factory: Callable = ProductionExecutionAdapter,
     server_lock_factory: Callable = ServerLock,
     job_manager_factory: Callable = JobManager,
     workspace_manager_factory: Callable = WebWorkspaceManager,
@@ -202,6 +204,7 @@ def create_app(
     lifecycle = APIRuntimeLifecycle(
         config,
         execution_service_provider,
+        execution_adapter_factory=execution_adapter_factory,
         server_lock_factory=server_lock_factory,
         job_manager_factory=job_manager_factory,
         workspace_manager_factory=workspace_manager_factory,
