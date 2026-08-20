@@ -104,8 +104,8 @@ them. The caller supplies a safe session ID and the exact claim is preserved.
 The source video is resolved and validated as a read-only regular file before
 startup, then execution delegates only to `VideoMultimodalRunner`.
 
-Runtime failures currently propagate unchanged; Task06F will define later
-operational failure and abstention behavior. The Frozen G1 contract remains
+Runtime failures propagate from this lifecycle layer to the public-safe
+operational failure boundary described below. The Frozen G1 contract remains
 unchanged, and supplemental visual observations remain excluded from Frozen G1
 candidate units.
 
@@ -121,8 +121,8 @@ minimum-unit threshold is introduced.
 
 Visual observations remain supplemental and can never independently make
 evidence sufficient. Operational and model failures remain outside this policy
-and continue to propagate pending Task06F. Task06E will package the assessment
-into an API-ready result.
+and propagate to the execution boundary. Task06E packages the assessment into
+an API-ready result.
 
 ## API-Ready Production Result
 
@@ -139,6 +139,18 @@ back to the G1 exposure list and never imply a Top-k prediction basis.
 
 The public contract intentionally omits local filesystem paths, raw provenance
 details, and raw internal warning strings. Successful engineering NEI results
-serialize normally. Task06F will define operational failure responses, Task06G
-will consume this contract from the production CLI, and Task07 FastAPI/Gradio
-surfaces may later expose the same contract.
+serialize normally. Task06G will consume this contract from the production CLI,
+and Task07 FastAPI/Gradio surfaces may later expose the same contract.
+
+## Operational Failure Boundary
+
+Successful Fake/Real and successful NOT_RUN/NEI results both have execution
+status `success`. A runtime or result-packaging exception has execution status
+`failure`; it is neither evidence insufficiency nor a Frozen G1 model class, and
+the failure path never fabricates NEI or another verdict.
+
+The deliberately coarse public failure payload exposes only a stable stage and
+code, the exception type name, and a fixed message. Raw exception messages,
+tracebacks, filesystem paths, subprocess stderr, and internal warnings are not
+public. Task06G will use `ProductionExecutionOutcome` for CLI JSON and exit
+codes, while Task07 may later map the same contract to HTTP semantics.
