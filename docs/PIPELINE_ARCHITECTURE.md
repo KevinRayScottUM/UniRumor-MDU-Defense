@@ -108,3 +108,18 @@ Runtime failures currently propagate unchanged; Task06F will define later
 operational failure and abstention behavior. The Frozen G1 contract remains
 unchanged, and supplemental visual observations remain excluded from Frozen G1
 candidate units.
+
+## Structural Evidence Sufficiency
+
+`EvidenceSufficiencyPolicy` audits a successfully completed
+`VideoMultimodalResult` and emits a separate
+`EvidenceSufficiencyAssessment`; it does not modify the verification result.
+Sufficiency is structural, never probability- or logit-threshold based:
+G1-eligible exposure plus a completed Frozen G1 binary result is sufficient,
+while no G1-eligible exposure remains engineering NEI/insufficient. No score or
+minimum-unit threshold is introduced.
+
+Visual observations remain supplemental and can never independently make
+evidence sufficient. Operational and model failures remain outside this policy
+and continue to propagate pending Task06F. Task06E will package the assessment
+into an API-ready result.
