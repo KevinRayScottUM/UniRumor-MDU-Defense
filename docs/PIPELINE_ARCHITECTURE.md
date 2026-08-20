@@ -85,4 +85,26 @@ demands them. Its optional preflight checks filesystem deployment prerequisites
 only; it does not load or hash model weights, and the existing services retain
 ownership of frozen-asset verification. The Frozen G1 scientific contract is
 unchanged, and visual observations remain excluded from Frozen G1 candidate
-units. Task06C will manage runtime lifecycle and execution-wrapper behavior.
+units.
+
+## Unified Production Runtime
+
+```text
+ProductionRuntimeConfig
+  -> ProductionRuntimeFactory
+  -> ProductionRuntimeServices
+  -> ProductionRuntime
+  -> VideoMultimodalRunner
+```
+
+`ProductionRuntime` construction is side-effect free. Its first `start()` runs
+factory preflight and builds the service graph once; later starts and requests
+reuse that exact graph while real models remain lazy until execution demands
+them. The caller supplies a safe session ID and the exact claim is preserved.
+The source video is resolved and validated as a read-only regular file before
+startup, then execution delegates only to `VideoMultimodalRunner`.
+
+Runtime failures currently propagate unchanged; Task06F will define later
+operational failure and abstention behavior. The Frozen G1 contract remains
+unchanged, and supplemental visual observations remain excluded from Frozen G1
+candidate units.
