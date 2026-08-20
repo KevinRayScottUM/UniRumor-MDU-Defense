@@ -7,10 +7,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
+from schemas import ProductionRuntimeConfig
+
 from .api_config import APIConfig, validate_web_runtime_root
 from .api_types import ReadinessPayload
 from .job_manager import JobManager
 from .server_lock import ServerLock
+from .workspace import (
+    WebWorkspaceManager,
+    validate_production_cache_containment,
+)
 
 
 class APIRuntimeStartupError(RuntimeError):
@@ -31,6 +37,7 @@ class APIRuntimeState:
         self.execution_service = None
         self.manager = None
         self.server_lock = None
+        self.workspace_manager = None
 
     def readiness(self) -> ReadinessPayload:
         with self._guard:
@@ -81,6 +88,7 @@ class APIRuntimeLifecycle:
         *,
         server_lock_factory: Callable[[Path], object] = ServerLock,
         job_manager_factory: Callable[[object], object] = JobManager,
+        workspace_manager_factory: Callable[[Path], object] = WebWorkspaceManager,
     ) -> None:
         if not isinstance(config, APIConfig):
             raise TypeError("config must be an APIConfig")
@@ -90,11 +98,25 @@ class APIRuntimeLifecycle:
             raise TypeError("server_lock_factory must be callable")
         if not callable(job_manager_factory):
             raise TypeError("job_manager_factory must be callable")
+        if not callable(workspace_manager_factory):
+            raise TypeError("workspace_manager_factory must be callable")
         self.config = config
         self._execution_service_provider = execution_service_provider
         self._server_lock_factory = server_lock_factory
         self._job_manager_factory = job_manager_factory
+        self._uses_default_job_manager = job_manager_factory is JobManager
+        self._workspace_manager_factory = workspace_manager_factory
         self.state = APIRuntimeState()
+
+    def _validate_production_containment(self, canonical_root: Path) -> None:
+        config_path = self.config.production_runtime_config_path
+        if config_path is None:
+            return
+        production_config = ProductionRuntimeConfig.from_json(config_path)
+        validate_production_cache_containment(
+            canonical_root,
+            production_config.cache_root,
+        )
 
     def _release_lock(self) -> None:
         lock = self.state.server_lock
@@ -120,11 +142,15 @@ class APIRuntimeLifecycle:
     def startup(self) -> None:
         """Use explicit startup failure instead of serving deceptive liveness."""
 
-        canonical_root = validate_web_runtime_root(self.config.web_runtime_root)
-        if canonical_root != self.config.web_runtime_root:
+        try:
+            canonical_root = validate_web_runtime_root(self.config.web_runtime_root)
+            if canonical_root != self.config.web_runtime_root:
+                raise ValueError("web runtime root must remain canonical")
+            self._validate_production_containment(canonical_root)
+        except Exception:
             with self.state._guard:
                 self.state.startup_failed = True
-            raise APIRuntimeStartupError("API runtime startup failed")
+            raise APIRuntimeStartupError("API runtime startup failed") from None
 
         try:
             lock = self._server_lock_factory(canonical_root)
@@ -139,6 +165,24 @@ class APIRuntimeLifecycle:
             self.state.singleton_acquired = True
 
         try:
+            workspace = self._workspace_manager_factory(canonical_root)
+            if not callable(getattr(workspace, "initialize", None)):
+                raise TypeError("workspace manager must provide initialize")
+            if not callable(getattr(workspace, "cleanup_orphans", None)):
+                raise TypeError("workspace manager must provide cleanup_orphans")
+            if not callable(getattr(workspace, "cleanup_job", None)):
+                raise TypeError("workspace manager must provide cleanup_job")
+            if not callable(
+                getattr(workspace, "cleanup_all_job_workspaces", None)
+            ):
+                raise TypeError(
+                    "workspace manager must provide cleanup_all_job_workspaces"
+                )
+            with self.state._guard:
+                self.state.workspace_manager = workspace
+            workspace.initialize()
+            workspace.cleanup_orphans()
+
             service = self._execution_service_provider()
             if not callable(getattr(service, "execute", None)):
                 raise TypeError("execution service must provide execute")
@@ -149,7 +193,13 @@ class APIRuntimeLifecycle:
                 self.state.execution_service = service
             runtime.start()
 
-            manager = self._job_manager_factory(service)
+            if self._uses_default_job_manager:
+                manager = self._job_manager_factory(
+                    service,
+                    on_terminal=workspace.cleanup_job,
+                )
+            else:
+                manager = self._job_manager_factory(service)
             if not callable(getattr(manager, "start", None)):
                 raise TypeError("job manager must provide start")
             with self.state._guard:
@@ -181,6 +231,15 @@ class APIRuntimeLifecycle:
             with self.state._guard:
                 self.state.shutdown_incomplete = True
             return False
+
+        workspace = self.state.workspace_manager
+        if workspace is not None:
+            try:
+                workspace.cleanup_all_job_workspaces()
+            except Exception:
+                with self.state._guard:
+                    self.state.shutdown_incomplete = True
+                return False
 
         self._release_lock()
         with self.state._guard:

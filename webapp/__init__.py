@@ -18,11 +18,21 @@ from .server_lock import (
     ServerLockError,
     ServerLockUnavailableError,
 )
+from .workspace import (
+    ALLOWED_INPUT_EXTENSIONS,
+    JOB_ID_PATTERN,
+    WebWorkspaceError,
+    WebWorkspaceManager,
+    WebWorkspaceSecurityError,
+    validate_production_cache_containment,
+)
 
 __all__ = [
     "APIConfig",
     "API_VERSION",
+    "ALLOWED_INPUT_EXTENSIONS",
     "CapacityReservation",
+    "JOB_ID_PATTERN",
     "JobFailureSnapshot",
     "JobManager",
     "JobManagerError",
@@ -35,5 +45,9 @@ __all__ = [
     "ServerLockError",
     "ServerLockUnavailableError",
     "WebAPIConfig",
+    "WebWorkspaceError",
+    "WebWorkspaceManager",
+    "WebWorkspaceSecurityError",
     "create_app",
+    "validate_production_cache_containment",
 ]

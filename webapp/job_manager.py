@@ -103,9 +103,16 @@ class _ExecutionDisposition:
 class CapacityReservation:
     """A private, single-use claim on one future waiting-queue slot."""
 
-    def __init__(self, manager: "JobManager") -> None:
+    def __init__(self, manager: "JobManager", job_id: str) -> None:
         self._manager = manager
+        self._job_id = job_id
         self._state = "active"
+
+    @property
+    def job_id(self) -> str:
+        """The immutable cryptographic ID owned by this future job."""
+
+        return self._job_id
 
     @property
     def active(self) -> bool:
@@ -137,6 +144,7 @@ class JobManager:
             timedelta, int, float
         ] = DEFAULT_EXPIRED_TOMBSTONE_DURATION,
         clock: Optional[Callable[[], datetime]] = None,
+        on_terminal: Optional[Callable[[str], None]] = None,
     ) -> None:
         if not callable(getattr(execution_service, "execute", None)):
             raise TypeError("execution_service must provide a callable execute method")
@@ -146,6 +154,8 @@ class JobManager:
             raise ValueError("max_queued_jobs must be positive")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
+        if on_terminal is not None and not callable(on_terminal):
+            raise TypeError("on_terminal must be callable or None")
 
         self._execution_service = execution_service
         self._max_queued_jobs = max_queued_jobs
@@ -158,11 +168,13 @@ class JobManager:
             "expired_tombstone_duration",
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._on_terminal = on_terminal
 
         self._condition = threading.Condition(threading.RLock())
         self._jobs: Dict[str, _JobRecord] = {}
         self._queue: Deque[str] = deque()
         self._reservations: Set[CapacityReservation] = set()
+        self._reserved_job_ids: Set[str] = set()
         self._worker: Optional[threading.Thread] = None
         self._worker_stopped = True
         self._started = False
@@ -248,8 +260,10 @@ class JobManager:
                 raise JobManagerNotAcceptingError("job manager is not accepting jobs")
             if not self._capacity_available_locked():
                 raise QueueFullError("waiting job capacity is full")
-            reservation = CapacityReservation(self)
+            job_id = self._new_job_id_locked()
+            reservation = CapacityReservation(self, job_id)
             self._reservations.add(reservation)
+            self._reserved_job_ids.add(job_id)
             return reservation
 
     def _release_reservation(self, reservation: CapacityReservation) -> None:
@@ -260,12 +274,13 @@ class JobManager:
                 return
             reservation._state = "released"
             self._reservations.discard(reservation)
+            self._reserved_job_ids.discard(reservation.job_id)
             self._condition.notify_all()
 
     def _consume_reservation_locked(
         self,
         reservation: CapacityReservation,
-    ) -> None:
+    ) -> str:
         if not isinstance(reservation, CapacityReservation):
             raise ReservationError("a capacity reservation is required")
         if reservation._manager is not self:
@@ -275,13 +290,16 @@ class JobManager:
         if not self._can_accept_locked():
             self._release_reservation(reservation)
             raise JobManagerNotAcceptingError("job manager is not accepting jobs")
+        job_id = reservation.job_id
         reservation._state = "submitted"
         self._reservations.remove(reservation)
+        self._reserved_job_ids.remove(job_id)
+        return job_id
 
     def _new_job_id_locked(self) -> str:
         while True:
             job_id = "job_" + secrets.token_hex(16)
-            if job_id not in self._jobs:
+            if job_id not in self._jobs and job_id not in self._reserved_job_ids:
                 return job_id
 
     def submit_reserved(
@@ -298,9 +316,8 @@ class JobManager:
         stored_path = Path(video_path)
 
         with self._condition:
-            self._consume_reservation_locked(reservation)
+            job_id = self._consume_reservation_locked(reservation)
             now = self._now()
-            job_id = self._new_job_id_locked()
             record = _JobRecord(
                 job_id=job_id,
                 claim=claim,
@@ -435,6 +452,13 @@ class JobManager:
                         self._transition_locked(record, JobState.FAILED, now)
                     self._running_job_id = None
                     self._condition.notify_all()
+
+                callback = self._on_terminal
+                if callback is not None:
+                    try:
+                        callback(job_id)
+                    except Exception:
+                        pass
         finally:
             with self._condition:
                 self._worker_stopped = True
@@ -561,6 +585,7 @@ class JobManager:
             for reservation in tuple(self._reservations):
                 reservation._state = "released"
             self._reservations.clear()
+            self._reserved_job_ids.clear()
             worker = self._worker
             self._condition.notify_all()
 

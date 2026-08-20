@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import secrets
 from typing import Callable, Optional, Tuple
 
@@ -21,9 +20,9 @@ from .job_manager import JobManager
 from .job_types import JobSnapshot, JobState
 from .runtime_lifecycle import APIRuntimeLifecycle
 from .server_lock import ServerLock
+from .workspace import JOB_ID_PATTERN, WebWorkspaceManager
 
 
-JOB_ID_PATTERN = re.compile(r"^job_[0-9a-f]{32}$")
 REQUEST_ID_HEADER = "X-Request-ID"
 
 
@@ -166,6 +165,7 @@ def create_app(
     execution_service_factory: Optional[Callable[[], object]] = None,
     server_lock_factory: Callable = ServerLock,
     job_manager_factory: Callable = JobManager,
+    workspace_manager_factory: Callable = WebWorkspaceManager,
 ) -> FastAPI:
     """Construct the HTTP surface without acquiring or starting dependencies."""
 
@@ -194,6 +194,7 @@ def create_app(
         execution_service_provider,
         server_lock_factory=server_lock_factory,
         job_manager_factory=job_manager_factory,
+        workspace_manager_factory=workspace_manager_factory,
     )
     app = FastAPI(
         title="UniRumor MDU Defense API",

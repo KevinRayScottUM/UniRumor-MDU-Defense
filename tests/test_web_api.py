@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -400,12 +401,17 @@ class WebAPILifecycleTests(unittest.TestCase):
         )
         service = FakeService()
         with patch(
+            "webapp.runtime_lifecycle.ProductionRuntimeConfig.from_json",
+            return_value=SimpleNamespace(cache_root=self.root.parent),
+        ) as config_loader, patch(
             "webapp.api.ProductionExecutionService.from_json",
             return_value=service,
         ) as constructor:
             app = create_app(config)
             constructor.assert_not_called()
+            config_loader.assert_not_called()
             with TestClient(app):
+                config_loader.assert_called_once_with(config_path.resolve())
                 constructor.assert_called_once_with(config_path.resolve())
         self.assertEqual(service.runtime.start_calls, 1)
 
