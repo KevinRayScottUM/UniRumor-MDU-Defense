@@ -1,4 +1,8 @@
-"""Task07 web application concurrency foundations."""
+"""Task07 production web application foundations."""
+
+from .api import create_app
+from .api_config import APIConfig, WebAPIConfig
+from .api_types import API_VERSION
 
 from .job_manager import (
     CapacityReservation,
@@ -16,6 +20,8 @@ from .server_lock import (
 )
 
 __all__ = [
+    "APIConfig",
+    "API_VERSION",
     "CapacityReservation",
     "JobFailureSnapshot",
     "JobManager",
@@ -28,4 +34,6 @@ __all__ = [
     "ServerLock",
     "ServerLockError",
     "ServerLockUnavailableError",
+    "WebAPIConfig",
+    "create_app",
 ]
