@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 DEFAULT_POLL_AFTER_MS = 3000
 DEFAULT_RETRY_AFTER_SECONDS = 3
 DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_UPLOAD_BYTES = 90 * 1024 * 1024
 
 
 def validate_web_runtime_root(value: Union[str, Path]) -> Path:
@@ -100,6 +101,7 @@ class APIConfig:
         DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
     )
     production_runtime_config_path: Optional[Path] = None
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -133,6 +135,15 @@ class APIConfig:
                 "graceful_shutdown_timeout_seconds",
             ),
         )
+        object.__setattr__(
+            self,
+            "max_upload_bytes",
+            _positive_integer(self.max_upload_bytes, "max_upload_bytes"),
+        )
+        if self.max_upload_bytes > DEFAULT_MAX_UPLOAD_BYTES:
+            raise ValueError(
+                "max_upload_bytes must not exceed the 90 MiB baseline limit"
+            )
         if self.production_runtime_config_path is not None:
             if not isinstance(self.production_runtime_config_path, (str, Path)):
                 raise TypeError(
@@ -151,6 +162,7 @@ WebAPIConfig = APIConfig
 __all__ = [
     "APIConfig",
     "DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_UPLOAD_BYTES",
     "DEFAULT_POLL_AFTER_MS",
     "DEFAULT_RETRY_AFTER_SECONDS",
     "WebAPIConfig",

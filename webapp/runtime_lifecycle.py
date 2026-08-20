@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,25 @@ from .workspace import (
 
 class APIRuntimeStartupError(RuntimeError):
     """Fixed internal startup failure without deployment details."""
+
+
+def _require_positional_interface(
+    owner: object,
+    method_name: str,
+    positional_argument_count: int,
+) -> None:
+    """Validate a bound callable signature without invoking the dependency."""
+
+    method = getattr(owner, method_name, None)
+    if not callable(method):
+        raise TypeError(f"workspace manager must provide {method_name}")
+    try:
+        signature = inspect.signature(method)
+        signature.bind(*(object() for _ in range(positional_argument_count)))
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"workspace manager method {method_name} has an incompatible signature"
+        ) from None
 
 
 class APIRuntimeState:
@@ -172,6 +192,9 @@ class APIRuntimeLifecycle:
                 raise TypeError("workspace manager must provide cleanup_orphans")
             if not callable(getattr(workspace, "cleanup_job", None)):
                 raise TypeError("workspace manager must provide cleanup_job")
+            _require_positional_interface(workspace, "prepare_job_workspace", 1)
+            _require_positional_interface(workspace, "job_input_path", 2)
+            _require_positional_interface(workspace, "create_job_input", 2)
             if not callable(
                 getattr(workspace, "cleanup_all_job_workspaces", None)
             ):

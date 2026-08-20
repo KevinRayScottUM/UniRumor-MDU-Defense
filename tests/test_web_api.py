@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import json
+import stat
 import tempfile
 import threading
 import time
@@ -24,7 +25,7 @@ from services.production_execution import (
 )
 from services.production_result import ProductionResult
 from webapp.api import _RequestBoundaryMiddleware, create_app
-from webapp.api_config import APIConfig
+from webapp.api_config import APIConfig, DEFAULT_MAX_UPLOAD_BYTES
 from webapp.job_manager import JobManager
 from webapp.job_types import JobFailureSnapshot, JobSnapshot, JobState
 from webapp.runtime_lifecycle import APIRuntimeLifecycle, APIRuntimeStartupError
@@ -34,6 +35,7 @@ from webapp.server_lock import ServerLock, ServerLockUnavailableError
 JOB_A = "job_0123456789abcdef0123456789abcdef"
 JOB_B = "job_fedcba9876543210fedcba9876543210"
 PRIVATE_PATH = "/private/model/cache/secret"
+VALID_MP4 = b"\x00\x00\x00\x18ftypisom" + (b"\x00" * 20)
 
 
 class BarrierBaseException(BaseException):
@@ -67,6 +69,35 @@ class FakeService:
         if self.error is not None:
             raise self.error
         return self.outcome
+
+
+class BlockingSubmissionService(FakeService):
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.returned_outcome = None
+        self.input_mode = None
+
+    def execute(self, session_id, claim, video_path):
+        path = Path(video_path)
+        self.calls.append((session_id, claim, path))
+        self.input_mode = stat.S_IMODE(path.stat().st_mode)
+        self.started.set()
+        if not self.release.wait(2):
+            raise RuntimeError("test synchronization deadline reached")
+        self.returned_outcome = success_outcome(job_id=session_id)
+        return self.returned_outcome
+
+
+class ShutdownBeforeSubmitManager(JobManager):
+    def submit_reserved(self, reservation, *, claim, video_path):
+        self.shutdown(timeout=1)
+        return super().submit_reserved(
+            reservation,
+            claim=claim,
+            video_path=video_path,
+        )
 
 
 class RecordingLock:
@@ -273,6 +304,13 @@ class WebAPIConfigTests(unittest.TestCase):
         self.assertEqual(config.poll_after_ms, 3000)
         self.assertEqual(config.retry_after_seconds, 3)
         self.assertEqual(config.graceful_shutdown_timeout_seconds, 30.0)
+        self.assertEqual(config.max_upload_bytes, 90 * 1024 * 1024)
+
+    def test_upload_limit_is_positive_and_can_only_be_configured_downward(self):
+        self.assertEqual(APIConfig(self.root, max_upload_bytes=1024).max_upload_bytes, 1024)
+        for value in (0, -1, True, DEFAULT_MAX_UPLOAD_BYTES + 1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                APIConfig(self.root, max_upload_bytes=value)
 
     def test_wildcard_and_blank_origins_are_rejected(self):
         for origins in (("*",), ("https://*.example.test",), ("",), ("  ",)):
@@ -562,6 +600,264 @@ class WebAPIHTTPTests(unittest.TestCase):
                 },
             },
         )
+
+    @staticmethod
+    def post_video(
+        client,
+        *,
+        claim="exact focal claim",
+        filename="caller-video.mp4",
+        content=VALID_MP4,
+        mime="video/mp4",
+        extra_fields=None,
+    ):
+        data = {"claim": claim}
+        if extra_fields:
+            data.update(extra_fields)
+        return client.post(
+            "/api/v1/jobs",
+            data=data,
+            files={"video": (filename, content, mime)},
+        )
+
+    def test_post_submission_is_202_workspace_safe_and_result_authoritative(self):
+        service = BlockingSubmissionService()
+        self.addCleanup(service.release.set)
+        app = create_app(self.config, execution_service=service)
+        exact_claim = "  exact focal claim preserved  "
+
+        with TestClient(app) as client:
+            response = self.post_video(client, claim=exact_claim)
+            self.assertEqual(response.status_code, 202)
+            body = response.json()
+            self.assertEqual(
+                set(body),
+                {"api_version", "job_id", "state", "request_id"},
+            )
+            self.assertEqual(body["api_version"], "v1")
+            self.assertRegex(body["job_id"], r"^job_[0-9a-f]{32}$")
+            self.assertIn(body["state"], {"queued", "running"})
+            self.assertEqual(body["request_id"], response.headers["X-Request-ID"])
+            self.assertEqual(
+                response.headers["Location"],
+                f"/api/v1/jobs/{body['job_id']}",
+            )
+            self.assertNotIn(str(self.root), json.dumps(body))
+
+            self.assertTrue(service.started.wait(1))
+            session_id, claim, input_path = service.calls[0]
+            self.assertEqual(session_id, body["job_id"])
+            self.assertEqual(claim, exact_claim)
+            self.assertEqual(input_path.name, "input.mp4")
+            self.assertEqual(input_path.parent.name, body["job_id"])
+            self.assertEqual(input_path.parent.parent.name, "jobs")
+            self.assertTrue(input_path.is_file())
+            self.assertEqual(service.input_mode, 0o600)
+            self.assertEqual(stat.S_IMODE(input_path.parent.stat().st_mode), 0o700)
+
+            service.release.set()
+            manager = app.state.api_runtime_state.manager
+            completed = manager.wait_for_state(
+                body["job_id"],
+                JobState.COMPLETED,
+                timeout=1,
+            )
+            self.assertIsNotNone(completed)
+            deadline = time.monotonic() + 1
+            while input_path.parent.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertFalse(input_path.parent.exists())
+
+            result = client.get(f"/api/v1/jobs/{body['job_id']}/result")
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(
+                result.json()["outcome"],
+                service.returned_outcome.to_dict(),
+            )
+
+    def test_post_queue_full_rejects_without_job_or_workspace(self):
+        service = FakeService(outcome=success_outcome())
+        app = create_app(self.config, execution_service=service)
+        with TestClient(app) as client:
+            manager = app.state.api_runtime_state.manager
+            reservations = [
+                manager.reserve_capacity() for _ in range(manager.max_queued_jobs)
+            ]
+            try:
+                response = self.post_video(client)
+            finally:
+                for reservation in reservations:
+                    reservation.release()
+
+            self.assert_public_error(response, 429, "queue_full")
+            self.assertEqual(response.headers["Retry-After"], "7")
+            self.assertEqual(manager._jobs, {})
+            self.assertEqual(
+                list(app.state.api_runtime_state.workspace_manager.jobs_root.iterdir()),
+                [],
+            )
+            self.assertEqual(service.calls, [])
+
+    def test_post_invalid_inputs_create_no_job_and_leave_no_workspace(self):
+        service = FakeService(outcome=success_outcome())
+        app = create_app(self.config, execution_service=service)
+        cases = (
+            ({"claim": "   "}, 422, "invalid_claim"),
+            ({"claim": "x" * 2001}, 422, "invalid_claim"),
+            ({"content": b""}, 422, "empty_upload"),
+            ({"filename": "../caller.mp4"}, 422, "invalid_filename"),
+            ({"filename": "caller.avi", "mime": "video/x-msvideo"}, 415, "unsupported_video_type"),
+            ({"mime": "application/octet-stream"}, 415, "unsupported_video_type"),
+            ({"content": b"not-an-mp4-container"}, 415, "unsupported_video_type"),
+            ({"extra_fields": {"model": "forbidden"}}, 400, "malformed_request"),
+        )
+        with TestClient(app) as client:
+            manager = app.state.api_runtime_state.manager
+            workspace = app.state.api_runtime_state.workspace_manager
+            for arguments, status_code, code in cases:
+                with self.subTest(code=code, arguments=arguments):
+                    response = self.post_video(client, **arguments)
+                    self.assert_public_error(response, status_code, code)
+                    self.assertEqual(manager._jobs, {})
+                    self.assertEqual(list(workspace.jobs_root.iterdir()), [])
+            missing_video = client.post(
+                "/api/v1/jobs",
+                data={"claim": "exact focal claim"},
+            )
+            self.assert_public_error(missing_video, 400, "malformed_request")
+            missing_claim = client.post(
+                "/api/v1/jobs",
+                files={"video": ("caller.mp4", VALID_MP4, "video/mp4")},
+            )
+            self.assert_public_error(missing_claim, 422, "invalid_claim")
+            self.assertEqual(manager._jobs, {})
+            self.assertEqual(service.calls, [])
+
+    def test_post_rejects_malformed_iso_bmff_box_sizes(self):
+        service = FakeService(outcome=success_outcome())
+        app = create_app(self.config, execution_service=service)
+        malformed_boxes = (
+            b"\x00\x00\x00\x08ftypjunk",
+            b"\x00\x00\x00\x01ftyp" + b"\x00" * 4,
+        )
+        with TestClient(app) as client:
+            manager = app.state.api_runtime_state.manager
+            workspace = app.state.api_runtime_state.workspace_manager
+            for content in malformed_boxes:
+                with self.subTest(content=content):
+                    response = self.post_video(client, content=content)
+                    self.assert_public_error(
+                        response,
+                        415,
+                        "unsupported_video_type",
+                    )
+                    self.assertEqual(manager._jobs, {})
+                    self.assertEqual(list(workspace.jobs_root.iterdir()), [])
+            self.assertEqual(service.calls, [])
+
+    def test_shutdown_during_submission_returns_service_not_ready(self):
+        service = FakeService(outcome=success_outcome())
+        holder = {}
+
+        def manager_factory(execution_service):
+            manager = ShutdownBeforeSubmitManager(execution_service)
+            holder["manager"] = manager
+            return manager
+
+        app = create_app(
+            self.config,
+            execution_service=service,
+            job_manager_factory=manager_factory,
+        )
+        with TestClient(app) as client:
+            response = self.post_video(client)
+            self.assert_public_error(response, 503, "service_not_ready")
+            self.assertEqual(response.headers["Retry-After"], "7")
+            self.assertEqual(holder["manager"].reservation_count, 0)
+            self.assertEqual(holder["manager"]._jobs, {})
+            self.assertEqual(
+                list(app.state.api_runtime_state.workspace_manager.jobs_root.iterdir()),
+                [],
+            )
+            self.assertEqual(service.calls, [])
+
+    def test_post_streamed_upload_limit_is_enforced_and_partial_file_removed(self):
+        config = APIConfig(
+            self.root,
+            ("https://frontend.example",),
+            retry_after_seconds=7,
+            max_upload_bytes=16,
+        )
+        service = FakeService(outcome=success_outcome())
+        app = create_app(config, execution_service=service)
+        with TestClient(app) as client:
+            response = self.post_video(client, content=VALID_MP4)
+            self.assert_public_error(response, 413, "upload_too_large")
+            self.assertEqual(
+                list(app.state.api_runtime_state.workspace_manager.jobs_root.iterdir()),
+                [],
+            )
+            self.assertEqual(app.state.api_runtime_state.manager._jobs, {})
+            self.assertEqual(service.calls, [])
+
+    def test_post_declared_body_limit_is_rejected_before_reservation(self):
+        config = APIConfig(self.root, max_upload_bytes=16)
+        service = FakeService(outcome=success_outcome())
+        app = create_app(config, execution_service=service)
+        boundary = "declared-limit-boundary"
+        body = f"--{boundary}--\r\n".encode("ascii")
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/jobs",
+                content=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(16 + (64 * 1024) + 1),
+                },
+            )
+            self.assert_public_error(response, 413, "upload_too_large")
+            self.assertEqual(app.state.api_runtime_state.manager.reservation_count, 0)
+            self.assertEqual(
+                list(app.state.api_runtime_state.workspace_manager.jobs_root.iterdir()),
+                [],
+            )
+            self.assertEqual(service.calls, [])
+
+    def test_post_execution_failure_is_failed_and_public_safe(self):
+        service = FakeService(outcome=failure_outcome())
+        app = create_app(self.config, execution_service=service)
+        with TestClient(app) as client:
+            response = self.post_video(client)
+            self.assertEqual(response.status_code, 202)
+            job_id = response.json()["job_id"]
+            manager = app.state.api_runtime_state.manager
+            snapshot_value = manager.wait_for_state(
+                job_id,
+                JobState.FAILED,
+                timeout=1,
+            )
+            self.assertIsNotNone(snapshot_value)
+
+            status_response = client.get(f"/api/v1/jobs/{job_id}")
+            self.assertEqual(status_response.status_code, 200)
+            encoded = json.dumps(status_response.json())
+            self.assertEqual(
+                status_response.json()["job"]["failure"]["code"],
+                "runtime_execution_failed",
+            )
+            self.assertNotIn("PrivateRuntimeError", encoded)
+            self.assertNotIn("PrivateFailure", encoded)
+            self.assertNotIn(str(self.root), encoded)
+
+            result_response = client.get(f"/api/v1/jobs/{job_id}/result")
+            self.assert_public_error(result_response, 409, "job_failed")
+            job_path = (
+                app.state.api_runtime_state.workspace_manager.jobs_root / job_id
+            )
+            deadline = time.monotonic() + 1
+            while job_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertFalse(job_path.exists())
 
     def test_health_is_exact_liveness_only_with_server_request_id(self):
         service = FakeService()
@@ -919,7 +1215,7 @@ class WebAPIHTTPTests(unittest.TestCase):
             rejected_preflight.headers,
         )
 
-    def test_route_table_has_only_task07c_api_routes_and_no_post_jobs(self):
+    def test_route_table_includes_only_the_required_submission_addition(self):
         app = create_app(self.config, execution_service=FakeService())
         routes = {
             (method, route.path)
@@ -929,11 +1225,11 @@ class WebAPIHTTPTests(unittest.TestCase):
         for expected in (
             ("GET", "/api/v1/health"),
             ("GET", "/api/v1/readiness"),
+            ("POST", "/api/v1/jobs"),
             ("GET", "/api/v1/jobs/{job_id}"),
             ("GET", "/api/v1/jobs/{job_id}/result"),
         ):
             self.assertIn(expected, routes)
-        self.assertNotIn(("POST", "/api/v1/jobs"), routes)
 
     def test_production_web_source_preserves_closed_execution_boundary(self):
         webapp_root = Path(__file__).resolve().parents[1] / "webapp"

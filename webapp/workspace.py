@@ -7,7 +7,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Union
+from typing import BinaryIO, Union
 
 
 JOB_ID_PATTERN = re.compile(r"^job_[0-9a-f]{32}$")
@@ -294,6 +294,61 @@ class WebWorkspaceManager:
         if candidate.parent != job_path:
             raise WebWorkspaceSecurityError("job input path escaped workspace")
         return candidate
+
+    def create_job_input(
+        self,
+        job_id: str,
+        validated_extension: str,
+    ) -> BinaryIO:
+        """Exclusively open one owner-only fixed input file without symlinks."""
+
+        self._job_path(job_id)
+        if not isinstance(validated_extension, str):
+            raise TypeError("validated_extension must be a string")
+        if validated_extension not in ALLOWED_INPUT_EXTENSIONS:
+            raise ValueError("validated_extension is not allowed")
+
+        jobs_fd = self._open_jobs_root()
+        input_fd = None
+        try:
+            try:
+                job_fd = os.open(job_id, self._directory_flags(), dir_fd=jobs_fd)
+            except OSError:
+                raise WebWorkspaceSecurityError(
+                    "job workspace must be a non-symlink directory"
+                ) from None
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    input_fd = os.open(
+                        "input" + validated_extension,
+                        flags,
+                        0o600,
+                        dir_fd=job_fd,
+                    )
+                except OSError:
+                    raise WebWorkspaceSecurityError(
+                        "job input file could not be created safely"
+                    ) from None
+                if hasattr(os, "fchmod"):
+                    os.fchmod(input_fd, 0o600)
+            except Exception:
+                if input_fd is not None:
+                    os.close(input_fd)
+                    input_fd = None
+                raise
+            finally:
+                os.close(job_fd)
+        finally:
+            os.close(jobs_fd)
+
+        try:
+            return os.fdopen(input_fd, "wb")
+        except Exception:
+            os.close(input_fd)
+            raise
 
     def cleanup_job(self, job_id: str) -> None:
         """Idempotently delete exactly one canonical Task07-owned workspace."""

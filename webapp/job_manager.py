@@ -285,11 +285,11 @@ class JobManager:
             raise ReservationError("a capacity reservation is required")
         if reservation._manager is not self:
             raise ReservationError("reservation belongs to a different manager")
-        if reservation._state != "active" or reservation not in self._reservations:
-            raise ReservationError("reservation is no longer available")
         if not self._can_accept_locked():
             self._release_reservation(reservation)
             raise JobManagerNotAcceptingError("job manager is not accepting jobs")
+        if reservation._state != "active" or reservation not in self._reservations:
+            raise ReservationError("reservation is no longer available")
         job_id = reservation.job_id
         reservation._state = "submitted"
         self._reservations.remove(reservation)

@@ -16,10 +16,20 @@ from services.production_execution import ProductionExecutionService
 
 from .api_config import APIConfig
 from .api_types import API_VERSION, error_envelope
-from .job_manager import JobManager
+from .job_manager import (
+    JobManager,
+    JobManagerNotAcceptingError,
+    QueueFullError,
+    ReservationError,
+)
 from .job_types import JobSnapshot, JobState
 from .runtime_lifecycle import APIRuntimeLifecycle
 from .server_lock import ServerLock
+from .submission import (
+    SubmissionValidationError,
+    receive_submission,
+    validate_submission_headers,
+)
 from .workspace import JOB_ID_PATTERN, WebWorkspaceManager
 
 
@@ -245,6 +255,92 @@ def create_app(
             status_code=status_code,
             headers=headers,
         )
+
+    @app.post("/api/v1/jobs")
+    async def submit_job(request: Request):
+        try:
+            submission_headers = validate_submission_headers(
+                request,
+                config.max_upload_bytes,
+            )
+        except SubmissionValidationError as error:
+            return _error_response(request, error.status_code, error.code)
+
+        manager = lifecycle.state.manager
+        workspace = lifecycle.state.workspace_manager
+        if manager is None or workspace is None:
+            return _error_response(
+                request,
+                503,
+                "service_not_ready",
+                headers={"Retry-After": str(config.retry_after_seconds)},
+            )
+        try:
+            reservation = manager.reserve_capacity()
+        except QueueFullError:
+            return _error_response(
+                request,
+                429,
+                "queue_full",
+                headers={"Retry-After": str(config.retry_after_seconds)},
+            )
+        except JobManagerNotAcceptingError:
+            return _error_response(
+                request,
+                503,
+                "service_not_ready",
+                headers={"Retry-After": str(config.retry_after_seconds)},
+            )
+
+        submitted = False
+        try:
+            workspace.prepare_job_workspace(reservation.job_id)
+            try:
+                parsed = await receive_submission(
+                    request,
+                    submission_headers,
+                    workspace,
+                    reservation.job_id,
+                    config.max_upload_bytes,
+                )
+            except SubmissionValidationError as error:
+                return _error_response(request, error.status_code, error.code)
+
+            try:
+                job_id = manager.submit_reserved(
+                    reservation,
+                    claim=parsed.claim,
+                    video_path=parsed.video_path,
+                )
+            except (JobManagerNotAcceptingError, ReservationError):
+                return _error_response(
+                    request,
+                    503,
+                    "service_not_ready",
+                    headers={"Retry-After": str(config.retry_after_seconds)},
+                )
+            submitted = True
+            snapshot = manager.get_snapshot(job_id)
+            if snapshot is None:
+                return _error_response(request, 500, "internal_error")
+            request_id = _request_id(request)
+            return JSONResponse(
+                {
+                    "api_version": API_VERSION,
+                    "job_id": job_id,
+                    "state": snapshot.state.value,
+                    "request_id": request_id,
+                },
+                status_code=202,
+                headers={"Location": f"/api/v1/jobs/{job_id}"},
+            )
+        finally:
+            if not submitted:
+                reservation.release()
+                try:
+                    workspace.cleanup_job(reservation.job_id)
+                except Exception:
+                    pass
 
     @app.get("/api/v1/jobs/{job_id}")
     async def job_status(request: Request, job_id: str):

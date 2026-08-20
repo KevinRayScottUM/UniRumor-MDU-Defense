@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -498,6 +499,29 @@ class WebWorkspaceManagerTests(unittest.TestCase):
             manager.job_input_path(JOB_A, ".mp4")
         self.assertEqual(outside.read_bytes(), b"outside")
 
+    def test_input_creation_is_owner_only_exclusive_and_fixed_name(self):
+        manager = self.initialized_manager()
+        job_path = manager.prepare_job_workspace(JOB_A)
+        with manager.create_job_input(JOB_A, ".mp4") as output:
+            output.write(b"video")
+
+        input_path = job_path / "input.mp4"
+        self.assertEqual(input_path.read_bytes(), b"video")
+        self.assertEqual(stat.S_IMODE(input_path.stat().st_mode), 0o600)
+        with self.assertRaises(WebWorkspaceSecurityError):
+            manager.create_job_input(JOB_A, ".mp4")
+
+    def test_input_creation_never_follows_an_existing_symlink(self):
+        manager = self.initialized_manager()
+        job_path = manager.prepare_job_workspace(JOB_A)
+        outside = self.base / "outside.mp4"
+        outside.write_bytes(b"preserve")
+        (job_path / "input.mp4").symlink_to(outside)
+
+        with self.assertRaises(WebWorkspaceSecurityError):
+            manager.create_job_input(JOB_A, ".mp4")
+        self.assertEqual(outside.read_bytes(), b"preserve")
+
     def test_cleanup_is_recursive_and_idempotent(self):
         manager = self.initialized_manager()
         job_path = manager.prepare_job_workspace(JOB_A)
@@ -618,6 +642,9 @@ class RecordingWorkspace:
 
     def job_input_path(self, job_id, extension):
         return self._workspace.job_input_path(job_id, extension)
+
+    def create_job_input(self, job_id, extension):
+        return self._workspace.create_job_input(job_id, extension)
 
     def cleanup_job(self, job_id):
         self.events.append("workspace.cleanup_job")
@@ -748,6 +775,155 @@ class WorkspaceLifecycleTests(unittest.TestCase):
                 "manager.start",
             ],
         )
+
+    def test_startup_rejects_missing_workspace_submission_method(self):
+        required_methods = (
+            "prepare_job_workspace",
+            "job_input_path",
+            "create_job_input",
+        )
+        for method_name in required_methods:
+            with self.subTest(method_name=method_name):
+                root = self.base / ("missing-" + method_name)
+                root.mkdir()
+                events = []
+                service = FakeService(events=events)
+
+                def workspace_factory(value, missing=method_name):
+                    workspace = RecordingWorkspace(value, events)
+                    methods = {
+                        name: getattr(workspace, name)
+                        for name in (
+                            "initialize",
+                            "cleanup_orphans",
+                            "cleanup_job",
+                            "cleanup_all_job_workspaces",
+                            *required_methods,
+                        )
+                        if name != missing
+                    }
+                    return SimpleNamespace(**methods)
+
+                lifecycle = APIRuntimeLifecycle(
+                    APIConfig(root),
+                    lambda: service,
+                    workspace_manager_factory=workspace_factory,
+                )
+
+                with self.assertRaises(APIRuntimeStartupError):
+                    lifecycle.startup()
+                readiness = lifecycle.state.readiness()
+                self.assertEqual(readiness.status, "not_ready")
+                self.assertFalse(readiness.accepting_jobs)
+                self.assertFalse(lifecycle.state.singleton_acquired)
+                self.assertEqual(service.runtime.start_calls, 0)
+
+    def test_startup_rejects_non_callable_workspace_submission_method(self):
+        required_methods = (
+            "prepare_job_workspace",
+            "job_input_path",
+            "create_job_input",
+        )
+        for method_name in required_methods:
+            with self.subTest(method_name=method_name):
+                root = self.base / ("non-callable-" + method_name)
+                root.mkdir()
+                events = []
+                service = FakeService(events=events)
+
+                def workspace_factory(value, invalid=method_name):
+                    workspace = RecordingWorkspace(value, events)
+                    setattr(workspace, invalid, None)
+                    return workspace
+
+                lifecycle = APIRuntimeLifecycle(
+                    APIConfig(root),
+                    lambda: service,
+                    workspace_manager_factory=workspace_factory,
+                )
+
+                with self.assertRaises(APIRuntimeStartupError):
+                    lifecycle.startup()
+                self.assertFalse(lifecycle.state.readiness().accepting_jobs)
+                self.assertFalse(lifecycle.state.singleton_acquired)
+                self.assertEqual(service.runtime.start_calls, 0)
+
+    def test_startup_rejects_incompatible_workspace_submission_signature(self):
+        incompatible_methods = {
+            "prepare_job_workspace": lambda: None,
+            "job_input_path": lambda job_id: None,
+            "create_job_input": lambda job_id: None,
+        }
+        for method_name, incompatible in incompatible_methods.items():
+            with self.subTest(method_name=method_name):
+                root = self.base / ("incompatible-" + method_name)
+                root.mkdir()
+                events = []
+                service = FakeService(events=events)
+
+                def workspace_factory(
+                    value,
+                    invalid=method_name,
+                    replacement=incompatible,
+                ):
+                    workspace = RecordingWorkspace(value, events)
+                    setattr(workspace, invalid, replacement)
+                    return workspace
+
+                lifecycle = APIRuntimeLifecycle(
+                    APIConfig(root),
+                    lambda: service,
+                    workspace_manager_factory=workspace_factory,
+                )
+
+                with self.assertRaises(APIRuntimeStartupError):
+                    lifecycle.startup()
+                self.assertFalse(lifecycle.state.readiness().accepting_jobs)
+                self.assertFalse(lifecycle.state.singleton_acquired)
+                self.assertEqual(service.runtime.start_calls, 0)
+
+    def test_compatible_workspace_submission_signatures_are_not_executed(self):
+        root = self.base / "compatible-submission-workspace"
+        root.mkdir()
+        events = []
+        submission_calls = []
+        service = FakeService(events=events)
+
+        def workspace_factory(value):
+            workspace = RecordingWorkspace(value, events)
+            prepare = workspace.prepare_job_workspace
+            input_path = workspace.job_input_path
+            create_input = workspace.create_job_input
+
+            def prepare_job_workspace(job_id):
+                submission_calls.append("prepare_job_workspace")
+                return prepare(job_id)
+
+            def job_input_path(job_id, extension):
+                submission_calls.append("job_input_path")
+                return input_path(job_id, extension)
+
+            def create_job_input(job_id, extension):
+                submission_calls.append("create_job_input")
+                return create_input(job_id, extension)
+
+            workspace.prepare_job_workspace = prepare_job_workspace
+            workspace.job_input_path = job_input_path
+            workspace.create_job_input = create_job_input
+            return workspace
+
+        lifecycle = APIRuntimeLifecycle(
+            APIConfig(root),
+            lambda: service,
+            workspace_manager_factory=workspace_factory,
+        )
+        lifecycle.startup()
+        self.addCleanup(lifecycle.shutdown)
+
+        readiness = lifecycle.state.readiness()
+        self.assertEqual(readiness.status, "ready")
+        self.assertTrue(readiness.accepting_jobs)
+        self.assertEqual(submission_calls, [])
 
     def test_lock_contention_performs_zero_workspace_or_runtime_work(self):
         root = self.base / "web-runtime"
@@ -916,7 +1092,7 @@ class WorkspaceLifecycleTests(unittest.TestCase):
 
 
 class WorkspaceBoundaryTests(unittest.TestCase):
-    def test_post_jobs_and_multipart_are_still_absent(self):
+    def test_post_jobs_uses_streaming_parser_without_uploadfile(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             app = create_app(
                 APIConfig(Path(temporary_directory)),
@@ -927,11 +1103,14 @@ class WorkspaceBoundaryTests(unittest.TestCase):
                 for route in app.routes
                 for method in getattr(route, "methods", set())
             }
-        self.assertNotIn(("POST", "/api/v1/jobs"), routes)
-        api_source = inspect.getsource(__import__("webapp.api", fromlist=["*"]))
-        self.assertNotIn("multipart", api_source.lower())
-        self.assertNotIn("UploadFile", api_source)
-        self.assertNotIn("Request.stream", api_source)
+        self.assertIn(("POST", "/api/v1/jobs"), routes)
+        webapp_root = Path(__file__).resolve().parents[1] / "webapp"
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(webapp_root.glob("*.py"))
+        )
+        self.assertNotIn("UploadFile", source)
+        self.assertIn("request.stream()", source)
 
     def test_task07d_production_source_has_no_direct_scientific_dependency(self):
         webapp_root = Path(__file__).resolve().parents[1] / "webapp"

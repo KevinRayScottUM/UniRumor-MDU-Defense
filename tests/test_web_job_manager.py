@@ -268,6 +268,19 @@ class WebJobManagerTests(unittest.TestCase):
                 video_path=self.PRIVATE_VIDEO,
             )
 
+    def test_shutdown_invalidated_reservation_is_not_accepting(self):
+        manager = self._started_manager(ConstantService(self._success()))
+        reservation = manager.reserve_capacity()
+        self.assertTrue(manager.shutdown(timeout=1))
+
+        with self.assertRaises(JobManagerNotAcceptingError):
+            manager.submit_reserved(
+                reservation,
+                claim="claim",
+                video_path=self.PRIVATE_VIDEO,
+            )
+        self.assertEqual(manager.reservation_count, 0)
+
     def test_reservation_cannot_be_submitted_twice(self):
         manager = self._started_manager(ConstantService(self._success()))
         reservation = manager.reserve_capacity()

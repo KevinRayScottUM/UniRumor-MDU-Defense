@@ -18,6 +18,12 @@ PUBLIC_ERROR_MESSAGES = {
     "not_found": "Resource not found.",
     "method_not_allowed": "Method not allowed.",
     "malformed_request": "Request could not be processed.",
+    "upload_too_large": "Uploaded video exceeds the configured size limit.",
+    "unsupported_video_type": "Video type is not supported.",
+    "invalid_claim": "Claim must contain between 1 and 2,000 characters.",
+    "empty_upload": "Uploaded video must not be empty.",
+    "invalid_filename": "Video filename is invalid.",
+    "queue_full": "Job queue is full.",
 }
 
 
