@@ -139,8 +139,8 @@ back to the G1 exposure list and never imply a Top-k prediction basis.
 
 The public contract intentionally omits local filesystem paths, raw provenance
 details, and raw internal warning strings. Successful engineering NEI results
-serialize normally. Task06G will consume this contract from the production CLI,
-and Task07 FastAPI/Gradio surfaces may later expose the same contract.
+serialize normally. The Task06G production CLI consumes this contract, and
+Task07 FastAPI/Gradio surfaces may later expose the same contract.
 
 ## Operational Failure Boundary
 
@@ -152,5 +152,29 @@ the failure path never fabricates NEI or another verdict.
 The deliberately coarse public failure payload exposes only a stable stage and
 code, the exception type name, and a fixed message. Raw exception messages,
 tracebacks, filesystem paths, subprocess stderr, and internal warnings are not
-public. Task06G will use `ProductionExecutionOutcome` for CLI JSON and exit
-codes, while Task07 may later map the same contract to HTTP semantics.
+public. Task06G uses `ProductionExecutionOutcome` for CLI JSON and exit codes,
+while Task07 may later map the same contract to HTTP semantics.
+
+## Production CLI
+
+The official command-line entry point composes the existing production
+execution service without adding another inference or result pipeline:
+
+```bash
+python -m app.production_cli \
+    --config /path/to/production_runtime.json \
+    --session-id demo-001 \
+    --claim "..." \
+    --video /path/to/video.mp4
+```
+
+Standard output is exactly one compact `ProductionExecutionOutcome` JSON
+document. Exit code `0` means successful execution, including Fake, Real, and
+normal NOT_RUN/NEI results. Exit code `1` means Task06F returned a public-safe
+operational failure outcome; an operational failure never becomes NEI. Exit
+code `2` means CLI usage, configuration, or service initialization failed.
+
+The CLI does not expose raw exceptions or local paths, and it does not alter
+scientific parameters. Deployment paths, devices, and model settings remain in
+the production configuration. Task07 FastAPI/Gradio surfaces will reuse
+`ProductionExecutionService` directly rather than shelling out to this CLI.
