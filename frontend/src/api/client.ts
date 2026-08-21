@@ -112,7 +112,7 @@ export class ApiClient {
       throw new TypeError("A Fetch API implementation is required.");
     }
     this.baseUrl = normalizeBaseUrl(baseUrl);
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = (...args) => fetchImpl(...args);
   }
 
   private async request<T>(

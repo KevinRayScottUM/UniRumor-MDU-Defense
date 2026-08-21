@@ -2,11 +2,16 @@
   "name": "unirumor-mdu-defense-frontend",
   "private": true,
   "version": "0.1.0",
+  "description": "Static research-demo frontend for explainable multimodal misinformation verification.",
   "type": "module",
+  "engines": {
+    "node": ">=22.16.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "npm run check && vite build",
     "check": "tsc --noEmit",
+    "preview": "vite preview",
     "test": "vitest run"
   },
   "dependencies": {
@@ -26,4 +31,3 @@
     "vitest": "^3.2.4"
   }
 }
-

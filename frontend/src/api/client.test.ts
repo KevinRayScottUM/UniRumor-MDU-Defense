@@ -24,6 +24,19 @@ describe("ApiClient", () => {
     });
   });
 
+  it("invokes the injected Fetch implementation without rebinding it", async () => {
+    let observedThis: unknown = "not-called";
+    const fetchMock = function (this: unknown) {
+      observedThis = this;
+      return Promise.resolve(jsonResponse({ api_version: "v1", status: "ok" }));
+    } as typeof fetch;
+    const client = createApiClient({ fetch: fetchMock });
+
+    await client.getHealth();
+
+    expect(observedThis).toBeUndefined();
+  });
+
   it("uses the authoritative health, readiness, status, and result routes", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()

@@ -57,6 +57,7 @@ demo_videos/*
 # Secrets / environment
 .env
 .env.*
+!frontend/.env.example
 *.pem
 *.key
 
