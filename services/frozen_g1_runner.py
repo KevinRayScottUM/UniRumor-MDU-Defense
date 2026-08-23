@@ -181,9 +181,11 @@ class FrozenG1Runner:
             session_id=session_id,
             claim=claim,
             model_verdict=model_verdict,
-            display_verdict=(
-                DisplayVerdict.FAKE if model_verdict is ModelVerdict.FAKE else DisplayVerdict.REAL
-            ),
+            display_verdict={
+                ModelVerdict.FAKE: DisplayVerdict.FAKE,
+                ModelVerdict.REAL: DisplayVerdict.REAL,
+                ModelVerdict.NOT_RUN: DisplayVerdict.NEI,
+            }[model_verdict],
             evidence_status=EvidenceStatus.SUFFICIENT,
             sample_logits=dict(prediction.sample_logits),
             probabilities=dict(prediction.probabilities),
