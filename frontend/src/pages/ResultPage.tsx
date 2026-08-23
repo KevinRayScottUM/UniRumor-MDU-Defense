@@ -100,6 +100,63 @@ function ResultOverview({ result }: { result: ProductionResult }) {
   );
 }
 
+function ResultConfidence({ result }: { result: ProductionResult }) {
+  const probabilities = Object.entries(result.verdict.probabilities);
+
+  return (
+    <Card
+      aria-label="Authoritative model probabilities"
+      className="result-confidence"
+      role="region"
+      variant="glass"
+    >
+      <div className="result-section-heading result-section-heading--split">
+        <div>
+          <p>Confidence view</p>
+          <h2>Authoritative model probabilities</h2>
+        </div>
+        <Badge tone={probabilities.length > 0 ? "info" : "neutral"}>
+          {probabilities.length > 0 ? "Backend provided" : "Not available"}
+        </Badge>
+      </div>
+
+      {probabilities.length > 0 ? (
+        <div className="result-confidence__list">
+          {probabilities.map(([label, value]) => {
+            const percentage = Math.max(0, Math.min(1, value)) * 100;
+            return (
+              <div className="result-confidence__item" key={label}>
+                <div>
+                  <span>{label}</span>
+                  <strong>{percentage.toFixed(1)}%</strong>
+                </div>
+                <div
+                  aria-label={`${label} probability ${percentage.toFixed(1)} percent`}
+                  aria-valuemax={100}
+                  aria-valuemin={0}
+                  aria-valuenow={Number(percentage.toFixed(1))}
+                  className="result-confidence__track"
+                  role="progressbar"
+                >
+                  <span style={{ width: `${percentage}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="result-confidence__empty">
+          No probability distribution was returned in the public result.
+        </p>
+      )}
+      <p className="result-confidence__boundary">
+        Values are visualized from the public response and do not determine or
+        recompute the displayed verdict.
+      </p>
+    </Card>
+  );
+}
+
 function ResultMetadata({
   jobId,
   result,
@@ -361,6 +418,7 @@ export function ResultPage() {
       {response ? (
         <>
           <ResultOverview result={response.outcome.result} />
+          <ResultConfidence result={response.outcome.result} />
           <ResultMetadata jobId={response.job_id} result={response.outcome.result} />
           <EvidenceHierarchy result={response.outcome.result} />
           <SupplementalEvidence result={response.outcome.result} />

@@ -134,11 +134,11 @@ export function ApplicationLayout() {
             to="/"
           >
             <span aria-hidden="true" className="brand__mark">
-              UM
+              MDU
             </span>
             <span className="brand__wordmark">
               <span className="brand__name">UniRumor-MDU</span>
-              <span className="brand__descriptor">Research verification</span>
+              <span className="brand__descriptor">Explainable verification</span>
             </span>
           </Link>
 
@@ -152,7 +152,14 @@ export function ApplicationLayout() {
           </div>
 
           <details className="mobile-navigation" ref={mobileNavigation}>
-            <summary>Menu</summary>
+            <summary>
+              <span>Menu</span>
+              <span aria-hidden="true" className="mobile-navigation__icon">
+                <i />
+                <i />
+                <i />
+              </span>
+            </summary>
             <div className="mobile-navigation__panel">
               <NavigationLinks mobile onNavigate={closeMobileNavigation} />
             </div>

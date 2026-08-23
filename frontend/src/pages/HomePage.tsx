@@ -25,6 +25,30 @@ const motivationPoints = [
   },
 ] as const;
 
+const illustrativeUnits = [
+  {
+    id: "01",
+    type: "Title text",
+    content: "48 Hour Challenge is safe and encouraged.",
+    score: "High relevance",
+    tone: "high",
+  },
+  {
+    id: "02",
+    type: "OCR evidence",
+    content: "Do not attempt this challenge.",
+    score: "Medium relevance",
+    tone: "medium",
+  },
+  {
+    id: "03",
+    type: "Transcript evidence",
+    content: "Experts warn users about potential risks.",
+    score: "High relevance",
+    tone: "high",
+  },
+] as const;
+
 export function HomePage() {
   return (
     <div className="home-page">
@@ -50,44 +74,82 @@ export function HomePage() {
           </div>
         </div>
 
-        <Card className="research-brief" variant="glass">
-          <div className="research-brief__topline">
-            <span>Research interface</span>
-            <Badge tone="neutral">Public API v1</Badge>
+        <Card
+          aria-label="Illustrative Minimal Deceptive Unit preview"
+          className="mdu-demo-preview"
+          role="region"
+          variant="glass"
+        >
+          <div className="mdu-demo-preview__topline">
+            <span>
+              <i aria-hidden="true" />
+              MDU interface preview
+            </span>
+            <Badge tone="research">Illustrative</Badge>
           </div>
-          <h2>From a focal claim to auditable evidence.</h2>
-          <p>
-            The interface keeps request handling, production execution, and
-            result presentation visually distinct.
-          </p>
-          <ol className="research-brief__flow" aria-label="Verification workflow">
+
+          <div className="mdu-demo-preview__claim">
+            <span>Claim</span>
+            <blockquote>
+              “48 Hour Challenge video claims a dangerous online challenge is
+              harmless.”
+            </blockquote>
+          </div>
+
+          <div className="mdu-demo-preview__connector" aria-hidden="true">
+            <span />
+            <strong>↓</strong>
+            <p>Candidate Units</p>
+          </div>
+
+          <div className="mdu-demo-preview__units">
+            {illustrativeUnits.map((unit) => (
+              <article className="mdu-demo-unit" key={unit.id}>
+                <div className="mdu-demo-unit__header">
+                  <span>Unit {unit.id}</span>
+                  <small>{unit.type}</small>
+                </div>
+                <p>{unit.content}</p>
+                <div className={`mdu-demo-unit__score mdu-demo-unit__score--${unit.tone}`}>
+                  <i aria-hidden="true" />
+                  {unit.score}
+                </div>
+              </article>
+            ))}
+          </div>
+
+          <ol
+            aria-label="Illustrative claim-to-verification flow"
+            className="mdu-demo-preview__pipeline"
+          >
             <li>
               <span>01</span>
-              Claim + video
+              <strong>Claim</strong>
             </li>
             <li>
               <span>02</span>
-              Managed job
+              <strong>Candidate Units</strong>
             </li>
             <li>
               <span>03</span>
-              Public result
+              <strong>Selection Score</strong>
+            </li>
+            <li>
+              <span>04</span>
+              <strong>Evidence Explanation</strong>
+            </li>
+            <li>
+              <span>05</span>
+              <strong>Final Verification</strong>
             </li>
           </ol>
-          <dl className="research-brief__facts">
-            <div>
-              <dt>Validation</dt>
-              <dd>Server enforced</dd>
-            </div>
-            <div>
-              <dt>Scientific output</dt>
-              <dd>Never recomputed</dd>
-            </div>
-          </dl>
-          <Link className="research-brief__demo-link" to="/demo">
-            View illustrative result demo
-            <span aria-hidden="true">→</span>
-          </Link>
+
+          <div className="mdu-demo-preview__footer">
+            <p>Illustrative interface only. Final results come from the backend.</p>
+            <Link to="/demo">
+              Explore demo <span aria-hidden="true">↗</span>
+            </Link>
+          </div>
         </Card>
       </section>
 
