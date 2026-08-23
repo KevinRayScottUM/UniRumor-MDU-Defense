@@ -145,10 +145,15 @@ def aggregate_all_evaluated(evaluated: List[RuntimeUnit], top_k: int) -> MockG1O
     total = sum(exponentials.values())
     probabilities = {label: round(value / total, 12) for label, value in exponentials.items()}
     predicted = "fake" if sample_logits["fake"] >= sample_logits["real"] else "real"
+    model_verdict = ModelVerdict(predicted)
     top_units = sorted(evaluated, key=lambda unit: (-unit.selection_score, unit.unit_id))[:top_k]
     return MockG1Output(
-        ModelVerdict(predicted),
-        DisplayVerdict.FAKE if predicted == "fake" else DisplayVerdict.REAL,
+        model_verdict,
+        {
+            ModelVerdict.FAKE: DisplayVerdict.FAKE,
+            ModelVerdict.REAL: DisplayVerdict.REAL,
+            ModelVerdict.NOT_RUN: DisplayVerdict.NEI,
+        }[model_verdict],
         EvidenceStatus.SUFFICIENT,
         sample_logits,
         probabilities,

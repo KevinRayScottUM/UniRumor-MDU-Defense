@@ -49,12 +49,14 @@ class VerificationResult:
         if not logit_classes <= binary_classes or not probability_classes <= binary_classes:
             raise ValueError("model logits and probabilities may contain only fake and real")
 
+        expected_display = {
+            ModelVerdict.FAKE: DisplayVerdict.FAKE,
+            ModelVerdict.REAL: DisplayVerdict.REAL,
+            ModelVerdict.NOT_RUN: DisplayVerdict.NEI,
+        }[self.model_verdict]
         if self.model_verdict in {ModelVerdict.FAKE, ModelVerdict.REAL}:
             if logit_classes != binary_classes or probability_classes != binary_classes:
                 raise ValueError("FAKE/REAL results require exactly fake and real logits and probabilities")
-            expected_display = (
-                DisplayVerdict.FAKE if self.model_verdict == ModelVerdict.FAKE else DisplayVerdict.REAL
-            )
             if self.display_verdict != expected_display:
                 raise ValueError("display verdict must match the FAKE/REAL model verdict")
         elif self.model_verdict == ModelVerdict.NOT_RUN:
@@ -62,7 +64,7 @@ class VerificationResult:
                 raise ValueError("NOT_RUN results cannot contain logits or probabilities")
             if self.evidence_status != EvidenceStatus.INSUFFICIENT:
                 raise ValueError("NOT_RUN results require insufficient evidence")
-            if self.display_verdict != DisplayVerdict.NEI:
+            if self.display_verdict != expected_display:
                 raise ValueError("NOT_RUN results require the NEI display verdict")
 
     def to_dict(self) -> Dict[str, Any]:

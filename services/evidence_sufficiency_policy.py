@@ -109,6 +109,11 @@ class EvidenceSufficiencyPolicy:
             unit.source_type is SourceType.OCR for unit in g1_units
         )
         visual_unit_count = len(visual_units)
+        expected_display = {
+            ModelVerdict.FAKE: DisplayVerdict.FAKE,
+            ModelVerdict.REAL: DisplayVerdict.REAL,
+            ModelVerdict.NOT_RUN: DisplayVerdict.NEI,
+        }[verification.model_verdict]
 
         if g1_exposure_count:
             if verification.model_verdict not in {
@@ -122,11 +127,6 @@ class EvidenceSufficiencyPolicy:
                 raise ValueError(
                     "Frozen G1 evidence requires sufficient verification status"
                 )
-            expected_display = (
-                DisplayVerdict.FAKE
-                if verification.model_verdict is ModelVerdict.FAKE
-                else DisplayVerdict.REAL
-            )
             if verification.display_verdict is not expected_display:
                 raise ValueError(
                     "display verdict must match the completed Frozen G1 verdict"
@@ -143,7 +143,7 @@ class EvidenceSufficiencyPolicy:
                 raise ValueError(
                     "no Frozen G1 evidence requires insufficient verification status"
                 )
-            if verification.display_verdict is not DisplayVerdict.NEI:
+            if verification.display_verdict is not expected_display:
                 raise ValueError(
                     "no Frozen G1 evidence requires the NEI display verdict"
                 )

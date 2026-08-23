@@ -63,6 +63,50 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual({"fake", "real"}, set(restored.probabilities))
         self.assertNotIn("NEI", restored.probabilities)
 
+    def test_all_verdict_states_serialize_with_explicit_display_mapping(self):
+        cases = (
+            (
+                ModelVerdict.FAKE,
+                DisplayVerdict.FAKE,
+                EvidenceStatus.SUFFICIENT,
+                {"fake": 1.0, "real": 0.0},
+                {"fake": 0.75, "real": 0.25},
+            ),
+            (
+                ModelVerdict.REAL,
+                DisplayVerdict.REAL,
+                EvidenceStatus.SUFFICIENT,
+                {"fake": 0.0, "real": 1.0},
+                {"fake": 0.25, "real": 0.75},
+            ),
+            (
+                ModelVerdict.NOT_RUN,
+                DisplayVerdict.NEI,
+                EvidenceStatus.INSUFFICIENT,
+                {},
+                {},
+            ),
+        )
+        for model_verdict, display_verdict, evidence_status, logits, probabilities in cases:
+            with self.subTest(model_verdict=model_verdict):
+                result = VerificationResult(
+                    session_id="verdict-serialization",
+                    claim="claim",
+                    model_verdict=model_verdict,
+                    display_verdict=display_verdict,
+                    evidence_status=evidence_status,
+                    sample_logits=logits,
+                    probabilities=probabilities,
+                    all_units=[],
+                    top_k_units=[],
+                    class_winners={},
+                    pipeline_stages=[],
+                )
+                payload = result.to_dict()
+                self.assertEqual(model_verdict.value, payload["model_verdict"])
+                self.assertEqual(display_verdict.value, payload["display_verdict"])
+                self.assertEqual(result, VerificationResult.from_dict(payload))
+
     def test_mock_result_fixture_json_round_trip(self):
         data = json.loads((FIXTURES / "mock_result.json").read_text(encoding="utf-8"))
         result = VerificationResult.from_dict(data)
