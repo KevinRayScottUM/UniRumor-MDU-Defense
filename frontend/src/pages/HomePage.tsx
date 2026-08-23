@@ -80,6 +80,11 @@ export function HomePage() {
           role="region"
           variant="glass"
         >
+          <div aria-hidden="true" className="mdu-demo-preview__liquid-layer">
+            <span className="mdu-demo-preview__orb mdu-demo-preview__orb--blue" />
+            <span className="mdu-demo-preview__orb mdu-demo-preview__orb--violet" />
+            <span className="mdu-demo-preview__refraction" />
+          </div>
           <div className="mdu-demo-preview__topline">
             <span>
               <i aria-hidden="true" />
@@ -143,6 +148,15 @@ export function HomePage() {
               <strong>Final Verification</strong>
             </li>
           </ol>
+
+          <div className="mdu-demo-preview__result">
+            <div>
+              <span>Result surface</span>
+              <strong>Backend-authoritative verification</strong>
+            </div>
+            <Badge tone="neutral">Illustrative layout</Badge>
+            <p>No verdict or confidence value is generated in this preview.</p>
+          </div>
 
           <div className="mdu-demo-preview__footer">
             <p>Illustrative interface only. Final results come from the backend.</p>
