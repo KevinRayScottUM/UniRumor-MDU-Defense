@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 import { ApiClientError } from "../api";
 import { apiClient } from "../app/api";
-import type { JobResultResponse } from "../types";
+import type { JobResultResponse, ProductionResult } from "../types";
 
 export type UnavailableResultState =
   | "not_completed"
@@ -19,12 +19,26 @@ export interface UnavailableResult extends PublicResultError {
   state: UnavailableResultState;
 }
 
+export interface FrontendJobResult {
+  jobId: string;
+  result: ProductionResult;
+}
+
 export interface JobResultLoadingState {
-  response?: JobResultResponse;
+  jobResult?: FrontendJobResult;
   loading: boolean;
   error?: PublicResultError;
   unavailable?: UnavailableResult;
   retry: () => void;
+}
+
+function normalizeJobResultResponse(
+  response: JobResultResponse,
+): FrontendJobResult {
+  return {
+    jobId: response.job_id,
+    result: response.outcome.result,
+  };
 }
 
 function unavailableFromError(error: unknown): UnavailableResult | undefined {
@@ -62,7 +76,7 @@ function publicErrorFrom(error: unknown): PublicResultError {
 }
 
 export function useJobResult(jobId: string | undefined): JobResultLoadingState {
-  const [response, setResponse] = useState<JobResultResponse>();
+  const [jobResult, setJobResult] = useState<FrontendJobResult>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<PublicResultError>();
   const [unavailable, setUnavailable] = useState<UnavailableResult>();
@@ -71,7 +85,7 @@ export function useJobResult(jobId: string | undefined): JobResultLoadingState {
   useEffect(() => {
     let disposed = false;
 
-    setResponse(undefined);
+    setJobResult(undefined);
     setError(undefined);
     setUnavailable(undefined);
     setLoading(true);
@@ -90,7 +104,7 @@ export function useJobResult(jobId: string | undefined): JobResultLoadingState {
         const nextResponse = await apiClient.getJobResult(requestedJobId);
         if (disposed) return;
 
-        setResponse(nextResponse);
+        setJobResult(normalizeJobResultResponse(nextResponse));
         setLoading(false);
       } catch (caught) {
         if (disposed) return;
@@ -113,7 +127,7 @@ export function useJobResult(jobId: string | undefined): JobResultLoadingState {
   }, [jobId, refreshVersion]);
 
   return {
-    response,
+    jobResult,
     loading,
     error,
     unavailable,

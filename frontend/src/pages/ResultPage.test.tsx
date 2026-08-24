@@ -213,11 +213,15 @@ describe("explainable result experience", () => {
   });
 
   it("renders the authoritative REAL verdict without recomputation", async () => {
+    const wrappedBackendResponse = makeResultResponse({
+      displayVerdict: "Real",
+      modelVerdict: "real",
+    });
+    expect(
+      wrappedBackendResponse.outcome.result.verdict.display_verdict,
+    ).toBe("Real");
     vi.spyOn(apiClient, "getJobResult").mockResolvedValueOnce(
-      makeResultResponse({
-        displayVerdict: "Real",
-        modelVerdict: "real",
-      }),
+      wrappedBackendResponse,
     );
 
     renderResult();

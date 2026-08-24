@@ -340,8 +340,8 @@ function SupplementalEvidence({ result }: { result: ProductionResult }) {
 
 export function ResultPage() {
   const { jobId } = useParams<{ jobId: string }>();
-  const { error, loading, response, retry, unavailable } = useJobResult(jobId);
-  const displayedJobId = response?.job_id ?? jobId ?? "Unavailable";
+  const { error, jobResult, loading, retry, unavailable } = useJobResult(jobId);
+  const displayedJobId = jobResult?.jobId ?? jobId ?? "Unavailable";
   const unavailablePresentation = unavailable
     ? UNAVAILABLE_PRESENTATION[unavailable.state]
     : undefined;
@@ -369,8 +369,11 @@ export function ResultPage() {
           <p>Public job identifier</p>
           <code>{displayedJobId}</code>
         </div>
-        <Badge tone={response ? "success" : "neutral"} withDot={Boolean(response)}>
-          {response ? "Authoritative result loaded" : "Result request"}
+        <Badge
+          tone={jobResult ? "success" : "neutral"}
+          withDot={Boolean(jobResult)}
+        >
+          {jobResult ? "Authoritative result loaded" : "Result request"}
         </Badge>
       </Card>
 
@@ -415,13 +418,13 @@ export function ResultPage() {
         </div>
       ) : null}
 
-      {response ? (
+      {jobResult ? (
         <>
-          <ResultOverview result={response.outcome.result} />
-          <ResultConfidence result={response.outcome.result} />
-          <ResultMetadata jobId={response.job_id} result={response.outcome.result} />
-          <EvidenceHierarchy result={response.outcome.result} />
-          <SupplementalEvidence result={response.outcome.result} />
+          <ResultOverview result={jobResult.result} />
+          <ResultConfidence result={jobResult.result} />
+          <ResultMetadata jobId={jobResult.jobId} result={jobResult.result} />
+          <EvidenceHierarchy result={jobResult.result} />
+          <SupplementalEvidence result={jobResult.result} />
         </>
       ) : null}
     </section>
