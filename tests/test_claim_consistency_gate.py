@@ -50,14 +50,22 @@ class ClaimConsistencyGateTests(unittest.TestCase):
         )
 
     def _runner(self):
+        return self._runner_with_units(
+            [self.transcript],
+            [self.ocr],
+            [self.visual],
+        )
+
+    @staticmethod
+    def _runner_with_units(transcript_units, ocr_units, visual_units):
         text_runner = mock.Mock()
         text_runner.run.return_value = SimpleNamespace(
-            g1_exposure_units=[self.transcript, self.ocr],
+            g1_exposure_units=list(transcript_units) + list(ocr_units),
             warnings=[],
         )
         visual_runner = mock.Mock()
         visual_runner.run.return_value = SimpleNamespace(
-            runtime_units=[self.visual],
+            runtime_units=list(visual_units),
             warnings=[],
         )
         frozen_runner = mock.Mock()
@@ -67,6 +75,23 @@ class ClaimConsistencyGateTests(unittest.TestCase):
             frozen_runner,
         )
         return runner, frozen_runner
+
+    @staticmethod
+    def _completed_real(session_id, claim, units):
+        return VerificationResult(
+            session_id=session_id,
+            claim=claim,
+            model_verdict=ModelVerdict.REAL,
+            display_verdict=DisplayVerdict.REAL,
+            evidence_status=EvidenceStatus.SUFFICIENT,
+            sample_logits={"fake": 0.1, "real": 0.9},
+            probabilities={"fake": 0.2, "real": 0.8},
+            all_units=list(units),
+            top_k_units=list(units[:1]),
+            class_winners={},
+            pipeline_stages=[],
+            warnings=[],
+        )
 
     def test_unrelated_claim_video_abstains_without_frozen_g1(self) -> None:
         claim = "A cat is sleeping peacefully on a sofa."
@@ -106,6 +131,29 @@ class ClaimConsistencyGateTests(unittest.TestCase):
         self.assertIs(production_result.display_verdict, DisplayVerdict.NEI)
         self.assertEqual((), production_result.sample_logits)
         self.assertEqual((), production_result.probabilities)
+
+    def test_existing_unrelated_claim_examples_remain_nei(self) -> None:
+        claims = (
+            "This video shows a football match.",
+            "A cat is walking outdoors.",
+        )
+        for index, claim in enumerate(claims):
+            with self.subTest(claim=claim):
+                runner, frozen_runner = self._runner()
+
+                result = runner.run(
+                    f"session-unrelated-{index}", claim, Path("input.mp4")
+                )
+
+                frozen_runner.run.assert_not_called()
+                self.assertIs(
+                    result.verification_result.model_verdict,
+                    ModelVerdict.NOT_RUN,
+                )
+                self.assertIs(
+                    result.verification_result.display_verdict,
+                    DisplayVerdict.NEI,
+                )
 
     def test_compatible_claim_preserves_frozen_g1_path(self) -> None:
         claim = "Two teams play basketball on an indoor court."
@@ -223,6 +271,132 @@ class ClaimConsistencyGateTests(unittest.TestCase):
             claim,
             [self.transcript],
         )
+
+    def test_explicit_year_mismatch_abstains_before_frozen_g1(self) -> None:
+        evidence = _unit(
+            "transcript-cpac",
+            SourceType.TRANSCRIPT,
+            "CPAC 2018",
+        )
+        for year in (2019, 2026):
+            with self.subTest(year=year):
+                claim = f"This video was recorded in {year}."
+                runner, frozen_runner = self._runner_with_units(
+                    [evidence], [], []
+                )
+
+                result = runner.run(
+                    f"session-year-{year}", claim, Path("input.mp4")
+                )
+
+                frozen_runner.run.assert_not_called()
+                self.assertIs(
+                    result.verification_result.model_verdict,
+                    ModelVerdict.NOT_RUN,
+                )
+                self.assertIs(
+                    result.verification_result.display_verdict,
+                    DisplayVerdict.NEI,
+                )
+                self.assertIs(
+                    result.verification_result.evidence_status,
+                    EvidenceStatus.INSUFFICIENT,
+                )
+
+    def test_conflicting_named_person_abstains_before_frozen_g1(self) -> None:
+        evidence = _unit(
+            "transcript-trump",
+            SourceType.TRANSCRIPT,
+            "Donald Trump speaking at CPAC 2018",
+        )
+        claim = "This video shows Barack Obama speaking at CPAC 2018."
+        runner, frozen_runner = self._runner_with_units([evidence], [], [])
+
+        result = runner.run("session-entity-mismatch", claim, Path("input.mp4"))
+
+        frozen_runner.run.assert_not_called()
+        self.assertIs(result.verification_result.model_verdict, ModelVerdict.NOT_RUN)
+        self.assertIs(result.verification_result.display_verdict, DisplayVerdict.NEI)
+        self.assertIn(CLAIM_VIDEO_MISMATCH_WARNING, result.warnings)
+
+    def test_matching_named_person_preserves_real_frozen_g1_result(self) -> None:
+        evidence = _unit(
+            "transcript-trump",
+            SourceType.TRANSCRIPT,
+            "Donald Trump speaking at CPAC 2018",
+        )
+        claim = "This video shows Donald Trump speaking at CPAC 2018."
+        runner, frozen_runner = self._runner_with_units([evidence], [], [])
+        expected = self._completed_real(
+            "session-entity-match", claim, [evidence]
+        )
+        frozen_runner.run.return_value = expected
+
+        result = runner.run("session-entity-match", claim, Path("input.mp4"))
+
+        frozen_runner.run.assert_called_once_with(
+            "session-entity-match", claim, [evidence]
+        )
+        self.assertIs(result.verification_result, expected)
+        self.assertIs(result.verification_result.model_verdict, ModelVerdict.REAL)
+
+    def test_person_title_does_not_create_false_entity_mismatch(self) -> None:
+        evidence = _unit(
+            "transcript-president-trump",
+            SourceType.TRANSCRIPT,
+            "President Donald Trump speaking at CPAC 2018",
+        )
+        claim = "This video shows Donald Trump speaking at CPAC 2018."
+
+        result = ClaimConsistencyGate().evaluate(claim, [evidence], [], [])
+
+        self.assertIs(result, ConsistencyResult.PASS)
+
+    def test_unsupported_named_person_abstains_even_when_event_matches(self) -> None:
+        evidence = _unit(
+            "ocr-cpac-only",
+            SourceType.OCR,
+            "CPAC 2018",
+        )
+        claim = "This video shows Donald Trump speaking at CPAC 2018."
+        runner, frozen_runner = self._runner_with_units([], [evidence], [])
+
+        result = runner.run("session-entity-unsupported", claim, Path("input.mp4"))
+
+        frozen_runner.run.assert_not_called()
+        self.assertIs(result.verification_result.model_verdict, ModelVerdict.NOT_RUN)
+        self.assertIs(result.verification_result.display_verdict, DisplayVerdict.NEI)
+
+    def test_matching_event_and_year_preserve_real_frozen_g1_result(self) -> None:
+        evidence = _unit(
+            "ocr-cpac",
+            SourceType.OCR,
+            "CPAC 2018",
+        )
+        claim = "This video contains information about CPAC 2018."
+        runner, frozen_runner = self._runner_with_units([], [evidence], [])
+        expected = self._completed_real("session-cpac-match", claim, [evidence])
+        frozen_runner.run.return_value = expected
+
+        result = runner.run("session-cpac-match", claim, Path("input.mp4"))
+
+        frozen_runner.run.assert_called_once_with(
+            "session-cpac-match", claim, [evidence]
+        )
+        self.assertIs(result.verification_result, expected)
+
+    def test_claim_without_explicit_year_does_not_trigger_temporal_mismatch(self) -> None:
+        evidence = _unit(
+            "ocr-cpac-year",
+            SourceType.OCR,
+            "CPAC 2018",
+        )
+
+        result = ClaimConsistencyGate().evaluate(
+            "This video is about CPAC.", [], [evidence], []
+        )
+
+        self.assertIs(result, ConsistencyResult.PASS)
 
 
 if __name__ == "__main__":

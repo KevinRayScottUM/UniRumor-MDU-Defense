@@ -28,6 +28,39 @@ class ClaimConsistencyGate:
     """Apply a conservative, dependency-free lexical consistency check."""
 
     _TOKEN_PATTERN = re.compile(r"[^\W_]+", flags=re.UNICODE)
+    _YEAR_PATTERN = re.compile(r"(?<!\d)(?:1\d{3}|2\d{3})(?!\d)")
+    _ACRONYM_PATTERN = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{1,9}(?!\w)")
+    _PROPER_NAME_PATTERN = re.compile(
+        r"(?<!\w)[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?"
+        r"(?:\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?){1,3}(?!\w)"
+    )
+    _GENERIC_ENTITY_TOKENS = frozenset(
+        {
+            "a",
+            "an",
+            "claim",
+            "clip",
+            "frame",
+            "scene",
+            "the",
+            "this",
+            "video",
+        }
+    )
+    _ENTITY_TITLES = frozenset(
+        {
+            "dr",
+            "former",
+            "governor",
+            "minister",
+            "mr",
+            "mrs",
+            "ms",
+            "president",
+            "professor",
+            "senator",
+        }
+    )
     _STOPWORDS = frozenset(
         {
             "a",
@@ -124,6 +157,62 @@ class ClaimConsistencyGate:
             tokens.update(cls._informative_tokens(unit.text))
         return frozenset(tokens)
 
+    @classmethod
+    def _explicit_years(cls, text: str) -> FrozenSet[str]:
+        normalized = unicodedata.normalize("NFKC", text)
+        return frozenset(cls._YEAR_PATTERN.findall(normalized))
+
+    @classmethod
+    def _named_entities(cls, text: str) -> FrozenSet[str]:
+        """Extract only explicit acronym or multi-token proper-name mentions."""
+
+        normalized = unicodedata.normalize("NFKC", text)
+        entities = set()
+        for pattern in (cls._ACRONYM_PATTERN, cls._PROPER_NAME_PATTERN):
+            for match in pattern.finditer(normalized):
+                entity = " ".join(match.group(0).casefold().split())
+                entity_tokens = [
+                    token
+                    for token in entity.split()
+                    if token not in cls._ENTITY_TITLES
+                ]
+                if entity_tokens and not all(
+                    token in cls._GENERIC_ENTITY_TOKENS
+                    or token in cls._STOPWORDS
+                    for token in entity_tokens
+                ):
+                    entities.add(" ".join(entity_tokens))
+        return frozenset(entities)
+
+    @staticmethod
+    def _entities_supported(
+        claim_entities: FrozenSet[str], evidence_entities: FrozenSet[str]
+    ) -> bool:
+        for claim_entity in claim_entities:
+            claim_parts = frozenset(claim_entity.split())
+            supported = any(
+                claim_entity == evidence_entity
+                or (
+                    len(claim_parts) > 1
+                    and claim_parts.issubset(evidence_entity.split())
+                )
+                for evidence_entity in evidence_entities
+            )
+            if not supported:
+                return False
+        return True
+
+    @classmethod
+    def _source_attributes(
+        cls, units: Iterable[RuntimeUnit]
+    ) -> tuple[FrozenSet[str], FrozenSet[str]]:
+        years = set()
+        entities = set()
+        for unit in units:
+            years.update(cls._explicit_years(unit.text))
+            entities.update(cls._named_entities(unit.text))
+        return frozenset(years), frozenset(entities)
+
     def evaluate(
         self,
         claim: str,
@@ -144,6 +233,25 @@ class ClaimConsistencyGate:
             return ConsistencyResult.UNKNOWN
 
         claim_tokens = self._informative_tokens(claim)
+        evidence_units = tuple(transcript_units) + tuple(ocr_units) + tuple(
+            visual_units
+        )
+        claim_years = self._explicit_years(claim)
+        claim_entities = self._named_entities(claim)
+        evidence_years, evidence_entities = self._source_attributes(evidence_units)
+
+        if (
+            claim_years
+            and evidence_years
+            and claim_years.isdisjoint(evidence_years)
+        ):
+            return ConsistencyResult.MISMATCH
+
+        if claim_entities and not self._entities_supported(
+            claim_entities, evidence_entities
+        ):
+            return ConsistencyResult.MISMATCH
+
         source_tokens = (
             self._source_tokens(transcript_units),
             self._source_tokens(ocr_units),
