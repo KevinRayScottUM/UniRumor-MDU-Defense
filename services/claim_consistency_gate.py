@@ -24,12 +24,17 @@ class ConsistencyResult(str, Enum):
     UNKNOWN = "unknown"
 
 
+class EntityConsistencyResult(str, Enum):
+    CONTRADICTION = "entity_contradiction"
+    SUPPORTED = "entity_supported"
+    UNKNOWN = "entity_unknown"
+
+
 class ClaimConsistencyGate:
     """Apply a conservative, dependency-free lexical consistency check."""
 
     _TOKEN_PATTERN = re.compile(r"[^\W_]+", flags=re.UNICODE)
     _YEAR_PATTERN = re.compile(r"(?<!\d)(?:1\d{3}|2\d{3})(?!\d)")
-    _ACRONYM_PATTERN = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{1,9}(?!\w)")
     _PROPER_NAME_PATTERN = re.compile(
         r"(?<!\w)[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?"
         r"(?:\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?){1,3}(?!\w)"
@@ -163,55 +168,65 @@ class ClaimConsistencyGate:
         return frozenset(cls._YEAR_PATTERN.findall(normalized))
 
     @classmethod
-    def _named_entities(cls, text: str) -> FrozenSet[str]:
-        """Extract only explicit acronym or multi-token proper-name mentions."""
+    def _named_people(cls, text: str) -> FrozenSet[str]:
+        """Extract conservative multi-token proper-name candidates."""
 
         normalized = unicodedata.normalize("NFKC", text)
         entities = set()
-        for pattern in (cls._ACRONYM_PATTERN, cls._PROPER_NAME_PATTERN):
-            for match in pattern.finditer(normalized):
-                entity = " ".join(match.group(0).casefold().split())
-                entity_tokens = [
-                    token
-                    for token in entity.split()
-                    if token not in cls._ENTITY_TITLES
-                ]
-                if entity_tokens and not all(
-                    token in cls._GENERIC_ENTITY_TOKENS
-                    or token in cls._STOPWORDS
-                    for token in entity_tokens
-                ):
-                    entities.add(" ".join(entity_tokens))
+        for match in cls._PROPER_NAME_PATTERN.finditer(normalized):
+            entity = " ".join(match.group(0).casefold().split())
+            entity_tokens = [
+                token
+                for token in entity.split()
+                if token not in cls._ENTITY_TITLES
+            ]
+            if entity_tokens and not all(
+                token in cls._GENERIC_ENTITY_TOKENS
+                or token in cls._STOPWORDS
+                for token in entity_tokens
+            ):
+                entities.add(" ".join(entity_tokens))
         return frozenset(entities)
 
-    @staticmethod
-    def _entities_supported(
-        claim_entities: FrozenSet[str], evidence_entities: FrozenSet[str]
-    ) -> bool:
-        for claim_entity in claim_entities:
-            claim_parts = frozenset(claim_entity.split())
-            supported = any(
-                claim_entity == evidence_entity
-                or (
-                    len(claim_parts) > 1
-                    and claim_parts.issubset(evidence_entity.split())
-                )
-                for evidence_entity in evidence_entities
-            )
-            if not supported:
-                return False
-        return True
-
     @classmethod
-    def _source_attributes(
+    def _source_years(
         cls, units: Iterable[RuntimeUnit]
-    ) -> tuple[FrozenSet[str], FrozenSet[str]]:
+    ) -> FrozenSet[str]:
         years = set()
-        entities = set()
         for unit in units:
             years.update(cls._explicit_years(unit.text))
-            entities.update(cls._named_entities(unit.text))
-        return frozenset(years), frozenset(entities)
+        return frozenset(years)
+
+    @classmethod
+    def _entity_consistency(
+        cls,
+        claim_people: FrozenSet[str],
+        evidence_units: Iterable[RuntimeUnit],
+    ) -> EntityConsistencyResult:
+        if not claim_people:
+            return EntityConsistencyResult.UNKNOWN
+
+        evidence_people = set()
+        evidence_tokens = set()
+        for unit in evidence_units:
+            evidence_people.update(cls._named_people(unit.text))
+            evidence_tokens.update(cls._tokens(unit.text))
+
+        supported_people = set()
+        for claim_person in claim_people:
+            claim_parts = frozenset(claim_person.split())
+            surname = claim_person.split()[-1]
+            if surname in evidence_tokens or any(
+                claim_parts.issubset(evidence_person.split())
+                for evidence_person in evidence_people
+            ):
+                supported_people.add(claim_person)
+
+        if supported_people == set(claim_people):
+            return EntityConsistencyResult.SUPPORTED
+        if not supported_people and evidence_people:
+            return EntityConsistencyResult.CONTRADICTION
+        return EntityConsistencyResult.UNKNOWN
 
     def evaluate(
         self,
@@ -237,8 +252,8 @@ class ClaimConsistencyGate:
             visual_units
         )
         claim_years = self._explicit_years(claim)
-        claim_entities = self._named_entities(claim)
-        evidence_years, evidence_entities = self._source_attributes(evidence_units)
+        claim_people = self._named_people(claim)
+        evidence_years = self._source_years(evidence_units)
 
         if (
             claim_years
@@ -247,10 +262,13 @@ class ClaimConsistencyGate:
         ):
             return ConsistencyResult.MISMATCH
 
-        if claim_entities and not self._entities_supported(
-            claim_entities, evidence_entities
-        ):
+        entity_consistency = self._entity_consistency(
+            claim_people, evidence_units
+        )
+        if entity_consistency is EntityConsistencyResult.CONTRADICTION:
             return ConsistencyResult.MISMATCH
+        if claim_people and entity_consistency is EntityConsistencyResult.UNKNOWN:
+            return ConsistencyResult.UNKNOWN
 
         source_tokens = (
             self._source_tokens(transcript_units),

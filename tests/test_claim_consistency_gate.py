@@ -15,6 +15,7 @@ from services.claim_consistency_gate import (
     CLAIM_VIDEO_MISMATCH_WARNING,
     ClaimConsistencyGate,
     ConsistencyResult,
+    EntityConsistencyResult,
 )
 from services.evidence_sufficiency_policy import EvidenceSufficiencyPolicy
 from services.production_result import ProductionResultBuilder
@@ -352,7 +353,9 @@ class ClaimConsistencyGateTests(unittest.TestCase):
 
         self.assertIs(result, ConsistencyResult.PASS)
 
-    def test_unsupported_named_person_abstains_even_when_event_matches(self) -> None:
+    def test_missing_named_person_evidence_remains_unknown_and_calls_frozen_g1(
+        self,
+    ) -> None:
         evidence = _unit(
             "ocr-cpac-only",
             SourceType.OCR,
@@ -360,12 +363,55 @@ class ClaimConsistencyGateTests(unittest.TestCase):
         )
         claim = "This video shows Donald Trump speaking at CPAC 2018."
         runner, frozen_runner = self._runner_with_units([], [evidence], [])
+        expected = self._completed_real(
+            "session-entity-unknown", claim, [evidence]
+        )
+        frozen_runner.run.return_value = expected
 
-        result = runner.run("session-entity-unsupported", claim, Path("input.mp4"))
+        result = runner.run("session-entity-unknown", claim, Path("input.mp4"))
 
-        frozen_runner.run.assert_not_called()
-        self.assertIs(result.verification_result.model_verdict, ModelVerdict.NOT_RUN)
-        self.assertIs(result.verification_result.display_verdict, DisplayVerdict.NEI)
+        self.assertIs(
+            ClaimConsistencyGate().evaluate(claim, [], [evidence], []),
+            ConsistencyResult.UNKNOWN,
+        )
+        frozen_runner.run.assert_called_once_with(
+            "session-entity-unknown", claim, [evidence]
+        )
+        self.assertIs(result.verification_result, expected)
+
+    def test_entity_calibration_distinguishes_all_three_states(self) -> None:
+        gate = ClaimConsistencyGate()
+        claim_people = gate._named_people(
+            "This video shows Donald Trump speaking at CPAC 2018."
+        )
+        supported = _unit(
+            "transcript-supported",
+            SourceType.TRANSCRIPT,
+            "Trump addresses the audience at CPAC 2018.",
+        )
+        contradiction = _unit(
+            "transcript-contradiction",
+            SourceType.TRANSCRIPT,
+            "Barack Obama addresses the audience at CPAC 2018.",
+        )
+        unknown = _unit(
+            "ocr-unknown",
+            SourceType.OCR,
+            "CPAC 2018",
+        )
+
+        self.assertIs(
+            gate._entity_consistency(claim_people, [supported]),
+            EntityConsistencyResult.SUPPORTED,
+        )
+        self.assertIs(
+            gate._entity_consistency(claim_people, [contradiction]),
+            EntityConsistencyResult.CONTRADICTION,
+        )
+        self.assertIs(
+            gate._entity_consistency(claim_people, [unknown]),
+            EntityConsistencyResult.UNKNOWN,
+        )
 
     def test_matching_event_and_year_preserve_real_frozen_g1_result(self) -> None:
         evidence = _unit(
