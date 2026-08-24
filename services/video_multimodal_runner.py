@@ -8,10 +8,12 @@ from typing import Any, Dict, List
 from schemas import (
     DisplayVerdict,
     EvidenceStatus,
+    GroundedVisualUnit,
     ModelVerdict,
     RuntimeUnit,
     SourceType,
     VerificationResult,
+    VisualObservationSnapshot,
 )
 from services.claim_consistency_gate import (
     CLAIM_VIDEO_MISMATCH_WARNING,
@@ -20,6 +22,10 @@ from services.claim_consistency_gate import (
 )
 from services.video_text_ocr_runner import VideoTextOCRResult
 from services.video_visual_runner import VideoVisualResult
+from services.visual_grounding_shadow import (
+    VISUAL_GROUNDING_SHADOW_FAILURE_WARNING,
+    VisualGroundingShadowRunner,
+)
 
 
 @dataclass
@@ -32,6 +38,9 @@ class VideoMultimodalResult:
     visual_units: List[RuntimeUnit]
     all_runtime_units: List[RuntimeUnit]
     verification_result: VerificationResult
+    visual_grounding_shadow_units: List[GroundedVisualUnit] = field(
+        default_factory=list
+    )
     warnings: List[str] = field(default_factory=list)
     runtime_ms: float = 0.0
 
@@ -45,6 +54,9 @@ class VideoMultimodalResult:
             "visual_units": [unit.to_dict() for unit in self.visual_units],
             "all_runtime_units": [unit.to_dict() for unit in self.all_runtime_units],
             "verification_result": self.verification_result.to_dict(),
+            "visual_grounding_shadow_units": [
+                unit.to_dict() for unit in self.visual_grounding_shadow_units
+            ],
             "warnings": list(self.warnings),
             "runtime_ms": self.runtime_ms,
         }
@@ -57,6 +69,7 @@ class VideoMultimodalRunner:
         video_visual_runner: Any,
         frozen_g1_runner: Any,
         claim_consistency_gate: Any = None,
+        visual_grounding_shadow_runner: Any = None,
     ) -> None:
         self.video_text_ocr_runner = video_text_ocr_runner
         self.video_visual_runner = video_visual_runner
@@ -65,6 +78,11 @@ class VideoMultimodalRunner:
             claim_consistency_gate
             if claim_consistency_gate is not None
             else ClaimConsistencyGate()
+        )
+        self.visual_grounding_shadow_runner = (
+            visual_grounding_shadow_runner
+            if visual_grounding_shadow_runner is not None
+            else VisualGroundingShadowRunner()
         )
 
     @staticmethod
@@ -146,6 +164,17 @@ class VideoMultimodalRunner:
             verification = self._insufficient_nei(
                 session_id, claim, all_units, warnings
             )
+        visual_grounding_shadow_units = []
+        try:
+            visual_snapshots = [
+                VisualObservationSnapshot.from_runtime_unit(unit, index=index)
+                for index, unit in enumerate(visual_units)
+            ]
+            visual_grounding_shadow_units = self.visual_grounding_shadow_runner.run(
+                visual_snapshots
+            )
+        except Exception:
+            warnings.append(VISUAL_GROUNDING_SHADOW_FAILURE_WARNING)
         return VideoMultimodalResult(
             session_id=session_id,
             claim=claim,
@@ -155,6 +184,7 @@ class VideoMultimodalRunner:
             visual_units=visual_units,
             all_runtime_units=all_units,
             verification_result=verification,
+            visual_grounding_shadow_units=visual_grounding_shadow_units,
             warnings=warnings,
             runtime_ms=(time.perf_counter() - started) * 1000.0,
         )
