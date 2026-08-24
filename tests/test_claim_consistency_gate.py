@@ -9,6 +9,7 @@ from schemas import (
     ModelVerdict,
     RuntimeUnit,
     SourceType,
+    VerificationResult,
 )
 from services.claim_consistency_gate import (
     CLAIM_VIDEO_MISMATCH_WARNING,
@@ -109,7 +110,20 @@ class ClaimConsistencyGateTests(unittest.TestCase):
     def test_compatible_claim_preserves_frozen_g1_path(self) -> None:
         claim = "Two teams play basketball on an indoor court."
         runner, frozen_runner = self._runner()
-        expected = object()
+        expected = VerificationResult(
+            session_id="session-pass",
+            claim=claim,
+            model_verdict=ModelVerdict.FAKE,
+            display_verdict=DisplayVerdict.FAKE,
+            evidence_status=EvidenceStatus.SUFFICIENT,
+            sample_logits={"fake": 0.9, "real": 0.1},
+            probabilities={"fake": 0.8, "real": 0.2},
+            all_units=[self.transcript, self.ocr],
+            top_k_units=[self.transcript],
+            class_winners={},
+            pipeline_stages=[],
+            warnings=[],
+        )
         frozen_runner.run.return_value = expected
 
         result = runner.run("session-pass", claim, Path("input.mp4"))
@@ -127,13 +141,28 @@ class ClaimConsistencyGateTests(unittest.TestCase):
         frozen_runner.run.assert_called_once_with(
             "session-pass",
             claim,
-            [self.transcript, self.ocr, self.visual],
+            [self.transcript, self.ocr],
         )
+        self.assertIs(result.verification_result.model_verdict, ModelVerdict.FAKE)
+        self.assertIs(result.verification_result.display_verdict, DisplayVerdict.FAKE)
 
     def test_uncertain_claim_preserves_frozen_g1_path(self) -> None:
         claim = "Something may be happening in this video."
         runner, frozen_runner = self._runner()
-        expected = object()
+        expected = VerificationResult(
+            session_id="session-unknown",
+            claim=claim,
+            model_verdict=ModelVerdict.REAL,
+            display_verdict=DisplayVerdict.REAL,
+            evidence_status=EvidenceStatus.SUFFICIENT,
+            sample_logits={"fake": 0.1, "real": 0.9},
+            probabilities={"fake": 0.2, "real": 0.8},
+            all_units=[self.transcript, self.ocr],
+            top_k_units=[self.ocr],
+            class_winners={},
+            pipeline_stages=[],
+            warnings=[],
+        )
         frozen_runner.run.return_value = expected
 
         result = runner.run("session-unknown", claim, Path("input.mp4"))
@@ -151,8 +180,10 @@ class ClaimConsistencyGateTests(unittest.TestCase):
         frozen_runner.run.assert_called_once_with(
             "session-unknown",
             claim,
-            [self.transcript, self.ocr, self.visual],
+            [self.transcript, self.ocr],
         )
+        self.assertIs(result.verification_result.model_verdict, ModelVerdict.REAL)
+        self.assertIs(result.verification_result.display_verdict, DisplayVerdict.REAL)
 
     def test_unknown_gate_result_for_normal_claim_calls_frozen_g1(self) -> None:
         claim = "A local council approved the proposed transit plan."

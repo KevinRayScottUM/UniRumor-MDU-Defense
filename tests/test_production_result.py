@@ -171,7 +171,7 @@ class ProductionResultTests(unittest.TestCase):
                 if completed
                 else {}
             ),
-            all_units=all_units,
+            all_units=g1_units,
             top_k_units=top_k_units,
             class_winners=(
                 {"real": g1_units[-1].unit_id, "fake": g1_units[0].unit_id}

@@ -84,9 +84,10 @@ class EvidenceSufficiencyPolicy:
             )
 
         verification = result.verification_result
-        if [unit.unit_id for unit in verification.all_units] != composed_ids:
+        g1_unit_ids = [unit.unit_id for unit in g1_units]
+        if [unit.unit_id for unit in verification.all_units] != g1_unit_ids:
             raise ValueError(
-                "verification_result.all_units must match all_runtime_units"
+                "verification_result.all_units must match g1_exposure_units"
             )
 
         g1_ids = {unit.unit_id for unit in g1_units}

@@ -89,7 +89,7 @@ class VideoMultimodalRunner:
     def _insufficient_nei(
         session_id: str,
         claim: str,
-        all_units: List[RuntimeUnit],
+        g1_units: List[RuntimeUnit],
         warnings: List[str],
     ) -> VerificationResult:
         return VerificationResult(
@@ -100,7 +100,7 @@ class VideoMultimodalRunner:
             evidence_status=EvidenceStatus.INSUFFICIENT,
             sample_logits={},
             probabilities={},
-            all_units=all_units,
+            all_units=g1_units,
             top_k_units=[],
             class_winners={},
             pipeline_stages=[],
@@ -148,21 +148,21 @@ class VideoMultimodalRunner:
             if consistency_result is ConsistencyResult.MISMATCH:
                 warnings.append(CLAIM_VIDEO_MISMATCH_WARNING)
                 verification = self._insufficient_nei(
-                    session_id, claim, all_units, warnings
+                    session_id, claim, g1_units, warnings
                 )
             elif consistency_result in {
                 ConsistencyResult.PASS,
                 ConsistencyResult.UNKNOWN,
             }:
                 verification = self.frozen_g1_runner.run(
-                    session_id, claim, all_units
+                    session_id, claim, g1_units
                 )
             else:
                 raise ValueError("invalid claim consistency result")
         else:
             warnings.append("visual-only evidence cannot run Frozen G1")
             verification = self._insufficient_nei(
-                session_id, claim, all_units, warnings
+                session_id, claim, g1_units, warnings
             )
         visual_grounding_shadow_units = []
         try:

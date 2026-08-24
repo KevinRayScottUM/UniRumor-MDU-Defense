@@ -898,9 +898,9 @@ class VideoVisualIntegrationTests(unittest.TestCase):
         self.assertEqual(ModelVerdict.NOT_RUN, verification.model_verdict)
         self.assertEqual(DisplayVerdict.NEI, verification.display_verdict)
         self.assertEqual(EvidenceStatus.INSUFFICIENT, verification.evidence_status)
-        self.assertEqual([visual_unit], verification.all_units)
+        self.assertEqual([], verification.all_units)
 
-    def test_multimodal_runner_passes_all_units_but_g1_candidates_remain_text_only(self):
+    def test_multimodal_runner_passes_only_g1_units_to_frozen_g1(self):
         text_unit = RuntimeUnit(
             "text", SourceType.TEXT, "text evidence", eligible_for_frozen_g1=True
         )
@@ -921,9 +921,10 @@ class VideoVisualIntegrationTests(unittest.TestCase):
             "session", "claim", Path("video.mp4")
         )
         passed_units = frozen.run.call_args.args[2]
-        self.assertEqual([text_unit, visual_unit], passed_units)
+        self.assertEqual([text_unit], passed_units)
         request = build_phase4a_request("session", "claim", passed_units)
         self.assertEqual(["text"], [item["unit_id"] for item in request["candidate_units"]])
+        self.assertEqual([text_unit, visual_unit], result.all_runtime_units)
         self.assertIs(frozen.run.return_value, result.verification_result)
 
 

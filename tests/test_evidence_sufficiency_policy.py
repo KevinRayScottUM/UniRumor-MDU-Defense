@@ -128,7 +128,7 @@ class EvidenceSufficiencyPolicyTests(unittest.TestCase):
             composed if all_runtime_units is None else list(all_runtime_units)
         )
         verification_all_units = (
-            all_runtime_units
+            g1_units
             if verification_all_units is None
             else list(verification_all_units)
         )
@@ -379,7 +379,7 @@ class EvidenceSufficiencyPolicyTests(unittest.TestCase):
         result = self._result(
             g1_units=[transcript],
             visual_units=[visual],
-            verification_all_units=[transcript],
+            verification_all_units=[transcript, visual],
         )
         with self.assertRaisesRegex(ValueError, "verification_result.all_units"):
             self.policy.assess(result)

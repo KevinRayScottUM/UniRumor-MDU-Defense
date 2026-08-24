@@ -125,7 +125,7 @@ class VisualGroundingShadowTests(unittest.TestCase):
         visual_runner = mock.Mock()
         visual_runner.run.return_value = visual_result
         frozen = mock.Mock()
-        expected = self.verification([text, visual])
+        expected = self.verification([text])
         frozen.run.return_value = expected
         gate = mock.Mock()
         gate.evaluate.return_value = ConsistencyResult.UNKNOWN
@@ -168,7 +168,7 @@ class VisualGroundingShadowTests(unittest.TestCase):
         frozen.run.assert_called_once_with(
             "session",
             "The video shows a basketball game.",
-            [text, visual],
+            [text],
         )
 
     def test_shadow_units_never_enter_authoritative_runtime_lists(self):
@@ -208,7 +208,7 @@ class VisualGroundingShadowTests(unittest.TestCase):
         frozen.run.assert_called_once_with(
             "session",
             "The video shows a basketball game.",
-            [text, visual],
+            [text],
         )
 
     def test_shadow_serialization_is_deterministic_and_separate(self):
@@ -243,7 +243,7 @@ class VisualGroundingShadowTests(unittest.TestCase):
         frozen.run.assert_called_once_with(
             "session",
             "The video shows a basketball game.",
-            [text, visual],
+            [text],
         )
 
     def test_mutating_snapshot_then_raising_cannot_change_authoritative_state(self):
@@ -273,7 +273,7 @@ class VisualGroundingShadowTests(unittest.TestCase):
         frozen.run.assert_called_once_with(
             "session",
             "The video shows a basketball game.",
-            [text, visual],
+            [text],
         )
 
     def test_mutating_snapshot_and_returning_artifact_leaves_units_unchanged(self):
