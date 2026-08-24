@@ -120,7 +120,11 @@ class ProductionExecutionService:
         if not callable(getattr(runtime, "run", None)):
             raise TypeError("runtime must provide a callable run method")
         if result_builder is None:
-            result_builder = ProductionResultBuilder()
+            runtime_config = getattr(runtime, "config", None)
+            cache_root = getattr(runtime_config, "cache_root", None)
+            result_builder = ProductionResultBuilder(
+                evidence_root=cache_root if isinstance(cache_root, Path) else None
+            )
         elif not callable(getattr(result_builder, "build", None)):
             raise TypeError("result_builder must provide a callable build method")
         self.runtime = runtime

@@ -1,7 +1,11 @@
 """Path-safe API presentation contract for completed production results."""
 
+import base64
 import json
+import math
 from dataclasses import dataclass
+from numbers import Real
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from schemas import (
@@ -19,6 +23,40 @@ from services.video_multimodal_runner import VideoMultimodalResult
 
 
 SCHEMA_VERSION = 1
+MAX_EVIDENCE_FRAMES_PER_UNIT = 4
+MAX_EVIDENCE_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_EVIDENCE_PAYLOAD_BYTES = 12 * 1024 * 1024
+
+
+def _optional_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
+
+
+def _optional_index(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _optional_bbox(value: Any) -> Optional[Tuple[float, float, float, float]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    normalized = tuple(_optional_number(item) for item in value)
+    if any(item is None for item in normalized):
+        return None
+    x1, y1, x2, y2 = normalized
+    if x2 < x1 or y2 < y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def _optional_string_tuple(
@@ -36,6 +74,44 @@ def _optional_string_tuple(
             f"provenance.details[{field_name!r}] must be a list or tuple of strings"
         )
     return tuple(value)
+
+
+@dataclass(frozen=True)
+class ProductionEvidenceRegion:
+    text: Optional[str]
+    bbox: Tuple[float, float, float, float]
+    confidence: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "bbox": list(self.bbox),
+            "confidence": self.confidence,
+        }
+
+
+@dataclass(frozen=True)
+class ProductionEvidenceFrame:
+    frame_id: Optional[str]
+    frame_index: Optional[int]
+    timestamp: Optional[float]
+    original_image: Optional[str]
+    annotated_image: Optional[str]
+    bbox: Optional[Tuple[float, float, float, float]]
+    regions: Tuple[ProductionEvidenceRegion, ...]
+    explanation: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "frame_id": self.frame_id,
+            "frame_index": self.frame_index,
+            "timestamp": self.timestamp,
+            "original_image": self.original_image,
+            "annotated_image": self.annotated_image,
+            "bbox": None if self.bbox is None else list(self.bbox),
+            "regions": [region.to_dict() for region in self.regions],
+            "explanation": self.explanation,
+        }
 
 
 @dataclass(frozen=True)
@@ -58,9 +134,14 @@ class ProductionEvidenceUnit:
     evidence_refs: Tuple[str, ...]
     source_unit_ids: Tuple[str, ...]
     observation_type: Optional[str]
+    evidence_frames: Tuple[ProductionEvidenceFrame, ...] = ()
 
     @classmethod
-    def from_runtime_unit(cls, unit: RuntimeUnit) -> "ProductionEvidenceUnit":
+    def from_runtime_unit(
+        cls,
+        unit: RuntimeUnit,
+        evidence_frames: Tuple[ProductionEvidenceFrame, ...] = (),
+    ) -> "ProductionEvidenceUnit":
         details = unit.provenance.details
         observation_type = details.get("observation_type")
         if observation_type is not None and not isinstance(observation_type, str):
@@ -90,6 +171,7 @@ class ProductionEvidenceUnit:
             evidence_refs=_optional_string_tuple(unit, "evidence_refs"),
             source_unit_ids=_optional_string_tuple(unit, "source_unit_ids"),
             observation_type=observation_type,
+            evidence_frames=evidence_frames,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -112,6 +194,9 @@ class ProductionEvidenceUnit:
             "evidence_refs": list(self.evidence_refs),
             "source_unit_ids": list(self.source_unit_ids),
             "observation_type": self.observation_type,
+            "evidence_frames": [
+                frame.to_dict() for frame in self.evidence_frames
+            ],
         }
 
 
@@ -179,12 +264,192 @@ class ProductionResult:
 
 
 class ProductionResultBuilder:
+    def __init__(self, *, evidence_root: Optional[Path] = None) -> None:
+        if evidence_root is not None and not isinstance(evidence_root, Path):
+            raise TypeError("evidence_root must be a Path or None")
+        self.evidence_root = (
+            None if evidence_root is None else evidence_root.expanduser().resolve()
+        )
+
+    @staticmethod
+    def _image_mime_type(data: bytes) -> Optional[str]:
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        return None
+
+    def _image_data_url(
+        self,
+        path_value: Any,
+        remaining_bytes: list,
+    ) -> Optional[str]:
+        if self.evidence_root is None or not isinstance(path_value, (str, Path)):
+            return None
+        try:
+            root = self.evidence_root.resolve(strict=True)
+            candidate = Path(path_value)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if candidate.is_symlink():
+                return None
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if root not in resolved.parents or not resolved.is_file():
+            return None
+        try:
+            with resolved.open("rb") as handle:
+                data = handle.read(MAX_EVIDENCE_IMAGE_BYTES + 1)
+        except OSError:
+            return None
+        if (
+            not data
+            or len(data) > MAX_EVIDENCE_IMAGE_BYTES
+            or len(data) > remaining_bytes[0]
+        ):
+            return None
+        mime_type = self._image_mime_type(data)
+        if mime_type is None:
+            return None
+        remaining_bytes[0] -= len(data)
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _ocr_regions(unit: RuntimeUnit) -> Tuple[ProductionEvidenceRegion, ...]:
+        regions = []
+        raw_detections = unit.provenance.details.get("accepted_detections")
+        if isinstance(raw_detections, (list, tuple)):
+            for detection in raw_detections:
+                if not isinstance(detection, dict):
+                    continue
+                bbox = _optional_bbox(detection.get("runtime_bbox"))
+                if bbox is None:
+                    continue
+                confidence = _optional_number(detection.get("confidence"))
+                if confidence is not None and not 0.0 <= confidence <= 1.0:
+                    confidence = None
+                regions.append(
+                    ProductionEvidenceRegion(
+                        text=_optional_text(detection.get("text")),
+                        bbox=bbox,
+                        confidence=confidence,
+                    )
+                )
+        if not regions:
+            bbox = _optional_bbox(unit.bbox)
+            if bbox is not None:
+                regions.append(
+                    ProductionEvidenceRegion(
+                        text=_optional_text(unit.text),
+                        bbox=bbox,
+                        confidence=_optional_number(unit.confidence),
+                    )
+                )
+        return tuple(regions)
+
+    def _ocr_frames(
+        self,
+        unit: RuntimeUnit,
+        remaining_bytes: list,
+    ) -> Tuple[ProductionEvidenceFrame, ...]:
+        if unit.frame_id is None and unit.frame_path is None:
+            return ()
+        regions = self._ocr_regions(unit)
+        image = self._image_data_url(unit.frame_path, remaining_bytes)
+        explanation = (
+            f"OCR text is grounded in {len(regions)} recorded region"
+            f"{'s' if len(regions) != 1 else ''} on this frame."
+            if regions
+            else "OCR region unavailable; this unit is grounded at frame level."
+        )
+        return (
+            ProductionEvidenceFrame(
+                frame_id=_optional_text(unit.frame_id),
+                frame_index=_optional_index(unit.provenance.source_index),
+                timestamp=_optional_number(unit.start_time),
+                original_image=image,
+                annotated_image=None,
+                bbox=_optional_bbox(unit.bbox),
+                regions=regions,
+                explanation=explanation,
+            ),
+        )
+
+    def _visual_frames(
+        self,
+        unit: RuntimeUnit,
+        remaining_bytes: list,
+    ) -> Tuple[ProductionEvidenceFrame, ...]:
+        referenced = unit.provenance.details.get("referenced_frames")
+        metadata = (
+            list(referenced[:MAX_EVIDENCE_FRAMES_PER_UNIT])
+            if isinstance(referenced, (list, tuple))
+            else []
+        )
+        if not metadata and (unit.frame_id is not None or unit.frame_path is not None):
+            metadata = [
+                {
+                    "frame_id": unit.frame_id,
+                    "frame_path": unit.frame_path,
+                    "frame_index": unit.provenance.source_index,
+                    "timestamp_sec": unit.start_time,
+                }
+            ]
+
+        frames = []
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            image = self._image_data_url(item.get("frame_path"), remaining_bytes)
+            frames.append(
+                ProductionEvidenceFrame(
+                    frame_id=_optional_text(item.get("frame_id")),
+                    frame_index=_optional_index(item.get("frame_index")),
+                    timestamp=_optional_number(item.get("timestamp_sec")),
+                    original_image=image,
+                    annotated_image=None,
+                    bbox=None,
+                    regions=(),
+                    explanation=(
+                        "This observation is grounded at frame level; localized "
+                        "object, attention, and identity regions were not provided."
+                    ),
+                )
+            )
+        return tuple(frames)
+
+    def _evidence_frames(
+        self,
+        unit: RuntimeUnit,
+        remaining_bytes: list,
+    ) -> Tuple[ProductionEvidenceFrame, ...]:
+        if unit.source_type is SourceType.OCR:
+            return self._ocr_frames(unit, remaining_bytes)
+        if unit.source_type is SourceType.VISUAL_OBSERVATION:
+            return self._visual_frames(unit, remaining_bytes)
+        return ()
+
+    def _public_unit(
+        self,
+        unit: RuntimeUnit,
+        remaining_bytes: list,
+    ) -> ProductionEvidenceUnit:
+        return ProductionEvidenceUnit.from_runtime_unit(
+            unit,
+            evidence_frames=self._evidence_frames(unit, remaining_bytes),
+        )
+
     def build(self, result: VideoMultimodalResult) -> ProductionResult:
         if not isinstance(result, VideoMultimodalResult):
             raise TypeError("result must be a VideoMultimodalResult")
 
         sufficiency = EvidenceSufficiencyPolicy().assess(result)
         verification = result.verification_result
+        remaining_bytes = [MAX_EVIDENCE_PAYLOAD_BYTES]
         return ProductionResult(
             schema_version=SCHEMA_VERSION,
             session_id=result.session_id,
@@ -198,14 +463,14 @@ class ProductionResultBuilder:
             checkpoint_sha256=verification.checkpoint_sha256,
             sufficiency=sufficiency,
             g1_exposure_units=tuple(
-                ProductionEvidenceUnit.from_runtime_unit(unit)
+                self._public_unit(unit, remaining_bytes)
                 for unit in result.g1_exposure_units
             ),
             g1_top_k_explanation_unit_ids=tuple(
                 unit.unit_id for unit in verification.top_k_units
             ),
             visual_supplemental_units=tuple(
-                ProductionEvidenceUnit.from_runtime_unit(unit)
+                self._public_unit(unit, remaining_bytes)
                 for unit in result.visual_units
             ),
             runtime_ms=result.runtime_ms,

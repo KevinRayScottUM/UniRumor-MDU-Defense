@@ -81,6 +81,23 @@ export type EvidenceSourceType =
   | "ocr"
   | "visual_observation";
 
+export interface PublicEvidenceRegion {
+  text: string | null;
+  bbox: number[];
+  confidence: number | null;
+}
+
+export interface PublicEvidenceFrame {
+  frame_id: string | null;
+  frame_index: number | null;
+  timestamp: number | null;
+  original_image: string | null;
+  annotated_image: string | null;
+  bbox: number[] | null;
+  regions: PublicEvidenceRegion[];
+  explanation: string;
+}
+
 export interface PublicEvidenceUnit {
   unit_id: string;
   source_type: EvidenceSourceType;
@@ -100,6 +117,7 @@ export interface PublicEvidenceUnit {
   evidence_refs: string[];
   source_unit_ids: string[];
   observation_type: string | null;
+  evidence_frames?: PublicEvidenceFrame[];
 }
 
 export interface PublicVerdict {
@@ -157,4 +175,3 @@ export interface SubmitJobInput {
   claim: string;
   video: File;
 }
-

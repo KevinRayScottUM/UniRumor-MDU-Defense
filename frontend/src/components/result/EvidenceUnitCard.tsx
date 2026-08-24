@@ -1,5 +1,6 @@
 import type { PublicEvidenceUnit } from "../../types";
 import { Badge, Card } from "../ui";
+import { EvidenceFrameGallery } from "./EvidenceFrameGallery";
 
 export type EvidenceUnitVariant = "candidate" | "selected" | "supplemental";
 
@@ -50,6 +51,27 @@ function optionalMetadata(unit: PublicEvidenceUnit) {
   ].filter((item): item is { label: string; value: string } => item !== null);
 }
 
+function groundedExplanation(unit: PublicEvidenceUnit): string {
+  const frames = unit.evidence_frames ?? [];
+  const regionCount = frames.reduce(
+    (count, frame) => count + frame.regions.length,
+    0,
+  );
+  if (unit.source_type === "ocr") {
+    if (regionCount > 0) {
+      return `The recognized text is grounded in ${String(regionCount)} recorded OCR region${regionCount === 1 ? "" : "s"}. Highlighted boxes reproduce backend coordinates without changing the text.`;
+    }
+    return "The OCR unit has frame-level provenance, but no localized OCR region was provided. The interface does not invent coordinates.";
+  }
+  if (unit.source_type === "visual_observation") {
+    if (frames.length > 0) {
+      return "The observation is grounded in the referenced public frames. No face identity, object identity, saliency, or attention region is inferred by this interface.";
+    }
+    return "The observation has public provenance metadata, but no frame imagery was provided. No visual region or identity is inferred.";
+  }
+  return "This unit is presented from the authoritative textual evidence and provenance returned by the backend.";
+}
+
 export function EvidenceUnitCard({
   unit,
   variant = "candidate",
@@ -82,26 +104,32 @@ export function EvidenceUnitCard({
         ) : null}
       </div>
 
-      <div className="evidence-unit__identity">
-        <p>Unit identifier</p>
-        <code>{unit.unit_id}</code>
-      </div>
-      <blockquote>{unit.text}</blockquote>
+      <section className="evidence-unit__summary" aria-label="Evidence summary">
+        <div className="evidence-unit__section-heading">
+          <p>Evidence summary</p>
+          <h4>Authoritative candidate content</h4>
+        </div>
+        <div className="evidence-unit__identity">
+          <p>Unit identifier</p>
+          <code>{unit.unit_id}</code>
+        </div>
+        <blockquote>{unit.text}</blockquote>
 
-      {metadata.length > 0 ? (
-        <dl className="evidence-unit__metadata">
-          {metadata.map((item) => (
-            <div key={item.label}>
-              <dt>{item.label}</dt>
-              <dd>{item.value}</dd>
-            </div>
-          ))}
-        </dl>
-      ) : (
-        <p className="evidence-unit__metadata-empty">
-          No additional public metadata was provided for this unit.
-        </p>
-      )}
+        {metadata.length > 0 ? (
+          <dl className="evidence-unit__metadata">
+            {metadata.map((item) => (
+              <div key={item.label}>
+                <dt>{item.label}</dt>
+                <dd>{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : (
+          <p className="evidence-unit__metadata-empty">
+            No additional public metadata was provided for this unit.
+          </p>
+        )}
+      </section>
 
       <div className="evidence-unit__provenance">
         <div>
@@ -130,6 +158,19 @@ export function EvidenceUnitCard({
           ) : null}
         </div>
       ) : null}
+
+      {unit.source_type === "ocr" || unit.source_type === "visual_observation" ? (
+        <EvidenceFrameGallery
+          frames={unit.evidence_frames ?? []}
+          sourceType={unit.source_type}
+        />
+      ) : null}
+
+      <section className="evidence-unit__grounding" aria-label="Grounded explanation">
+        <p>Grounded explanation</p>
+        <h4>Why this evidence is inspectable</h4>
+        <span>{groundedExplanation(unit)}</span>
+      </section>
     </Card>
   );
 }

@@ -261,6 +261,56 @@ describe("explainable result experience", () => {
     expect(screen.queryByText(/Selection score/)).not.toBeInTheDocument();
   });
 
+  it("renders real OCR frames, recorded regions, and the accessible lightbox", async () => {
+    const image =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+    const ocr = makeUnit("unit-ocr-grounded", {
+      source_type: "ocr",
+      text: "CPAC 2018",
+      frame_id: "frame_004",
+      extraction_method: "frame_ocr",
+      evidence_frames: [
+        {
+          frame_id: "frame_004",
+          frame_index: 4,
+          timestamp: 12.5,
+          original_image: image,
+          annotated_image: null,
+          bbox: [10, 8, 120, 42],
+          regions: [
+            { text: "CPAC", bbox: [10, 8, 62, 42], confidence: 0.97 },
+            { text: "2018", bbox: [68, 8, 120, 42], confidence: 0.93 },
+          ],
+          explanation: "OCR text is grounded in 2 recorded regions on this frame.",
+        },
+      ],
+    });
+    vi.spyOn(apiClient, "getJobResult").mockResolvedValueOnce(
+      makeResultResponse({ candidates: [ocr], selectedIds: [] }),
+    );
+
+    renderResult();
+
+    expect(await screen.findByText("OCR Evidence Frames")).toBeVisible();
+    expect(screen.getByText(/grounded in 2 recorded OCR regions/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Inspect frame_004" }));
+
+    const dialog = screen.getByRole("dialog", { name: "frame_004" });
+    expect(within(dialog).getByText("Original public evidence frame")).toBeVisible();
+    expect(within(dialog).getByText("Annotated OCR regions")).toBeVisible();
+    expect(within(dialog).getByText("CPAC")).toBeVisible();
+    expect(within(dialog).getByText("2018")).toBeVisible();
+
+    const annotated = within(dialog).getByAltText("frame_004 annotated evidence");
+    Object.defineProperty(annotated, "naturalWidth", { configurable: true, value: 160 });
+    Object.defineProperty(annotated, "naturalHeight", { configurable: true, value: 90 });
+    fireEvent.load(annotated);
+    expect(
+      within(dialog).getByRole("img", { name: "2 grounded OCR regions" }),
+    ).toBeVisible();
+
+  });
+
   it("maps failed, expired, and not-completed public errors", async () => {
     const getResult = vi.spyOn(apiClient, "getJobResult").mockRejectedValueOnce(
       new ApiClientError(409, "job_failed", "Job execution failed.", "req_failed"),

@@ -17,6 +17,8 @@ export type {
   PublicError,
   PublicErrorEnvelope,
   PublicEvidence,
+  PublicEvidenceFrame,
+  PublicEvidenceRegion,
   PublicEvidenceUnit,
   PublicSufficiency,
   PublicVerdict,
@@ -25,4 +27,3 @@ export type {
   SubmitJobInput,
   SuccessfulProductionExecutionOutcome,
 } from "./api";
-

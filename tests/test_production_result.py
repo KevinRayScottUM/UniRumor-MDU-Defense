@@ -1,3 +1,4 @@
+import base64
 import inspect
 import json
 import subprocess
@@ -440,6 +441,88 @@ class ProductionResultTests(unittest.TestCase):
         self.assertNotIn("referenced_frames", keys)
         self.assertNotIn("some_unapproved_internal_field", keys)
         self.assertNotIn("private_model_path", keys)
+
+    def test_path_safe_evidence_frames_embed_real_images_and_ocr_regions(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_root = Path(temporary_directory)
+            frame_path = cache_root / "frame.png"
+            frame_path.write_bytes(png)
+            ocr = self._g1_unit("ocr-grounded", SourceType.OCR, 7)
+            ocr.frame_path = str(frame_path)
+            ocr.provenance.details["accepted_detections"] = [
+                {
+                    "text": "CPAC",
+                    "confidence": 0.97,
+                    "runtime_bbox": [1, 2, 30, 20],
+                },
+                {
+                    "text": "2018",
+                    "confidence": 0.93,
+                    "runtime_bbox": [32, 2, 58, 20],
+                },
+            ]
+            visual = self._visual_unit("visual-grounded", 0)
+            visual.provenance.details["referenced_frames"] = [
+                {
+                    "frame_id": "F001",
+                    "frame_path": str(frame_path),
+                    "frame_index": 42,
+                    "timestamp_sec": 2.5,
+                }
+            ]
+
+            public = ProductionResultBuilder(evidence_root=cache_root).build(
+                self._result(
+                    g1_units=[ocr],
+                    visual_units=[visual],
+                    top_k_units=[ocr],
+                )
+            )
+
+        ocr_frame = public.g1_exposure_units[0].to_dict()["evidence_frames"][0]
+        visual_frame = public.visual_supplemental_units[0].to_dict()[
+            "evidence_frames"
+        ][0]
+        self.assertTrue(ocr_frame["original_image"].startswith("data:image/png;base64,"))
+        self.assertEqual(["CPAC", "2018"], [item["text"] for item in ocr_frame["regions"]])
+        self.assertEqual([1.0, 2.0, 30.0, 20.0], ocr_frame["regions"][0]["bbox"])
+        self.assertIsNone(ocr_frame["annotated_image"])
+        self.assertTrue(visual_frame["original_image"].startswith("data:image/png;base64,"))
+        self.assertEqual(visual_frame["frame_index"], 42)
+        self.assertEqual(visual_frame["timestamp"], 2.5)
+        self.assertEqual(visual_frame["regions"], [])
+        encoded = json.dumps(public.to_dict())
+        self.assertNotIn(str(frame_path), encoded)
+
+    def test_evidence_image_outside_configured_root_is_never_embedded(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            outside = root / "private.png"
+            outside.write_bytes(png)
+            ocr = self._g1_unit("ocr-outside", SourceType.OCR, 3)
+            ocr.frame_path = str(outside)
+
+            public = ProductionResultBuilder(evidence_root=cache_root).build(
+                self._result(
+                    g1_units=[ocr],
+                    visual_units=[],
+                    top_k_units=[ocr],
+                )
+            )
+
+        frame = public.g1_exposure_units[0].to_dict()["evidence_frames"][0]
+        self.assertIsNone(frame["original_image"])
+        self.assertNotIn(str(outside), json.dumps(public.to_dict()))
 
     def test_builder_never_uses_internal_to_dict_contracts(self):
         internal = self._result()

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from schemas import DisplayVerdict, EvidenceStatus, ModelVerdict
@@ -251,6 +252,18 @@ class ProductionExecutionTests(unittest.TestCase):
         runtime = FakeRuntime()
         service = ProductionExecutionService(runtime)
         self.assertIsInstance(service.result_builder, ProductionResultBuilder)
+        self.assertEqual(runtime.calls, [])
+
+    def test_default_builder_receives_runtime_cache_root_for_evidence_images(self):
+        runtime = FakeRuntime()
+        runtime.config = SimpleNamespace(cache_root=Path("/deployment/cache"))
+
+        service = ProductionExecutionService(runtime)
+
+        self.assertEqual(
+            service.result_builder.evidence_root,
+            Path("/deployment/cache").resolve(),
+        )
         self.assertEqual(runtime.calls, [])
 
     def test_constructor_rejects_incompatible_dependencies(self):

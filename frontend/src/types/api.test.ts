@@ -4,6 +4,8 @@ import type {
   HealthResponse,
   JobResultResponse,
   JobStatusResponse,
+  PublicEvidenceFrame,
+  PublicEvidenceUnit,
   PublicErrorEnvelope,
   ReadinessResponse,
 } from "./api";
@@ -33,6 +35,7 @@ describe("public API types", () => {
       "accepted" | "queued" | "running" | "completed" | "failed" | "expired"
     >();
     expectTypeOf<JobResultResponse["outcome"]["status"]>().toEqualTypeOf<"success">();
+    expectTypeOf<NonNullable<PublicEvidenceUnit["evidence_frames"]>[number]>()
+      .toEqualTypeOf<PublicEvidenceFrame>();
   });
 });
-
