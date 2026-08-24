@@ -154,6 +154,45 @@ class ClaimConsistencyGateTests(unittest.TestCase):
             [self.transcript, self.ocr, self.visual],
         )
 
+    def test_unknown_gate_result_for_normal_claim_calls_frozen_g1(self) -> None:
+        claim = "A local council approved the proposed transit plan."
+        text_runner = mock.Mock()
+        text_runner.run.return_value = SimpleNamespace(
+            g1_exposure_units=[self.transcript],
+            warnings=[],
+        )
+        visual_runner = mock.Mock()
+        visual_runner.run.return_value = SimpleNamespace(
+            runtime_units=[],
+            warnings=[],
+        )
+        frozen_runner = mock.Mock()
+        runner = VideoMultimodalRunner(
+            text_runner,
+            visual_runner,
+            frozen_runner,
+        )
+        expected = object()
+        frozen_runner.run.return_value = expected
+
+        result = runner.run("session-unknown-normal", claim, Path("input.mp4"))
+
+        self.assertIs(
+            ClaimConsistencyGate().evaluate(
+                claim,
+                [self.transcript],
+                [],
+                [],
+            ),
+            ConsistencyResult.UNKNOWN,
+        )
+        self.assertIs(result.verification_result, expected)
+        frozen_runner.run.assert_called_once_with(
+            "session-unknown-normal",
+            claim,
+            [self.transcript],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

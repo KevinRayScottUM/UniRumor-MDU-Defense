@@ -132,10 +132,15 @@ class VideoMultimodalRunner:
                 verification = self._insufficient_nei(
                     session_id, claim, all_units, warnings
                 )
-            else:
+            elif consistency_result in {
+                ConsistencyResult.PASS,
+                ConsistencyResult.UNKNOWN,
+            }:
                 verification = self.frozen_g1_runner.run(
                     session_id, claim, all_units
                 )
+            else:
+                raise ValueError("invalid claim consistency result")
         else:
             warnings.append("visual-only evidence cannot run Frozen G1")
             verification = self._insufficient_nei(
