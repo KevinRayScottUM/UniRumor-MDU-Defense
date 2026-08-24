@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from schemas import DisplayVerdict, EvidenceStatus, ModelVerdict, SourceType
+from services.claim_consistency_gate import CLAIM_VIDEO_MISMATCH_WARNING
 from services.video_multimodal_runner import VideoMultimodalResult
 
 
@@ -36,6 +37,7 @@ class EvidenceSufficiencyAssessment:
 class EvidenceSufficiencyPolicy:
     SUFFICIENT_REASON = "frozen_g1_evidence_available_and_model_completed"
     INSUFFICIENT_REASON = "no_frozen_g1_eligible_evidence"
+    CONSISTENCY_MISMATCH_REASON = "claim_video_consistency_mismatch"
 
     def assess(
         self,
@@ -115,7 +117,28 @@ class EvidenceSufficiencyPolicy:
             ModelVerdict.NOT_RUN: DisplayVerdict.NEI,
         }[verification.model_verdict]
 
-        if g1_exposure_count:
+        consistency_mismatch = (
+            g1_exposure_count > 0
+            and CLAIM_VIDEO_MISMATCH_WARNING in result.warnings
+            and CLAIM_VIDEO_MISMATCH_WARNING in verification.warnings
+        )
+        if consistency_mismatch:
+            if verification.model_verdict is not ModelVerdict.NOT_RUN:
+                raise ValueError(
+                    "consistency mismatch requires a not_run model verdict"
+                )
+            if verification.evidence_status is not EvidenceStatus.INSUFFICIENT:
+                raise ValueError(
+                    "consistency mismatch requires insufficient verification status"
+                )
+            if verification.display_verdict is not expected_display:
+                raise ValueError(
+                    "consistency mismatch requires the NEI display verdict"
+                )
+            status = EvidenceStatus.INSUFFICIENT
+            reason_code = self.CONSISTENCY_MISMATCH_REASON
+            model_was_run = False
+        elif g1_exposure_count:
             if verification.model_verdict not in {
                 ModelVerdict.FAKE,
                 ModelVerdict.REAL,

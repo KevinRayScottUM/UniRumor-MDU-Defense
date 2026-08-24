@@ -13,6 +13,11 @@ from schemas import (
     SourceType,
     VerificationResult,
 )
+from services.claim_consistency_gate import (
+    CLAIM_VIDEO_MISMATCH_WARNING,
+    ClaimConsistencyGate,
+    ConsistencyResult,
+)
 from services.video_text_ocr_runner import VideoTextOCRResult
 from services.video_visual_runner import VideoVisualResult
 
@@ -51,13 +56,19 @@ class VideoMultimodalRunner:
         video_text_ocr_runner: Any,
         video_visual_runner: Any,
         frozen_g1_runner: Any,
+        claim_consistency_gate: Any = None,
     ) -> None:
         self.video_text_ocr_runner = video_text_ocr_runner
         self.video_visual_runner = video_visual_runner
         self.frozen_g1_runner = frozen_g1_runner
+        self.claim_consistency_gate = (
+            claim_consistency_gate
+            if claim_consistency_gate is not None
+            else ClaimConsistencyGate()
+        )
 
     @staticmethod
-    def _visual_only_nei(
+    def _insufficient_nei(
         session_id: str,
         claim: str,
         all_units: List[RuntimeUnit],
@@ -102,12 +113,32 @@ class VideoMultimodalRunner:
         all_units = g1_units + visual_units
         warnings = list(text_ocr_result.warnings) + list(visual_result.warnings)
         if g1_units:
-            verification = self.frozen_g1_runner.run(
-                session_id, claim, all_units
+            consistency_result = self.claim_consistency_gate.evaluate(
+                claim=claim,
+                transcript_units=[
+                    unit
+                    for unit in g1_units
+                    if unit.source_type is SourceType.TRANSCRIPT
+                ],
+                ocr_units=[
+                    unit
+                    for unit in g1_units
+                    if unit.source_type is SourceType.OCR
+                ],
+                visual_units=visual_units,
             )
+            if consistency_result is ConsistencyResult.MISMATCH:
+                warnings.append(CLAIM_VIDEO_MISMATCH_WARNING)
+                verification = self._insufficient_nei(
+                    session_id, claim, all_units, warnings
+                )
+            else:
+                verification = self.frozen_g1_runner.run(
+                    session_id, claim, all_units
+                )
         else:
             warnings.append("visual-only evidence cannot run Frozen G1")
-            verification = self._visual_only_nei(
+            verification = self._insufficient_nei(
                 session_id, claim, all_units, warnings
             )
         return VideoMultimodalResult(
