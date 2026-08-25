@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "audit_id": "cpac_selector_fidelity_v1",
+  "candidate_pool": {
+    "pool_id": "cpac_production_qa_18_unit_pool",
+    "expected_unit_count": 18,
+    "require_original_order": true,
+    "formal_dataset_split": null
+  },
+  "scientific_boundary": {
+    "selection_only_audit": true,
+    "top_k_is_explanation_only": true,
+    "prediction_uses_all_valid_unit_veracity_logits": true,
+    "pooling": "class_wise_max",
+    "modify_scores": false,
+    "modify_top_k": false
+  },
+  "probes": [
+    {
+      "probe_id": "ocr_01_direct_full_banner",
+      "claim": "The on-screen text reads 'AMERICAN CONSERVATIVE UNION CPAC 2018'.",
+      "expected_modality": "OCR",
+      "expected_relevant_unit_ids": ["ocr_0001"],
+      "direct_grounding_unit_ids": ["ocr_0001"],
+      "annotation_status": "audited",
+      "annotation_basis": "The known QA OCR unit is reported as 'UNIC AMERICAN CONSERVATIVE UNION CPAC 2018'."
+    },
+    {
+      "probe_id": "ocr_02_cpac_2018",
+      "claim": "The text 'CPAC 2018' appears on screen.",
+      "expected_modality": "OCR",
+      "expected_relevant_unit_ids": ["ocr_0001"],
+      "direct_grounding_unit_ids": ["ocr_0001"],
+      "annotation_status": "audited",
+      "annotation_basis": "The known QA OCR unit explicitly contains 'CPAC 2018'."
+    },
+    {
+      "probe_id": "ocr_03_american_conservative_union",
+      "claim": "The words 'AMERICAN CONSERVATIVE UNION' are visible on screen.",
+      "expected_modality": "OCR",
+      "expected_relevant_unit_ids": ["ocr_0001"],
+      "direct_grounding_unit_ids": ["ocr_0001"],
+      "annotation_status": "audited",
+      "annotation_basis": "The known QA OCR unit explicitly contains 'AMERICAN CONSERVATIVE UNION'."
+    },
+    {
+      "probe_id": "ocr_04_event_banner",
+      "claim": "The on-screen banner identifies the event as CPAC 2018.",
+      "expected_modality": "OCR",
+      "expected_relevant_unit_ids": ["ocr_0001"],
+      "direct_grounding_unit_ids": ["ocr_0001"],
+      "annotation_status": "audited",
+      "annotation_basis": "The known QA OCR unit visibly identifies CPAC 2018; no named-person identity is inferred."
+    },
+    {
+      "probe_id": "transcript_01_armed_security",
+      "claim": "The speaker discusses armed security in schools.",
+      "expected_modality": "TRANSCRIPT",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "pending_exact_candidate_pool",
+      "annotation_basis": "Exact transcript unit IDs must be assigned by human inspection of the production candidate pool."
+    },
+    {
+      "probe_id": "transcript_02_protected_schools",
+      "claim": "The speaker argues that schools should be protected by armed security.",
+      "expected_modality": "TRANSCRIPT",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "pending_exact_candidate_pool",
+      "annotation_basis": "Exact transcript unit IDs must be assigned by human inspection of the production candidate pool."
+    },
+    {
+      "probe_id": "transcript_03_protecting_children",
+      "claim": "The speaker talks about protecting children.",
+      "expected_modality": "TRANSCRIPT",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "pending_exact_candidate_pool",
+      "annotation_basis": "Exact transcript unit IDs must be assigned by human inspection of the production candidate pool."
+    },
+    {
+      "probe_id": "visual_01_podium_microphones",
+      "claim": "A man is standing behind a podium with microphones.",
+      "expected_modality": "VISUAL_SUPPLEMENTAL",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "audited_not_in_frozen_g1",
+      "annotation_basis": "Supplemental visual observations are intentionally absent from the Frozen G1 candidate pool."
+    },
+    {
+      "probe_id": "visual_02_flag_backdrop",
+      "claim": "The backdrop contains an American flag design.",
+      "expected_modality": "VISUAL_SUPPLEMENTAL",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "audited_not_in_frozen_g1",
+      "annotation_basis": "Supplemental visual observations are intentionally absent from the Frozen G1 candidate pool."
+    },
+    {
+      "probe_id": "none_01_football",
+      "claim": "The video shows a football match.",
+      "expected_modality": "NONE",
+      "expected_relevant_unit_ids": [],
+      "direct_grounding_unit_ids": [],
+      "annotation_status": "audited_no_relevant_g1_unit",
+      "annotation_basis": "No relevant Frozen G1 unit should be fabricated for the irrelevant control."
+    }
+  ],
+  "paired_claims": [
+    {
+      "pair_id": "full_banner_to_armed_security",
+      "old_probe_id": "ocr_01_direct_full_banner",
+      "new_probe_id": "transcript_01_armed_security"
+    },
+    {
+      "pair_id": "cpac_text_to_protected_schools",
+      "old_probe_id": "ocr_02_cpac_2018",
+      "new_probe_id": "transcript_02_protected_schools"
+    },
+    {
+      "pair_id": "union_text_to_protecting_children",
+      "old_probe_id": "ocr_03_american_conservative_union",
+      "new_probe_id": "transcript_03_protecting_children"
+    }
+  ]
+}
