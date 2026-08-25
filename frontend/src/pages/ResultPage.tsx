@@ -305,7 +305,15 @@ function EvidenceHierarchy({ result }: { result: ProductionResult }) {
   );
 }
 
-function SupplementalEvidence({ result }: { result: ProductionResult }) {
+function SupplementalEvidence({
+  jobId,
+  onVisualXAIReady,
+  result,
+}: {
+  jobId: string;
+  onVisualXAIReady: () => void;
+  result: ProductionResult;
+}) {
   const units = result.evidence.visual_supplemental_units;
 
   return (
@@ -323,7 +331,13 @@ function SupplementalEvidence({ result }: { result: ProductionResult }) {
       {units.length > 0 ? (
         <div className="evidence-unit-grid">
           {units.map((unit) => (
-            <EvidenceUnitCard key={unit.unit_id} unit={unit} variant="supplemental" />
+            <EvidenceUnitCard
+              jobId={jobId}
+              key={unit.unit_id}
+              onVisualXAIReady={onVisualXAIReady}
+              unit={unit}
+              variant="supplemental"
+            />
           ))}
         </div>
       ) : (
@@ -340,7 +354,7 @@ function SupplementalEvidence({ result }: { result: ProductionResult }) {
 
 export function ResultPage() {
   const { jobId } = useParams<{ jobId: string }>();
-  const { error, jobResult, loading, retry, unavailable } = useJobResult(jobId);
+  const { error, jobResult, loading, refresh, retry, unavailable } = useJobResult(jobId);
   const displayedJobId = jobResult?.jobId ?? jobId ?? "Unavailable";
   const unavailablePresentation = unavailable
     ? UNAVAILABLE_PRESENTATION[unavailable.state]
@@ -424,7 +438,11 @@ export function ResultPage() {
           <ResultConfidence result={jobResult.result} />
           <ResultMetadata jobId={jobResult.jobId} result={jobResult.result} />
           <EvidenceHierarchy result={jobResult.result} />
-          <SupplementalEvidence result={jobResult.result} />
+          <SupplementalEvidence
+            jobId={jobResult.jobId}
+            onVisualXAIReady={refresh}
+            result={jobResult.result}
+          />
         </>
       ) : null}
     </section>

@@ -78,7 +78,7 @@ class VideoMultimodalRunner:
         frozen_g1_runner: Any,
         claim_consistency_gate: Any = None,
         visual_grounding_shadow_runner: Any = None,
-        visual_xai_attributor: Any = None,
+        visual_xai_service: Any = None,
     ) -> None:
         self.video_text_ocr_runner = video_text_ocr_runner
         self.video_visual_runner = video_visual_runner
@@ -93,11 +93,11 @@ class VideoMultimodalRunner:
             if visual_grounding_shadow_runner is not None
             else VisualGroundingShadowRunner()
         )
-        if visual_xai_attributor is not None and not callable(
-            getattr(visual_xai_attributor, "attribute", None)
+        if visual_xai_service is not None and not callable(
+            getattr(visual_xai_service, "register", None)
         ):
-            raise TypeError("visual_xai_attributor must provide attribute()")
-        self.visual_xai_attributor = visual_xai_attributor
+            raise TypeError("visual_xai_service must provide register()")
+        self.visual_xai_service = visual_xai_service
 
     @staticmethod
     def _insufficient_nei(
@@ -191,14 +191,16 @@ class VideoMultimodalRunner:
         except Exception:
             warnings.append(VISUAL_GROUNDING_SHADOW_FAILURE_WARNING)
         visual_xai_artifacts = []
-        if self.visual_xai_attributor is not None:
+        if self.visual_xai_service is not None:
             try:
                 observation_result = visual_result.observation_result
                 if observation_result is not None and visual_snapshots:
-                    visual_xai_artifacts = self.visual_xai_attributor.attribute(
+                    self.visual_xai_service.register(
+                        session_id,
                         visual_snapshots,
                         visual_result.retrieval_result.selected_frames,
                         observation_result.raw_generation,
+                        observer_runtime_ms=visual_result.runtime_ms,
                     )
             except Exception:
                 warnings.append(VISUAL_XAI_FAILURE_WARNING)

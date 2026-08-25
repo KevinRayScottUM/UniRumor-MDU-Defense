@@ -1,6 +1,7 @@
 """Path-safe API presentation contract for completed production results."""
 
 import base64
+import copy
 import json
 import math
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from schemas import (
     DisplayVerdict,
     EvidenceStatus,
     ModelVerdict,
+    QWEN_OCCLUSION_BASELINE,
+    QWEN_OCCLUSION_METHOD,
     RuntimeUnit,
     SourceType,
     VISUAL_XAI_BOUNDARY,
@@ -131,11 +134,15 @@ class ProductionVisualXAI:
     observation_unit_id: str
     observation_text_sha256: str
     raw_generation_sha256: str
+    profile: str
     grid_rows: int
     grid_columns: int
+    attribution_batch_size: int
     occlusion_baseline: str
     configuration_version: str
+    configuration_fingerprint: str
     phrase_policy: str
+    heavy_scorer_batches: int
     disclaimer: str
     scientific_boundary: str
     attribution_maps: Tuple[ProductionVisualXAIMap, ...]
@@ -152,11 +159,15 @@ class ProductionVisualXAI:
             "observation_unit_id": self.observation_unit_id,
             "observation_text_sha256": self.observation_text_sha256,
             "raw_generation_sha256": self.raw_generation_sha256,
+            "profile": self.profile,
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
+            "attribution_batch_size": self.attribution_batch_size,
             "occlusion_baseline": self.occlusion_baseline,
             "configuration_version": self.configuration_version,
+            "configuration_fingerprint": self.configuration_fingerprint,
             "phrase_policy": self.phrase_policy,
+            "heavy_scorer_batches": self.heavy_scorer_batches,
             "disclaimer": self.disclaimer,
             "scientific_boundary": self.scientific_boundary,
             "attribution_maps": [
@@ -555,15 +566,131 @@ class ProductionResultBuilder:
             observation_unit_id=artifact.observation_unit_id,
             observation_text_sha256=artifact.observation_text_sha256,
             raw_generation_sha256=artifact.raw_generation_sha256,
+            profile=artifact.profile,
             grid_rows=artifact.grid_rows,
             grid_columns=artifact.grid_columns,
+            attribution_batch_size=artifact.attribution_batch_size,
             occlusion_baseline=artifact.occlusion_baseline,
             configuration_version=artifact.configuration_version,
+            configuration_fingerprint=artifact.configuration_fingerprint,
             phrase_policy=artifact.phrase_policy,
+            heavy_scorer_batches=artifact.heavy_scorer_batches,
             disclaimer=VISUAL_XAI_DISCLAIMER,
             scientific_boundary=VISUAL_XAI_BOUNDARY,
             attribution_maps=maps,
         )
+
+    @staticmethod
+    def _embedded_image_bytes(value: Any) -> int:
+        if isinstance(value, dict):
+            return sum(
+                ProductionResultBuilder._embedded_image_bytes(item)
+                for item in value.values()
+            )
+        if isinstance(value, list):
+            return sum(
+                ProductionResultBuilder._embedded_image_bytes(item)
+                for item in value
+            )
+        if not isinstance(value, str) or not value.startswith("data:image/"):
+            return 0
+        marker = ";base64,"
+        if marker not in value:
+            return 0
+        encoded = value.split(marker, 1)[1]
+        padding = len(encoded) - len(encoded.rstrip("="))
+        return max(0, (len(encoded) * 3) // 4 - padding)
+
+    def _public_xai_state(
+        self,
+        status: Any,
+        artifact: Optional[VisualAttributionArtifact],
+        remaining_bytes: list,
+    ) -> Dict[str, Any]:
+        public_artifact = (
+            None
+            if artifact is None
+            else self._public_xai(artifact, remaining_bytes).to_dict()
+        )
+        if public_artifact is None:
+            public_artifact = {
+                "status": status.state.value,
+                "unavailable_reason": status.unavailable_reason,
+                "method": QWEN_OCCLUSION_METHOD,
+                "model_id": None,
+                "model_revision": None,
+                "model_fingerprint": None,
+                "source_frame_sha256": None,
+                "observation_unit_id": status.unit_id,
+                "observation_text_sha256": None,
+                "raw_generation_sha256": None,
+                "profile": status.profile,
+                "grid_rows": status.grid_rows,
+                "grid_columns": status.grid_columns,
+                "attribution_batch_size": status.attribution_batch_size,
+                "occlusion_baseline": QWEN_OCCLUSION_BASELINE,
+                "configuration_version": None,
+                "configuration_fingerprint": status.configuration_fingerprint,
+                "phrase_policy": None,
+                "heavy_scorer_batches": status.heavy_scorer_batches,
+                "disclaimer": VISUAL_XAI_DISCLAIMER,
+                "scientific_boundary": VISUAL_XAI_BOUNDARY,
+                "attribution_maps": [],
+            }
+        else:
+            public_artifact["status"] = status.state.value
+            public_artifact["unavailable_reason"] = status.unavailable_reason
+        public_artifact.update(
+            {
+                "cache_hit": status.cache_hit,
+                "queue_wait_ms": status.queue_wait_ms,
+                "compute_time_ms": status.compute_time_ms,
+                "source_frame_count": status.source_frame_count,
+                "heavy_scorer_batches": status.heavy_scorer_batches,
+            }
+        )
+        return public_artifact
+
+    def augment_visual_xai(
+        self,
+        result_payload: Mapping[str, Any],
+        states: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Copy and augment supplemental presentation metadata only."""
+
+        output = copy.deepcopy(dict(result_payload))
+        remaining_bytes = [
+            max(
+                0,
+                MAX_EVIDENCE_PAYLOAD_BYTES
+                - self._embedded_image_bytes(output),
+            )
+        ]
+        evidence = output.get("evidence")
+        if not isinstance(evidence, dict):
+            return output
+        units = evidence.get("visual_supplemental_units")
+        if not isinstance(units, list):
+            return output
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = unit.get("unit_id")
+            status = states.get(unit_id)
+            frames = unit.get("evidence_frames")
+            if status is None or not isinstance(frames, list):
+                continue
+            artifacts = {
+                item.source_frame_id: item for item in status.artifacts
+            }
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                artifact = artifacts.get(frame.get("frame_id"))
+                frame["xai"] = self._public_xai_state(
+                    status, artifact, remaining_bytes
+                )
+        return output
 
     def _public_unit(
         self,

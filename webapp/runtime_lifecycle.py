@@ -62,6 +62,7 @@ class APIRuntimeState:
         self.manager = None
         self.server_lock = None
         self.workspace_manager = None
+        self.visual_xai_service = None
 
     def readiness(self) -> ReadinessPayload:
         with self._guard:
@@ -163,6 +164,11 @@ class APIRuntimeLifecycle:
             stopped = manager.shutdown(
                 timeout=self.config.graceful_shutdown_timeout_seconds
             )
+        visual_xai_service = self.state.visual_xai_service
+        if stopped and visual_xai_service is not None:
+            stopped = visual_xai_service.shutdown(
+                timeout=self.config.graceful_shutdown_timeout_seconds
+            )
         if stopped:
             self._release_lock()
         else:
@@ -224,7 +230,18 @@ class APIRuntimeLifecycle:
                 raise TypeError("execution service runtime must provide start")
             with self.state._guard:
                 self.state.execution_service = service
-            runtime.start()
+            runtime_services = runtime.start()
+            visual_xai_service = getattr(
+                runtime_services, "visual_xai_service", None
+            )
+            if visual_xai_service is not None:
+                for method_name in ("request", "get_status", "shutdown"):
+                    if not callable(getattr(visual_xai_service, method_name, None)):
+                        raise TypeError(
+                            f"visual XAI service must provide {method_name}"
+                        )
+            with self.state._guard:
+                self.state.visual_xai_service = visual_xai_service
 
             adapter = self._execution_adapter_factory(service)
             _require_positional_interface(
@@ -274,6 +291,16 @@ class APIRuntimeLifecycle:
             with self.state._guard:
                 self.state.shutdown_incomplete = True
             return False
+
+        visual_xai_service = self.state.visual_xai_service
+        if visual_xai_service is not None:
+            stopped = visual_xai_service.shutdown(
+                timeout=self.config.graceful_shutdown_timeout_seconds
+            )
+            if not stopped:
+                with self.state._guard:
+                    self.state.shutdown_incomplete = True
+                return False
 
         workspace = self.state.workspace_manager
         if workspace is not None:

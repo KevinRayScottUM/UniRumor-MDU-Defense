@@ -7,17 +7,24 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 
+import { apiClient } from "../../app/api";
 import type {
   EvidenceSourceType,
   PublicEvidenceFrame,
   PublicEvidenceRegion,
   PublicVisualXAIMap,
+  VisualXAIStatus,
 } from "../../types";
 
 export interface EvidenceFrameGalleryProps {
   frames: PublicEvidenceFrame[];
+  jobId?: string;
+  onVisualXAIReady?: () => void;
   sourceType: EvidenceSourceType;
+  unitId?: string;
 }
+
+type ViewerXAIState = VisualXAIStatus | "legacy_missing";
 
 interface ImageDimensions {
   width: number;
@@ -176,12 +183,19 @@ function AnnotatedFrame({
 function VisualAttributionViewer({
   frame,
   label,
+  onGenerate,
+  requestError,
+  requestState,
 }: {
   frame: PublicEvidenceFrame;
   label: string;
+  onGenerate?: () => void;
+  requestError?: string;
+  requestState: ViewerXAIState;
 }) {
   const xai = frame.xai ?? null;
-  const maps = xai?.status === "available" ? xai.attribution_maps : [];
+  const ready = requestState === "ready" || requestState === "available";
+  const maps = ready ? xai?.attribution_maps ?? [] : [];
   const wholeMap = maps.find((item) => item.scope === "observation") ?? maps[0];
   const [selectedMapId, setSelectedMapId] = useState(wholeMap?.map_id);
   const [view, setView] = useState<"original" | "xai">(
@@ -196,7 +210,7 @@ function VisualAttributionViewer({
   const selectedMap =
     maps.find((item) => item.map_id === selectedMapId) ?? wholeMap;
   const selectedHeatmap = safeImageSource(selectedMap?.heatmap_image ?? null);
-  const xaiAvailable = xai?.status === "available" && maps.length > 0;
+  const xaiAvailable = ready && maps.length > 0;
   const description =
     selectedMap?.scope === "phrase"
       ? `Regions whose removal most reduced model support for the phrase “${selectedMap.label}”.`
@@ -219,6 +233,13 @@ function VisualAttributionViewer({
           {xai ? xaiMethodLabel(xai.method) : "XAI unavailable"}
         </span>
       </div>
+
+      {xai ? (
+        <p className="visual-xai__profile">
+          {xai.profile === "public" ? "Public" : "Research"} {String(xai.grid_rows)}×{String(xai.grid_columns)} attribution
+          {xai.cache_hit ? " · cached" : ""}
+        </p>
+      ) : null}
 
       {xaiAvailable ? (
         <>
@@ -272,14 +293,31 @@ function VisualAttributionViewer({
             </p>
           ) : null}
         </>
+      ) : requestState === "not_requested" ? (
+        <div className="visual-xai__lazy" role="status">
+          <strong>High-cost post-hoc attribution is available.</strong>
+          <span>Generate model-derived occlusion attribution for this observation.</span>
+          <button onClick={onGenerate} type="button">
+            Generate XAI
+          </button>
+        </div>
+      ) : requestState === "pending" ? (
+        <div className="visual-xai__lazy visual-xai__lazy--pending" role="status">
+          <span aria-hidden="true" className="visual-xai__spinner" />
+          <strong>Generating Qwen occlusion attribution…</strong>
+          <span>The authoritative verdict is already available.</span>
+        </div>
       ) : (
         <div className="visual-xai__unavailable" role="status">
-          <strong>XAI attribution unavailable</strong>
+          <strong>Visual XAI unavailable</strong>
           <span>
-            {xai?.unavailable_reason
+            {requestError
+              ? requestError
+              : xai?.unavailable_reason
               ? `Safe reason: ${xai.unavailable_reason.replaceAll("_", " ")}.`
               : "This older result does not contain an XAI artifact."}
           </span>
+          <span>The authoritative verification result is unaffected.</span>
         </div>
       )}
 
@@ -295,11 +333,17 @@ function EvidenceLightbox({
   frame,
   frameIndex,
   onClose,
+  onGenerate,
+  requestError,
+  requestState,
   sourceType,
 }: {
   frame: PublicEvidenceFrame;
   frameIndex: number;
   onClose: () => void;
+  onGenerate?: () => void;
+  requestError?: string;
+  requestState: ViewerXAIState;
   sourceType: EvidenceSourceType;
 }) {
   const [closing, setClosing] = useState(false);
@@ -356,7 +400,13 @@ function EvidenceLightbox({
         </header>
 
         {sourceType === "visual_observation" ? (
-          <VisualAttributionViewer frame={frame} label={label} />
+          <VisualAttributionViewer
+            frame={frame}
+            label={label}
+            onGenerate={onGenerate}
+            requestError={requestError}
+            requestState={requestState}
+          />
         ) : (
           <>
             <div className="evidence-lightbox__views">
@@ -399,11 +449,90 @@ function EvidenceLightbox({
   );
 }
 
-export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGalleryProps) {
+export function EvidenceFrameGallery({
+  frames,
+  jobId,
+  onVisualXAIReady,
+  sourceType,
+  unitId,
+}: EvidenceFrameGalleryProps) {
   const [selectedIndex, setSelectedIndex] = useState<number>();
   const [previewIndex, setPreviewIndex] = useState(0);
+  const backendState = frames.find((frame) => frame.xai)?.xai?.status;
+  const [requestState, setRequestState] = useState<ViewerXAIState>(
+    backendState ?? "legacy_missing",
+  );
+  const [requestError, setRequestError] = useState<string>();
   const heading = sourceType === "ocr" ? "OCR Evidence Frames" : "Visual Evidence Frames";
   const closeLightbox = useCallback(() => setSelectedIndex(undefined), []);
+
+  useEffect(() => {
+    setRequestState(backendState ?? "legacy_missing");
+    if (backendState === "ready" || backendState === "available") {
+      setRequestError(undefined);
+    }
+  }, [backendState]);
+
+  const generateVisualXAI = useCallback(() => {
+    if (!jobId || !unitId || requestState === "pending") return;
+    setRequestError(undefined);
+    setRequestState("pending");
+    void apiClient
+      .requestVisualXAI(jobId, unitId)
+      .then((response) => {
+        const nextState = response.visual_xai.status;
+        setRequestState(nextState);
+        if (nextState === "ready") onVisualXAIReady?.();
+      })
+      .catch(() => {
+        setRequestState("failed");
+        setRequestError(
+          "XAI attribution unavailable. The authoritative verification result is unaffected.",
+        );
+      });
+  }, [jobId, onVisualXAIReady, requestState, unitId]);
+
+  useEffect(() => {
+    if (requestState !== "pending" || !jobId || !unitId) return undefined;
+    let disposed = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      try {
+        const response = await apiClient.getVisualXAI(jobId, unitId);
+        if (disposed) return;
+        const nextState = response.visual_xai.status;
+        setRequestState(nextState);
+        if (nextState === "ready") {
+          onVisualXAIReady?.();
+          return;
+        }
+        if (
+          nextState === "failed" ||
+          nextState === "unavailable" ||
+          nextState === "not_requested"
+        ) {
+          return;
+        }
+        timer = window.setTimeout(
+          () => void poll(),
+          response.poll_after_ms ?? 1500,
+        );
+      } catch {
+        if (disposed) return;
+        setRequestState("failed");
+        setRequestError(
+          "XAI attribution unavailable. The authoritative verification result is unaffected.",
+        );
+      }
+    };
+
+    timer = window.setTimeout(() => void poll(), 1500);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [jobId, onVisualXAIReady, requestState, unitId]);
 
   return (
     <section aria-label={heading} className="evidence-frames">
@@ -421,6 +550,9 @@ export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGaller
             <VisualAttributionViewer
               frame={frames[previewIndex]}
               label={frameName(frames[previewIndex], previewIndex)}
+              onGenerate={generateVisualXAI}
+              requestError={requestError}
+              requestState={requestState}
             />
           ) : null}
           <div className="evidence-frames__rail">
@@ -470,6 +602,9 @@ export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGaller
           frame={frames[selectedIndex]}
           frameIndex={selectedIndex}
           onClose={closeLightbox}
+          onGenerate={generateVisualXAI}
+          requestError={requestError}
+          requestState={requestState}
           sourceType={sourceType}
         />
       ) : null}

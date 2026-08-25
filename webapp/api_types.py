@@ -24,6 +24,7 @@ PUBLIC_ERROR_MESSAGES = {
     "empty_upload": "Uploaded video must not be empty.",
     "invalid_filename": "Video filename is invalid.",
     "queue_full": "Job queue is full.",
+    "visual_xai_not_found": "Visual attribution request not found.",
 }
 
 

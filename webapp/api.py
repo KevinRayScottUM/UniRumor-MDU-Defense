@@ -32,6 +32,7 @@ from .submission import (
     validate_submission_headers,
 )
 from .workspace import JOB_ID_PATTERN, WebWorkspaceManager
+from services.visual_xai_runtime import VISUAL_XAI_POLL_AFTER_MS
 
 
 REQUEST_ID_HEADER = "X-Request-ID"
@@ -167,6 +168,21 @@ def _job_payload(snapshot: JobSnapshot, poll_after_ms: int) -> dict:
         else poll_after_ms
     )
     return {"api_version": API_VERSION, "job": payload}
+
+
+def _visual_xai_response(job_id: str, unit_id: str, status: object) -> dict:
+    payload = status.to_public_dict()
+    return {
+        "api_version": API_VERSION,
+        "job_id": job_id,
+        "unit_id": unit_id,
+        "visual_xai": payload,
+        "poll_after_ms": (
+            VISUAL_XAI_POLL_AFTER_MS
+            if payload["status"] == "pending"
+            else None
+        ),
+    }
 
 
 def create_app(
@@ -368,11 +384,31 @@ def create_app(
 
         outcome = manager._get_completed_outcome(job_id)
         if outcome is not None:
+            outcome_payload = outcome.to_dict()
+            visual_xai_service = lifecycle.state.visual_xai_service
+            execution_service = lifecycle.state.execution_service
+            result_builder = getattr(execution_service, "result_builder", None)
+            if (
+                visual_xai_service is not None
+                and outcome.result is not None
+                and callable(getattr(result_builder, "augment_visual_xai", None))
+            ):
+                states = {}
+                for unit in outcome.result.visual_supplemental_units:
+                    try:
+                        state = visual_xai_service.get_status(job_id, unit.unit_id)
+                    except Exception:
+                        state = None
+                    if state is not None:
+                        states[unit.unit_id] = state
+                outcome_payload["result"] = result_builder.augment_visual_xai(
+                    outcome_payload["result"], states
+                )
             return JSONResponse(
                 {
                     "api_version": API_VERSION,
                     "job_id": job_id,
-                    "outcome": outcome.to_dict(),
+                    "outcome": outcome_payload,
                 }
             )
 
@@ -390,6 +426,58 @@ def create_app(
         ):
             return _error_response(request, 409, "job_not_completed")
         return _error_response(request, 500, "internal_error")
+
+    @app.post("/api/v1/jobs/{job_id}/visual-xai/{unit_id}")
+    async def request_visual_xai(request: Request, job_id: str, unit_id: str):
+        _, snapshot, error = _snapshot_lookup(request, lifecycle, job_id)
+        if error is not None:
+            return error
+        if snapshot.state in (
+            JobState.ACCEPTED,
+            JobState.QUEUED,
+            JobState.RUNNING,
+        ):
+            return _error_response(request, 409, "job_not_completed")
+        if snapshot.state is JobState.FAILED:
+            return _error_response(request, 409, "job_failed")
+        visual_xai_service = lifecycle.state.visual_xai_service
+        if visual_xai_service is None:
+            return _error_response(request, 503, "service_not_ready")
+        try:
+            status = visual_xai_service.request(job_id, unit_id)
+        except (KeyError, ValueError):
+            return _error_response(request, 404, "visual_xai_not_found")
+        except RuntimeError:
+            return _error_response(request, 503, "service_not_ready")
+        response_status = 202 if status.state.value == "pending" else 200
+        return JSONResponse(
+            _visual_xai_response(job_id, unit_id, status),
+            status_code=response_status,
+        )
+
+    @app.get("/api/v1/jobs/{job_id}/visual-xai/{unit_id}")
+    async def visual_xai_status(request: Request, job_id: str, unit_id: str):
+        _, snapshot, error = _snapshot_lookup(request, lifecycle, job_id)
+        if error is not None:
+            return error
+        if snapshot.state in (
+            JobState.ACCEPTED,
+            JobState.QUEUED,
+            JobState.RUNNING,
+        ):
+            return _error_response(request, 409, "job_not_completed")
+        if snapshot.state is JobState.FAILED:
+            return _error_response(request, 409, "job_failed")
+        visual_xai_service = lifecycle.state.visual_xai_service
+        if visual_xai_service is None:
+            return _error_response(request, 503, "service_not_ready")
+        try:
+            status = visual_xai_service.get_status(job_id, unit_id)
+        except ValueError:
+            status = None
+        if status is None:
+            return _error_response(request, 404, "visual_xai_not_found")
+        return JSONResponse(_visual_xai_response(job_id, unit_id, status))
 
     return app
 

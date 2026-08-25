@@ -91,6 +91,14 @@ export type VisualXAIMethod =
   | "qwen_occlusion_logprob_v1"
   | "siglip_semantic_grounding_v1";
 
+export type VisualXAIStatus =
+  | "not_requested"
+  | "pending"
+  | "ready"
+  | "unavailable"
+  | "failed"
+  | "available";
+
 export interface PublicVisualXAIMap {
   map_id: string;
   scope: "observation" | "phrase";
@@ -103,24 +111,53 @@ export interface PublicVisualXAIMap {
 }
 
 export interface PublicVisualXAI {
-  status: "available" | "unavailable";
+  status: VisualXAIStatus;
   unavailable_reason: string | null;
   method: VisualXAIMethod;
-  model_id: string;
-  model_revision: string;
-  model_fingerprint: string;
-  source_frame_sha256: string;
+  model_id: string | null;
+  model_revision: string | null;
+  model_fingerprint: string | null;
+  source_frame_sha256: string | null;
   observation_unit_id: string;
-  observation_text_sha256: string;
-  raw_generation_sha256: string;
+  observation_text_sha256: string | null;
+  raw_generation_sha256: string | null;
+  profile: "public" | "research";
   grid_rows: number;
   grid_columns: number;
+  attribution_batch_size: number;
   occlusion_baseline: string;
-  configuration_version: string;
-  phrase_policy: string;
+  configuration_version: string | null;
+  configuration_fingerprint: string;
+  phrase_policy: string | null;
+  cache_hit: boolean;
+  queue_wait_ms: number | null;
+  compute_time_ms: number | null;
+  source_frame_count: number;
+  heavy_scorer_batches: number;
   disclaimer: string;
   scientific_boundary: string;
   attribution_maps: PublicVisualXAIMap[];
+}
+
+export interface VisualXAIStateResponse {
+  api_version: ApiVersion;
+  job_id: string;
+  unit_id: string;
+  visual_xai: {
+    status: Exclude<VisualXAIStatus, "available">;
+    profile: "public" | "research";
+    grid_rows: number;
+    grid_columns: number;
+    attribution_batch_size: number;
+    configuration_fingerprint: string;
+    source_frame_count: number;
+    cache_hit: boolean;
+    queue_wait_ms: number | null;
+    compute_time_ms: number | null;
+    heavy_scorer_batches: number;
+    unavailable_reason: string | null;
+  };
+  poll_after_ms: number | null;
 }
 
 export interface PublicEvidenceFrame {

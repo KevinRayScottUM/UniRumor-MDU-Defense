@@ -25,6 +25,10 @@ from services.video_ocr_runner import VideoOCRRunner
 from services.video_text_ocr_runner import VideoTextOCRRunner
 from services.video_visual_runner import VideoVisualRunner
 from services.visual_xai_attributor import VisualXAIAttributor, VisualXAIConfig
+from services.visual_xai_runtime import (
+    VisualXAIRuntimeService,
+    visual_xai_max_concurrency,
+)
 from services.whisper_asr_service import WhisperASRConfig, WhisperASRService
 
 
@@ -44,6 +48,7 @@ class ProductionRuntimeServices:
     qwen_observer: QwenVisualObserver
     video_visual_runner: VideoVisualRunner
     visual_xai_attributor: VisualXAIAttributor
+    visual_xai_service: VisualXAIRuntimeService
     video_multimodal_runner: VideoMultimodalRunner
 
 
@@ -200,13 +205,20 @@ class ProductionRuntimeFactory:
         )
         visual_xai_attributor = VisualXAIAttributor(
             scorer=qwen_observer,
-            config=VisualXAIConfig(cache_root=config.cache_root / "visual_xai"),
+            config=VisualXAIConfig.from_environment(
+                cache_root=config.cache_root / "visual_xai"
+            ),
+        )
+        visual_xai_service = VisualXAIRuntimeService(
+            attributor=visual_xai_attributor,
+            runtime_cache_root=config.cache_root,
+            max_concurrency=visual_xai_max_concurrency(),
         )
         video_multimodal_runner = VideoMultimodalRunner(
             video_text_ocr_runner=video_text_ocr_runner,
             video_visual_runner=video_visual_runner,
             frozen_g1_runner=frozen_g1_runner,
-            visual_xai_attributor=visual_xai_attributor,
+            visual_xai_service=visual_xai_service,
         )
 
         return ProductionRuntimeServices(
@@ -224,5 +236,6 @@ class ProductionRuntimeFactory:
             qwen_observer=qwen_observer,
             video_visual_runner=video_visual_runner,
             visual_xai_attributor=visual_xai_attributor,
+            visual_xai_service=visual_xai_service,
             video_multimodal_runner=video_multimodal_runner,
         )

@@ -23,6 +23,7 @@ VISUAL_XAI_BOUNDARY = (
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _STATUS_VALUES = {"available", "unavailable"}
+_PROFILE_VALUES = {"public", "research"}
 _SCOPE_VALUES = {"observation", "phrase"}
 
 
@@ -250,11 +251,15 @@ class VisualAttributionArtifact:
     observation_text: str
     observation_text_sha256: str
     raw_generation_sha256: str
+    profile: str
     grid_rows: int
     grid_columns: int
+    attribution_batch_size: int
     occlusion_baseline: str
     configuration_version: str
+    configuration_fingerprint: str
     phrase_policy: str
+    heavy_scorer_batches: int
     maps: Tuple[VisualAttributionMap, ...]
     cache_key: str
 
@@ -290,6 +295,11 @@ class VisualAttributionArtifact:
         _require_sha256(self.observation_text_sha256, "observation_text_sha256")
         _require_sha256(self.raw_generation_sha256, "raw_generation_sha256")
         _require_sha256(self.cache_key, "cache_key")
+        _require_sha256(
+            self.configuration_fingerprint, "configuration_fingerprint"
+        )
+        if self.profile not in _PROFILE_VALUES:
+            raise ValueError("profile must be public or research")
         if type(self.source_frame_index) is not int or self.source_frame_index < 0:
             raise ValueError("source_frame_index must be non-negative")
         object.__setattr__(
@@ -303,6 +313,13 @@ class VisualAttributionArtifact:
             value = getattr(self, field_name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
+        if (
+            type(self.attribution_batch_size) is not int
+            or self.attribution_batch_size < 1
+        ):
+            raise ValueError("attribution_batch_size must be a positive integer")
+        if type(self.heavy_scorer_batches) is not int or self.heavy_scorer_batches < 0:
+            raise ValueError("heavy_scorer_batches must be non-negative")
         if not isinstance(self.maps, tuple) or not all(
             isinstance(item, VisualAttributionMap) for item in self.maps
         ):
@@ -336,11 +353,15 @@ class VisualAttributionArtifact:
             "observation_text": self.observation_text,
             "observation_text_sha256": self.observation_text_sha256,
             "raw_generation_sha256": self.raw_generation_sha256,
+            "profile": self.profile,
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
+            "attribution_batch_size": self.attribution_batch_size,
             "occlusion_baseline": self.occlusion_baseline,
             "configuration_version": self.configuration_version,
+            "configuration_fingerprint": self.configuration_fingerprint,
             "phrase_policy": self.phrase_policy,
+            "heavy_scorer_batches": self.heavy_scorer_batches,
             "maps": [item.to_dict() for item in self.maps],
             "cache_key": self.cache_key,
         }

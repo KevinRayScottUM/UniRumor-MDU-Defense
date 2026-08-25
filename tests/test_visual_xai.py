@@ -290,7 +290,8 @@ class VisualXAIAttributorTests(unittest.TestCase):
 
     def test_occlusion_scores_strong_and_irrelevant_regions_and_phrase_tokens(self):
         original_sha = hashlib.sha256(self.frame_path.read_bytes()).hexdigest()
-        artifact = self.attributor().attribute(
+        scorer = MockTargetScorer()
+        artifact = self.attributor(scorer).attribute(
             [self.snapshot], [self.frame], RAW_GENERATION
         )[0]
         self.assertEqual("available", artifact.status)
@@ -311,6 +312,10 @@ class VisualXAIAttributorTests(unittest.TestCase):
         self.assertEqual(1, microphones.target_token_count)
         self.assertTrue(whole.overlay_image_path.is_file())
         self.assertEqual(original_sha, hashlib.sha256(self.frame_path.read_bytes()).hexdigest())
+        self.assertEqual(3, len(scorer.calls))
+        self.assertTrue(
+            all(len(call[2]) == len(artifact.maps) for call in scorer.calls)
+        )
 
     def test_phrase_policy_does_not_turn_named_people_into_visual_labels(self):
         labels = {
@@ -343,6 +348,24 @@ class VisualXAIAttributorTests(unittest.TestCase):
                 for item in second.maps
             ],
         )
+
+    def test_corrupted_persistent_cache_recomputes_safely(self):
+        scorer = MockTargetScorer()
+        attributor = self.attributor(scorer)
+        artifact = attributor.attribute(
+            [self.snapshot], [self.frame], RAW_GENERATION
+        )[0]
+        initial_calls = len(scorer.calls)
+        _, manifest = attributor._cache_paths(artifact.cache_key)
+        manifest.write_text("{corrupted", encoding="utf-8")
+
+        repaired = attributor.attribute(
+            [self.snapshot], [self.frame], RAW_GENERATION
+        )[0]
+
+        self.assertEqual(artifact.artifact_id, repaired.artifact_id)
+        self.assertGreater(len(scorer.calls), initial_calls)
+        self.assertEqual("available", repaired.status)
 
     def test_serialization_never_exposes_paths_or_prediction_fields(self):
         artifact = self.attributor().attribute(
@@ -450,6 +473,46 @@ class VisualXAIAttributorTests(unittest.TestCase):
             limited_frame["xai"]["attribution_maps"][0]["heatmap_image"]
         )
 
+        verdict_before = public.to_dict()["verdict"]
+        base_without_xai = VideoMultimodalResult(
+            session_id=result.session_id,
+            claim=result.claim,
+            text_ocr_result=result.text_ocr_result,
+            visual_result=result.visual_result,
+            g1_exposure_units=result.g1_exposure_units,
+            visual_units=result.visual_units,
+            all_runtime_units=result.all_runtime_units,
+            verification_result=result.verification_result,
+        )
+        builder = ProductionResultBuilder(evidence_root=self.root)
+        base_payload = builder.build(base_without_xai).to_dict()
+        state = SimpleNamespace(
+            state=SimpleNamespace(value="not_requested"),
+            unavailable_reason=None,
+            unit_id=visual_unit.unit_id,
+            profile="public",
+            grid_rows=6,
+            grid_columns=6,
+            attribution_batch_size=2,
+            configuration_fingerprint="a" * 64,
+            cache_hit=False,
+            queue_wait_ms=None,
+            compute_time_ms=None,
+            source_frame_count=1,
+            heavy_scorer_batches=0,
+            artifacts=(),
+        )
+        augmented = builder.augment_visual_xai(
+            base_payload, {visual_unit.unit_id: state}
+        )
+        self.assertEqual(verdict_before, augmented["verdict"])
+        self.assertEqual(
+            "not_requested",
+            augmented["evidence"]["visual_supplemental_units"][0][
+                "evidence_frames"
+            ][0]["xai"]["status"],
+        )
+
 
 class VideoXAIIsolationTests(unittest.TestCase):
     def test_xai_failure_does_not_change_verdict_or_frozen_g1_input(self):
@@ -511,7 +574,11 @@ class VideoXAIIsolationTests(unittest.TestCase):
                     return authoritative
 
             class Raises:
-                def attribute(self, *args):
+                def register(self, *args, **kwargs):
+                    if frozen.units is None:
+                        raise AssertionError(
+                            "visual XAI registration ran before Frozen G1"
+                        )
                     raise RuntimeError("private failure")
 
             frozen = FrozenG1()
@@ -546,7 +613,7 @@ class VideoXAIIsolationTests(unittest.TestCase):
                     evaluate=lambda **kwargs: ConsistencyResult.PASS
                 ),
                 visual_grounding_shadow_runner=SimpleNamespace(run=lambda units: []),
-                visual_xai_attributor=Raises(),
+                visual_xai_service=Raises(),
             )
             result = runner.run(
                 "session",

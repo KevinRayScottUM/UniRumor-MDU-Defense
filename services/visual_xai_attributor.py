@@ -9,6 +9,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import time
@@ -30,9 +31,14 @@ from services.qwen_visual_observer import QWEN_RUNTIME_TREE_SHA256
 from services.siglip_visual_retriever import VisualFrame
 
 
-VISUAL_XAI_CONFIGURATION_VERSION = "qwen_occlusion_8x8_blur_v1"
+VISUAL_XAI_CONFIGURATION_VERSION = "qwen_occlusion_blur_v2"
 VISUAL_XAI_PHRASE_POLICY = "deterministic_visible_concept_tokens_v1"
 VISUAL_XAI_FAILURE_WARNING = "Visual attribution unavailable."
+VISUAL_XAI_PROFILE_ENV = "MDU_VISUAL_XAI_PROFILE"
+VISUAL_XAI_GRID_SIZE_ENV = "MDU_VISUAL_XAI_GRID_SIZE"
+VISUAL_XAI_MAX_CONCURRENCY_ENV = "MDU_VISUAL_XAI_MAX_CONCURRENCY"
+VISUAL_XAI_PUBLIC_GRID_SIZE = 6
+VISUAL_XAI_RESEARCH_GRID_SIZE = 8
 _SAFE_UNAVAILABLE_REASONS = {
     "attribution_failed",
     "attribution_timeout",
@@ -116,6 +122,7 @@ _SAFE_CAPITALIZED_CONCEPTS = {
 @dataclass(frozen=True, slots=True)
 class VisualXAIConfig:
     cache_root: Path
+    profile: str = "research"
     grid_rows: int = 8
     grid_columns: int = 8
     attribution_batch_size: int = 2
@@ -127,6 +134,8 @@ class VisualXAIConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cache_root", Path(self.cache_root).resolve())
+        if self.profile not in {"public", "research"}:
+            raise ValueError("profile must be public or research")
         for field_name in (
             "grid_rows",
             "grid_columns",
@@ -148,6 +157,66 @@ class VisualXAIConfig:
             raise ValueError("timeout_seconds must be positive")
         if not self.configuration_version:
             raise ValueError("configuration_version is required")
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        payload = {
+            "profile": self.profile,
+            "grid_rows": self.grid_rows,
+            "grid_columns": self.grid_columns,
+            "attribution_batch_size": self.attribution_batch_size,
+            "blur_kernel_size": self.blur_kernel_size,
+            "overlay_alpha": self.overlay_alpha,
+            "maximum_phrase_count": self.maximum_phrase_count,
+            "configuration_version": self.configuration_version,
+            "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
+            "method": QWEN_OCCLUSION_METHOD,
+            "baseline": QWEN_OCCLUSION_BASELINE,
+        }
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_environment(
+        cls,
+        cache_root: Path,
+        *,
+        environ: Optional[Mapping[str, str]] = None,
+        attribution_batch_size: int = 2,
+    ) -> "VisualXAIConfig":
+        values = os.environ if environ is None else environ
+        profile = values.get(VISUAL_XAI_PROFILE_ENV, "research").strip().lower()
+        if profile not in {"public", "research"}:
+            raise ValueError(
+                f"{VISUAL_XAI_PROFILE_ENV} must be public or research"
+            )
+        default_grid = (
+            VISUAL_XAI_PUBLIC_GRID_SIZE
+            if profile == "public"
+            else VISUAL_XAI_RESEARCH_GRID_SIZE
+        )
+        raw_grid = values.get(VISUAL_XAI_GRID_SIZE_ENV)
+        if raw_grid is None or not raw_grid.strip():
+            grid = default_grid
+        else:
+            try:
+                grid = int(raw_grid)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{VISUAL_XAI_GRID_SIZE_ENV} must be 6 or 8"
+                ) from None
+            if grid not in {
+                VISUAL_XAI_PUBLIC_GRID_SIZE,
+                VISUAL_XAI_RESEARCH_GRID_SIZE,
+            }:
+                raise ValueError(f"{VISUAL_XAI_GRID_SIZE_ENV} must be 6 or 8")
+        return cls(
+            cache_root=cache_root,
+            profile=profile,
+            grid_rows=grid,
+            grid_columns=grid,
+            attribution_batch_size=attribution_batch_size,
+        )
 
 
 class VisualXAIAttributor:
@@ -296,18 +365,28 @@ class VisualXAIAttributor:
             "observation_text_sha256": self._text_sha256(snapshot.observation_text),
             "raw_generation_sha256": snapshot.raw_generation_sha256,
             "prompt_policy": snapshot.prompt_policy,
+            "profile": self.config.profile,
             "grid_rows": self.config.grid_rows,
             "grid_columns": self.config.grid_columns,
+            "attribution_batch_size": self.config.attribution_batch_size,
             "blur_kernel_size": self.config.blur_kernel_size,
             "overlay_alpha": self.config.overlay_alpha,
             "configuration_version": self.config.configuration_version,
+            "configuration_fingerprint": self.config.configuration_fingerprint,
             "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
+            "phrase_spans": [
+                {"label": label, "start": start, "end": end}
+                for label, start, end in self.phrase_spans(
+                    snapshot.observation_text,
+                    self.config.maximum_phrase_count,
+                )
+            ],
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def _cache_paths(self, cache_key: str) -> Tuple[Path, Path]:
-        category = f"xai_{cache_key[:24]}"
+        category = f"xai_{cache_key}"
         directory = safe_target(self.config.cache_root, category, "manifest.json").parent
         return directory, directory / "manifest.json"
 
@@ -374,6 +453,25 @@ class VisualXAIAttributor:
             return None
         self.cache_hits += 1
         return artifact
+
+    @staticmethod
+    def _rebind_cached_artifact(
+        artifact: VisualAttributionArtifact,
+        snapshot: VisualObservationSnapshot,
+    ) -> VisualAttributionArtifact:
+        if artifact.observation_unit_id == snapshot.unit_id:
+            return artifact
+        rebound = replace(
+            artifact,
+            artifact_id="0" * 64,
+            observation_unit_id=snapshot.unit_id,
+        )
+        return replace(
+            rebound,
+            artifact_id=VisualAttributionArtifact.compute_identity(
+                rebound.identity_payload()
+            ),
+        )
 
     def _write_cache(self, artifact: VisualAttributionArtifact) -> None:
         _, manifest = self._cache_paths(artifact.cache_key)
@@ -496,11 +594,15 @@ class VisualXAIAttributor:
             "observation_text": snapshot.observation_text,
             "observation_text_sha256": self._text_sha256(snapshot.observation_text),
             "raw_generation_sha256": snapshot.raw_generation_sha256,
+            "profile": self.config.profile,
             "grid_rows": self.config.grid_rows,
             "grid_columns": self.config.grid_columns,
+            "attribution_batch_size": self.config.attribution_batch_size,
             "occlusion_baseline": QWEN_OCCLUSION_BASELINE,
             "configuration_version": self.config.configuration_version,
+            "configuration_fingerprint": self.config.configuration_fingerprint,
             "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
+            "heavy_scorer_batches": 0,
             "maps": (),
             "cache_key": cache_key,
         }
@@ -536,7 +638,7 @@ class VisualXAIAttributor:
         )
         cached = self._load_cache(cache_key)
         if cached is not None:
-            return cached
+            return self._rebind_cached_artifact(cached, snapshot)
         if source_frame is None or not source_frame.frame_path.is_file():
             artifact = self._unavailable(
                 snapshot,
@@ -593,6 +695,7 @@ class VisualXAIAttributor:
         baseline = self.scorer.score_target_logprob_batch(
             [tuple(all_frames)], raw_generation, spans
         )[0]
+        heavy_scorer_batches = 1
         raw_by_span = {span.span_id: [] for span in spans}
         directory, _ = self._cache_paths(cache_key)
         temporary_directory = directory / "working"
@@ -624,6 +727,7 @@ class VisualXAIAttributor:
                 scores = self.scorer.score_target_logprob_batch(
                     batch_frames, raw_generation, spans
                 )
+                heavy_scorer_batches += 1
                 if len(scores) != len(batch_frames) or not all(
                     isinstance(score, VisualTargetScore) for score in scores
                 ):
@@ -702,11 +806,15 @@ class VisualXAIAttributor:
             "observation_text": snapshot.observation_text,
             "observation_text_sha256": self._text_sha256(snapshot.observation_text),
             "raw_generation_sha256": snapshot.raw_generation_sha256,
+            "profile": self.config.profile,
             "grid_rows": self.config.grid_rows,
             "grid_columns": self.config.grid_columns,
+            "attribution_batch_size": self.config.attribution_batch_size,
             "occlusion_baseline": QWEN_OCCLUSION_BASELINE,
             "configuration_version": self.config.configuration_version,
+            "configuration_fingerprint": self.config.configuration_fingerprint,
             "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
+            "heavy_scorer_batches": heavy_scorer_batches,
             "maps": tuple(maps),
             "cache_key": cache_key,
         }
@@ -720,6 +828,38 @@ class VisualXAIAttributor:
         )
         self._write_cache(artifact)
         return artifact
+
+    def cached_artifacts(
+        self,
+        visual_snapshot: VisualObservationSnapshot,
+        selected_frames: Iterable[VisualFrame],
+    ) -> Optional[Tuple[VisualAttributionArtifact, ...]]:
+        """Return a complete persisted cache hit without invoking model scoring."""
+
+        if not isinstance(visual_snapshot, VisualObservationSnapshot):
+            raise TypeError("visual_snapshot must be a VisualObservationSnapshot")
+        frames = tuple(selected_frames)
+        if not all(isinstance(item, VisualFrame) for item in frames):
+            raise TypeError("selected_frames must contain VisualFrame only")
+        model_fingerprint = self._model_fingerprint(visual_snapshot, self.scorer)
+        artifacts = []
+        for reference in visual_snapshot.frame_references:
+            source_frame = self._source_frame(reference.frame_id, frames)
+            if source_frame is None:
+                return None
+            cache_key = self._cache_key(
+                visual_snapshot,
+                source_frame,
+                frames,
+                model_fingerprint,
+            )
+            artifact = self._load_cache(cache_key)
+            if artifact is None:
+                return None
+            artifacts.append(
+                self._rebind_cached_artifact(artifact, visual_snapshot)
+            )
+        return tuple(artifacts)
 
     def attribute(
         self,
@@ -763,15 +903,15 @@ class VisualXAIAttributor:
                         frames,
                         model_fingerprint,
                     )
-                    artifacts.append(
-                        self._unavailable(
+                    artifact = self._unavailable(
                             snapshot,
                             reference,
                             model_fingerprint,
                             cache_key,
                             "attribution_timeout",
-                        )
                     )
+                    self._write_cache(artifact)
+                    artifacts.append(artifact)
                 except Exception:
                     model_fingerprint = self._model_fingerprint(snapshot, self.scorer)
                     source_frame = self._source_frame(reference.frame_id, frames)
@@ -791,13 +931,13 @@ class VisualXAIAttributor:
                         frames,
                         model_fingerprint,
                     )
-                    artifacts.append(
-                        self._unavailable(
+                    artifact = self._unavailable(
                             snapshot,
                             reference,
                             model_fingerprint,
                             cache_key,
                             "attribution_failed",
-                        )
                     )
+                    self._write_cache(artifact)
+                    artifacts.append(artifact)
         return artifacts

@@ -56,13 +56,18 @@ describe("ApiClient", () => {
     await client.getReadiness();
     await client.getJob("job_test/value");
     await client.getJobResult("job_test/value");
+    await client.requestVisualXAI("job_test/value", "visual/unit");
+    await client.getVisualXAI("job_test/value", "visual/unit");
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/api/v1/health",
       "/api/v1/readiness",
       "/api/v1/jobs/job_test%2Fvalue",
       "/api/v1/jobs/job_test%2Fvalue/result",
+      "/api/v1/jobs/job_test%2Fvalue/visual-xai/visual%2Funit",
+      "/api/v1/jobs/job_test%2Fvalue/visual-xai/visual%2Funit",
     ]);
+    expect(fetchMock.mock.calls[4][1]?.method).toBe("POST");
   });
 
   it("returns the valid readiness payload for HTTP 200", async () => {

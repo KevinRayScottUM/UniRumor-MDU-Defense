@@ -30,6 +30,7 @@ export interface JobResultLoadingState {
   error?: PublicResultError;
   unavailable?: UnavailableResult;
   retry: () => void;
+  refresh: () => void;
 }
 
 function normalizeJobResultResponse(
@@ -83,9 +84,12 @@ export function useJobResult(jobId: string | undefined): JobResultLoadingState {
   const [refreshVersion, setRefreshVersion] = useState(0);
 
   useEffect(() => {
+    setJobResult(undefined);
+  }, [jobId]);
+
+  useEffect(() => {
     let disposed = false;
 
-    setJobResult(undefined);
     setError(undefined);
     setUnavailable(undefined);
     setLoading(true);
@@ -132,5 +136,6 @@ export function useJobResult(jobId: string | undefined): JobResultLoadingState {
     error,
     unavailable,
     retry: () => setRefreshVersion((version) => version + 1),
+    refresh: () => setRefreshVersion((version) => version + 1),
   };
 }

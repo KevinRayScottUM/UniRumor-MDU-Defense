@@ -6,6 +6,7 @@ import type {
   PublicErrorEnvelope,
   ReadinessResponse,
   SubmitJobInput,
+  VisualXAIStateResponse,
 } from "../types";
 
 const API_PREFIX = "/api/v1";
@@ -103,6 +104,10 @@ function jobPath(jobId: string): string {
   return `${API_ENDPOINTS.jobs}/${encodeURIComponent(jobId)}`;
 }
 
+function visualXAIPath(jobId: string, unitId: string): string {
+  return `${jobPath(jobId)}/visual-xai/${encodeURIComponent(unitId)}`;
+}
+
 export class ApiClient {
   readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -181,6 +186,14 @@ export class ApiClient {
 
   getJobResult(jobId: string): Promise<JobResultResponse> {
     return this.request(`${jobPath(jobId)}/result`);
+  }
+
+  requestVisualXAI(jobId: string, unitId: string): Promise<VisualXAIStateResponse> {
+    return this.request(visualXAIPath(jobId, unitId), { method: "POST" });
+  }
+
+  getVisualXAI(jobId: string, unitId: string): Promise<VisualXAIStateResponse> {
+    return this.request(visualXAIPath(jobId, unitId));
   }
 }
 

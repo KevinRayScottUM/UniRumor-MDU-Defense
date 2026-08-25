@@ -3375,6 +3375,80 @@ p {
   font-weight: 680;
 }
 
+.visual-xai__profile {
+  margin: -0.35rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+
+.visual-xai__lazy {
+  padding: clamp(1rem, 3vw, 1.35rem);
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  border: 1px solid rgb(92 123 184 / 0.22);
+  border-radius: 0.9rem;
+  background: rgb(255 255 255 / 0.48);
+  color: var(--color-text-secondary);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.visual-xai__lazy strong {
+  color: var(--color-text-primary);
+}
+
+.visual-xai__lazy button {
+  min-height: 2.45rem;
+  margin-top: var(--space-1);
+  padding: 0.55rem 1rem;
+  border: 1px solid rgb(37 78 163 / 0.42);
+  border-radius: var(--radius-pill);
+  background: linear-gradient(145deg, #4173d5, #2852a6);
+  box-shadow: 0 9px 22px rgb(38 79 164 / 0.22);
+  color: #fff;
+  cursor: pointer;
+  font: 680 0.74rem/1 inherit;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.visual-xai__lazy button:hover {
+  box-shadow: 0 12px 27px rgb(38 79 164 / 0.28);
+  transform: translateY(-1px);
+}
+
+.visual-xai__lazy--pending {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+.visual-xai__lazy--pending span:last-child {
+  grid-column: 2;
+}
+
+.visual-xai__spinner {
+  width: 1.15rem;
+  height: 1.15rem;
+  grid-row: 1 / span 2;
+  border: 2px solid rgb(72 108 180 / 0.2);
+  border-top-color: #3764c0;
+  border-radius: 50%;
+  animation: visual-xai-spin 800ms linear infinite;
+}
+
+@keyframes visual-xai-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .visual-xai__spinner {
+    animation-duration: 1.8s;
+  }
+}
+
 .visual-xai__controls {
   display: flex;
   align-items: center;

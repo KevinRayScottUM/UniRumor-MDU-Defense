@@ -7,6 +7,8 @@ export type EvidenceUnitVariant = "candidate" | "selected" | "supplemental";
 export interface EvidenceUnitCardProps {
   unit: PublicEvidenceUnit;
   variant?: EvidenceUnitVariant;
+  jobId?: string;
+  onVisualXAIReady?: () => void;
 }
 
 const SOURCE_LABELS: Record<PublicEvidenceUnit["source_type"], string> = {
@@ -80,6 +82,8 @@ function groundedExplanation(unit: PublicEvidenceUnit): string {
 export function EvidenceUnitCard({
   unit,
   variant = "candidate",
+  jobId,
+  onVisualXAIReady,
 }: EvidenceUnitCardProps) {
   const metadata = optionalMetadata(unit);
   const selectionLabel =
@@ -167,7 +171,10 @@ export function EvidenceUnitCard({
       {unit.source_type === "ocr" || unit.source_type === "visual_observation" ? (
         <EvidenceFrameGallery
           frames={unit.evidence_frames ?? []}
+          jobId={jobId}
+          onVisualXAIReady={onVisualXAIReady}
           sourceType={unit.source_type}
+          unitId={unit.unit_id}
         />
       ) : null}
 

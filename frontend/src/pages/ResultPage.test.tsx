@@ -378,6 +378,69 @@ describe("explainable result experience", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "F001" })).not.toBeInTheDocument());
   });
 
+  it("loads the verdict first and lazily requests visual XAI without blocking the result", async () => {
+    const pendingFrame = {
+      ...VISUAL_XAI_QA_FRAME,
+      xai: {
+        ...VISUAL_XAI_QA_FRAME.xai!,
+        status: "not_requested" as const,
+        attribution_maps: [],
+        cache_hit: false,
+        queue_wait_ms: null,
+        compute_time_ms: null,
+        heavy_scorer_batches: 0,
+      },
+    };
+    const pendingVisual = makeUnit("visual-xai-1", {
+      source_type: "visual_observation",
+      text: VISUAL_XAI_QA_OBSERVATION,
+      frame_id: "F001",
+      frame_ids: ["F001"],
+      evidence_refs: ["F001"],
+      producer: "Qwen/Qwen2.5-VL-7B-Instruct",
+      eligible_for_frozen_g1: false,
+      selection_score: null,
+      logits: null,
+      observation_type: "scene",
+      evidence_frames: [pendingFrame],
+    });
+    const readyVisual = { ...pendingVisual, evidence_frames: [VISUAL_XAI_QA_FRAME] };
+    const getResult = vi
+      .spyOn(apiClient, "getJobResult")
+      .mockResolvedValueOnce(makeResultResponse({ supplemental: [pendingVisual] }))
+      .mockResolvedValueOnce(makeResultResponse({ supplemental: [readyVisual] }));
+    const requestXAI = vi.spyOn(apiClient, "requestVisualXAI").mockResolvedValueOnce({
+      api_version: "v1",
+      job_id: JOB_ID,
+      unit_id: "visual-xai-1",
+      visual_xai: {
+        status: "ready",
+        profile: "public",
+        grid_rows: 6,
+        grid_columns: 6,
+        attribution_batch_size: 2,
+        configuration_fingerprint: "e".repeat(64),
+        source_frame_count: 1,
+        cache_hit: true,
+        queue_wait_ms: 0,
+        compute_time_ms: 0,
+        heavy_scorer_batches: 0,
+        unavailable_reason: null,
+      },
+      poll_after_ms: null,
+    });
+
+    renderResult();
+
+    expect(await screen.findByText("FAKE")).toBeVisible();
+    expect(screen.getByText("High-cost post-hoc attribution is available.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Generate XAI" }));
+    expect(await screen.findByText("Qwen occlusion attribution")).toBeVisible();
+    await waitFor(() => expect(getResult).toHaveBeenCalledTimes(2));
+    expect(requestXAI).toHaveBeenCalledWith(JOB_ID, "visual-xai-1");
+    expect(screen.getByText("FAKE")).toBeVisible();
+  });
+
   it("shows an explicit unavailable state for older visual results without XAI", async () => {
     const visual = makeUnit("visual-legacy", {
       source_type: "visual_observation",
@@ -406,7 +469,7 @@ describe("explainable result experience", () => {
 
     renderResult();
 
-    expect(await screen.findByText("XAI attribution unavailable")).toBeVisible();
+    expect(await screen.findByText("Visual XAI unavailable")).toBeVisible();
     expect(screen.getByText("This older result does not contain an XAI artifact.")).toBeVisible();
   });
 

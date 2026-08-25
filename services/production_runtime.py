@@ -1,5 +1,6 @@
 """Lifecycle and delegation wrapper for the real production service graph."""
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Union
 
@@ -81,8 +82,15 @@ class ProductionRuntime:
             )
 
         services = self.start()
-        return services.video_multimodal_runner.run(
-            session_id,
-            claim,
-            resolved_video_path,
+        visual_xai_service = getattr(services, "visual_xai_service", None)
+        execution_boundary = (
+            visual_xai_service.authoritative_execution()
+            if visual_xai_service is not None
+            else nullcontext()
         )
+        with execution_boundary:
+            return services.video_multimodal_runner.run(
+                session_id,
+                claim,
+                resolved_video_path,
+            )

@@ -29,4 +29,6 @@ export type {
   SubmitJobInput,
   SuccessfulProductionExecutionOutcome,
   VisualXAIMethod,
+  VisualXAIStateResponse,
+  VisualXAIStatus,
 } from "./api";

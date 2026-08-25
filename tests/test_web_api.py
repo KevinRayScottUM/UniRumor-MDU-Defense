@@ -31,6 +31,7 @@ from webapp.job_manager import JobManager
 from webapp.job_types import JobFailureSnapshot, JobSnapshot, JobState
 from webapp.runtime_lifecycle import APIRuntimeLifecycle, APIRuntimeStartupError
 from webapp.server_lock import ServerLock, ServerLockUnavailableError
+from services.visual_xai_runtime import VisualXAIState
 
 
 JOB_A = "job_0123456789abcdef0123456789abcdef"
@@ -190,6 +191,51 @@ class ScriptedManager:
 
     def _get_completed_outcome(self, job_id):
         return self.outcomes.get(job_id)
+
+
+class FakeVisualXAIStatus:
+    def __init__(self, state=VisualXAIState.NOT_REQUESTED):
+        self.state = state
+
+    def to_public_dict(self):
+        return {
+            "status": self.state.value,
+            "profile": "public",
+            "grid_rows": 6,
+            "grid_columns": 6,
+            "attribution_batch_size": 2,
+            "configuration_fingerprint": "a" * 64,
+            "source_frame_count": 1,
+            "cache_hit": False,
+            "queue_wait_ms": None,
+            "compute_time_ms": None,
+            "heavy_scorer_batches": 0,
+            "unavailable_reason": None,
+        }
+
+
+class FakeVisualXAIService:
+    def __init__(self):
+        self.status = FakeVisualXAIStatus()
+        self.request_calls = []
+        self.status_calls = []
+        self.shutdown_calls = 0
+
+    def request(self, job_id, unit_id):
+        self.request_calls.append((job_id, unit_id))
+        if unit_id != "visual-unit-1":
+            raise KeyError(unit_id)
+        if self.status.state is VisualXAIState.NOT_REQUESTED:
+            self.status.state = VisualXAIState.PENDING
+        return self.status
+
+    def get_status(self, job_id, unit_id):
+        self.status_calls.append((job_id, unit_id))
+        return self.status if unit_id == "visual-unit-1" else None
+
+    def shutdown(self, timeout=30.0):
+        self.shutdown_calls += 1
+        return True
 
 
 def production_result(verdict, job_id=JOB_A):
@@ -1128,6 +1174,57 @@ class WebAPIHTTPTests(unittest.TestCase):
                     ],
                     dict(outcome.result.sample_logits),
                 )
+
+    def test_visual_xai_request_is_subordinate_idempotent_and_pollable(self):
+        xai = FakeVisualXAIService()
+        service = FakeService()
+        service.runtime.start = lambda: SimpleNamespace(visual_xai_service=xai)
+        app, _, _ = self.scripted_app(
+            {JOB_A: snapshot(JobState.COMPLETED)},
+            {JOB_A: success_outcome()},
+            service=service,
+        )
+        path = f"/api/v1/jobs/{JOB_A}/visual-xai/visual-unit-1"
+        with TestClient(app) as client:
+            first = client.post(path)
+            duplicate = client.post(path)
+            pending = client.get(path)
+            xai.status.state = VisualXAIState.READY
+            ready = client.get(path)
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(duplicate.status_code, 202)
+        self.assertEqual(pending.json()["visual_xai"]["status"], "pending")
+        self.assertEqual(pending.json()["poll_after_ms"], 1500)
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json()["visual_xai"]["status"], "ready")
+        self.assertIsNone(ready.json()["poll_after_ms"])
+        self.assertEqual(len(xai.request_calls), 2)
+        self.assertGreaterEqual(xai.shutdown_calls, 1)
+
+    def test_visual_xai_rejects_active_job_and_unknown_unit_safely(self):
+        xai = FakeVisualXAIService()
+        service = FakeService()
+        service.runtime.start = lambda: SimpleNamespace(visual_xai_service=xai)
+        active_app, _, _ = self.scripted_app(
+            {JOB_A: snapshot(JobState.RUNNING)}, service=service
+        )
+        path = f"/api/v1/jobs/{JOB_A}/visual-xai/visual-unit-1"
+        with TestClient(active_app) as client:
+            active = client.post(path)
+        self.assert_public_error(active, 409, "job_not_completed")
+
+        xai = FakeVisualXAIService()
+        service = FakeService()
+        service.runtime.start = lambda: SimpleNamespace(visual_xai_service=xai)
+        completed_app, _, _ = self.scripted_app(
+            {JOB_A: snapshot(JobState.COMPLETED)}, service=service
+        )
+        with TestClient(completed_app) as client:
+            missing = client.post(
+                f"/api/v1/jobs/{JOB_A}/visual-xai/missing-unit"
+            )
+        self.assert_public_error(missing, 404, "visual_xai_not_found")
 
     def test_result_maps_active_failed_expired_and_unknown_without_leaks(self):
         failure = JobFailureSnapshot(
