@@ -1,6 +1,7 @@
 import { Link, useParams } from "react-router-dom";
 
 import { EvidenceUnitCard } from "../components/result";
+import { deriveSelectionPresentation } from "../components/result/selectionPresentation";
 import {
   Badge,
   Button,
@@ -194,20 +195,24 @@ function ResultMetadata({
   );
 }
 
-function FlowConnector({ label }: { label: string }) {
-  return (
-    <div aria-hidden="true" className="result-flow-connector">
-      <span />
-      <p>{label}</p>
-      <strong>↓</strong>
-    </div>
-  );
-}
-
-function MissingSelectedUnit({ unitId }: { unitId: string }) {
+function MissingSelectedUnit({
+  topKDisplayRank,
+  unitId,
+}: {
+  topKDisplayRank: number;
+  unitId: string;
+}) {
   return (
     <Card className="evidence-unit evidence-unit--selected evidence-unit--missing">
-      <Badge tone="success">Selected explanation</Badge>
+      <div className="evidence-unit__topline">
+        <Badge tone="success">Frozen G1 selected</Badge>
+        <span
+          aria-label={`Top-k explanation display rank ${String(topKDisplayRank)}`}
+          className="evidence-unit__top-k-rank"
+        >
+          #{topKDisplayRank}
+        </span>
+      </div>
       <div className="evidence-unit__identity">
         <p>Unit identifier</p>
         <code>{unitId}</code>
@@ -222,86 +227,162 @@ function MissingSelectedUnit({ unitId }: { unitId: string }) {
 function EvidenceHierarchy({ result }: { result: ProductionResult }) {
   const candidates = result.evidence.g1_exposure_units;
   const selectedIds = result.evidence.g1_top_k_explanation_unit_ids;
+  const presentation = deriveSelectionPresentation(candidates, selectedIds);
   const candidateById = new Map(
-    candidates.map((unit): [string, PublicEvidenceUnit] => [unit.unit_id, unit]),
+    candidates.map(
+      (unit, index): [
+        string,
+        {
+          unit: PublicEvidenceUnit;
+          selectionPresentation: (typeof presentation)[number];
+        },
+      ] => [
+        unit.unit_id,
+        { unit, selectionPresentation: presentation[index] },
+      ],
+    ),
   );
 
   return (
-    <section aria-labelledby="mdu-explanation-heading" className="result-evidence">
-      <div className="result-section-heading result-section-heading--split">
-        <div>
-          <p>Minimal Deceptive Unit explanation</p>
-          <h2 id="mdu-explanation-heading">Evidence hierarchy</h2>
+    <div className="result-evidence">
+      <section
+        aria-labelledby="selected-units-heading"
+        className="result-flow-stage result-flow-stage--selected"
+      >
+        <div className="result-flow-stage__heading">
+          <div>
+            <p>Explanation selection</p>
+            <h2 id="selected-units-heading">Frozen G1 Top-k Selected Units</h2>
+            <span>
+              These units are returned by the frozen claim–unit selection head for
+              explanation.
+            </span>
+          </div>
+          <Badge tone="success">{selectedIds.length} selected</Badge>
         </div>
-        <p>
-          Candidate and selected units are presented in the exact public response order.
-        </p>
-      </div>
 
-      <div aria-label="Claim to selected explanation hierarchy" className="result-flow">
-        <Card className="result-flow-claim" variant="subtle">
-          <Badge tone="info">Claim</Badge>
-          <p>{result.claim}</p>
+        <Card className="result-scientific-boundary" variant="subtle">
+          <strong>
+            Top-k selection is explanation-only. The final Frozen G1 verdict is not
+            computed from these units alone.
+          </strong>
+          <p>
+            The final verdict is composed from veracity logits over all valid Frozen G1
+            candidate units using the frozen class-wise max-pooling rule.
+          </p>
         </Card>
 
-        <FlowConnector label="decomposed into" />
-
-        <section aria-labelledby="candidate-units-heading" className="result-flow-stage">
-          <div className="result-flow-stage__heading">
-            <div>
-              <p>Stage 01</p>
-              <h3 id="candidate-units-heading">Candidate units</h3>
-            </div>
-            <Badge tone="neutral">{candidates.length} returned</Badge>
+        {selectedIds.length > 0 ? (
+          <div className="evidence-unit-grid evidence-unit-grid--selected">
+            {selectedIds.map((unitId, selectedIndex) => {
+              const candidate = candidateById.get(unitId);
+              return candidate ? (
+                <EvidenceUnitCard
+                  key={unitId}
+                  selectionPresentation={candidate.selectionPresentation}
+                  unit={candidate.unit}
+                  variant="selected"
+                />
+              ) : (
+                <MissingSelectedUnit
+                  key={unitId}
+                  topKDisplayRank={selectedIndex + 1}
+                  unitId={unitId}
+                />
+              );
+            })}
           </div>
-          {candidates.length > 0 ? (
-            <div className="evidence-unit-grid">
-              {candidates.map((unit) => (
-                <EvidenceUnitCard key={unit.unit_id} unit={unit} />
-              ))}
-            </div>
-          ) : (
-            <EmptyState
-              description="The authoritative result contains no frozen-G1 candidate units."
-              eyebrow="Candidate units"
-              headingLevel={3}
-              title="No candidate evidence available"
-            />
-          )}
-        </section>
+        ) : (
+          <EmptyState
+            description="No explanation-unit identifiers were returned by the authoritative result."
+            eyebrow="Explanation selection"
+            headingLevel={3}
+            title="No explanation available"
+          />
+        )}
+      </section>
 
-        <FlowConnector label="backend-selected explanation" />
-
-        <section aria-labelledby="selected-units-heading" className="result-flow-stage">
-          <div className="result-flow-stage__heading">
-            <div>
-              <p>Stage 02</p>
-              <h3 id="selected-units-heading">Selected explanation units</h3>
-            </div>
-            <Badge tone="success">{selectedIds.length} selected</Badge>
+      <section
+        aria-labelledby="selection-method-heading"
+        className="result-selection-method"
+      >
+        <div className="result-section-heading">
+          <div>
+            <p>Scientific interpretation</p>
+            <h2 id="selection-method-heading">How these units were selected</h2>
           </div>
-          {selectedIds.length > 0 ? (
-            <div className="evidence-unit-grid evidence-unit-grid--selected">
-              {selectedIds.map((unitId) => {
-                const unit = candidateById.get(unitId);
-                return unit ? (
-                  <EvidenceUnitCard key={unitId} unit={unit} variant="selected" />
-                ) : (
-                  <MissingSelectedUnit key={unitId} unitId={unitId} />
-                );
-              })}
-            </div>
-          ) : (
-            <EmptyState
-              description="No explanation-unit identifiers were returned by the authoritative result."
-              eyebrow="Selected explanation"
-              headingLevel={3}
-              title="No explanation available"
-            />
-          )}
-        </section>
-      </div>
-    </section>
+        </div>
+
+        <div className="result-selection-branches">
+          <Card className="result-selection-branch" variant="glass">
+            <Badge tone="info">Explanation branch</Badge>
+            <ol aria-label="Frozen G1 explanation selection process">
+              <li>Claim + ordered candidate pool</li>
+              <li>Claim–unit scoring</li>
+              <li>Raw selection ranking scores</li>
+              <li>Top-k explanation selection</li>
+            </ol>
+          </Card>
+          <Card className="result-selection-branch" variant="glass">
+            <Badge tone="research">Prediction branch</Badge>
+            <ol aria-label="Frozen G1 final verdict composition process">
+              <li>All valid unit veracity logits</li>
+              <li>Class-wise max pooling</li>
+              <li>Final verdict</li>
+            </ol>
+          </Card>
+        </div>
+
+        <Card className="result-score-explanation" variant="subtle">
+          <p>
+            Selection and prediction are separate branches. Selection scores rank
+            units for explanation, while unit-level veracity logits from all valid
+            Frozen G1 units contribute to the final class-wise max-pooled prediction.
+          </p>
+          <p>
+            Selection scores are raw claim-conditioned ranking values, not
+            probabilities. They are interpreted comparatively within the exposed
+            candidate set.
+          </p>
+          <p>
+            A negative score does not by itself mean that a unit is invalid or
+            incorrect.
+          </p>
+        </Card>
+      </section>
+
+      <section aria-labelledby="candidate-units-heading" className="result-flow-stage">
+        <div className="result-flow-stage__heading">
+          <div>
+            <p>Candidate analysis</p>
+            <h2 id="candidate-units-heading">Full Frozen G1 Candidate Pool</h2>
+            <span>
+              The ordered candidate pool exposed to Frozen G1. Candidate order is
+              preserved for reproducibility.
+            </span>
+          </div>
+          <Badge tone="neutral">{candidates.length} returned</Badge>
+        </div>
+        {candidates.length > 0 ? (
+          <div className="evidence-unit-grid">
+            {candidates.map((unit, index) => (
+              <EvidenceUnitCard
+                key={unit.unit_id}
+                selectionPresentation={presentation[index]}
+                unit={unit}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            description="The authoritative result contains no frozen-G1 candidate units."
+            eyebrow="Candidate analysis"
+            headingLevel={3}
+            title="No candidate evidence available"
+          />
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -320,12 +401,12 @@ function SupplementalEvidence({
     <section aria-labelledby="supplemental-heading" className="result-supplemental">
       <div className="result-section-heading result-section-heading--split">
         <div>
-          <p>Supplemental evidence</p>
-          <h2 id="supplemental-heading">Supplemental observations</h2>
+          <p>Supplemental visual grounding</p>
+          <h2 id="supplemental-heading">Supplemental Visual Observations</h2>
         </div>
         <p>
-          Public visual observations remain separate from candidate and selected
-          explanation units.
+          Supplemental visual observations provide additional visual grounding and
+          are not part of the Frozen G1 Text+OCR candidate pool.
         </p>
       </div>
       {units.length > 0 ? (
@@ -435,14 +516,14 @@ export function ResultPage() {
       {jobResult ? (
         <>
           <ResultOverview result={jobResult.result} />
-          <ResultConfidence result={jobResult.result} />
-          <ResultMetadata jobId={jobResult.jobId} result={jobResult.result} />
           <EvidenceHierarchy result={jobResult.result} />
           <SupplementalEvidence
             jobId={jobResult.jobId}
             onVisualXAIReady={refresh}
             result={jobResult.result}
           />
+          <ResultConfidence result={jobResult.result} />
+          <ResultMetadata jobId={jobResult.jobId} result={jobResult.result} />
         </>
       ) : null}
     </section>

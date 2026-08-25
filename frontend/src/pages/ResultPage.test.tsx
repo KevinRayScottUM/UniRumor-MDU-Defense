@@ -170,20 +170,29 @@ describe("explainable result experience", () => {
     renderResult();
 
     expect(await screen.findByText("FAKE")).toBeVisible();
-    expect(screen.getAllByText(longClaim)).toHaveLength(2);
-    expect(screen.getByRole("heading", { name: "Candidate units" })).toBeVisible();
+    expect(screen.getByText(longClaim)).toBeVisible();
+    const selectedHeading = screen.getByRole("heading", {
+      name: "Frozen G1 Top-k Selected Units",
+    });
+    const candidateHeading = screen.getByRole("heading", {
+      name: "Full Frozen G1 Candidate Pool",
+    });
+    expect(
+      selectedHeading.compareDocumentPosition(candidateHeading) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     const selectedSection = screen
-      .getByRole("heading", { name: "Selected explanation units" })
+      .getByRole("heading", { name: "Frozen G1 Top-k Selected Units" })
       .closest("section");
     expect(selectedSection).not.toBeNull();
     const selectedUnitIds = within(selectedSection as HTMLElement)
       .getAllByText(/^unit-/)
       .map((node) => node.textContent);
     expect(selectedUnitIds).toEqual(["unit-ocr", "unit-transcript"]);
-    expect(screen.getAllByText("Selection score 0.72")).toHaveLength(2);
+    expect(screen.getAllByText("+0.7200")).toHaveLength(2);
     expect(screen.getAllByText("frame_004")).toHaveLength(4);
     expect(
-      screen.getByRole("heading", { name: "Supplemental observations" }),
+      screen.getByRole("heading", { name: "Supplemental Visual Observations" }),
     ).toBeVisible();
     expect(screen.getByText("Supplemental")).toBeVisible();
     expect(
@@ -265,7 +274,107 @@ describe("explainable result experience", () => {
     expect(
       await screen.findByText("No additional public metadata was provided for this unit."),
     ).toBeVisible();
-    expect(screen.queryByText(/Selection score/)).not.toBeInTheDocument();
+    const candidateSection = screen
+      .getByRole("heading", { name: "Full Frozen G1 Candidate Pool" })
+      .closest("section");
+    expect(candidateSection).not.toBeNull();
+    expect(
+      within(candidateSection as HTMLElement).getByText(
+        "Raw selection ranking score",
+      ),
+    ).toBeVisible();
+    expect(
+      within(candidateSection as HTMLElement).getAllByText("Not available"),
+    ).toHaveLength(2);
+  });
+
+  it("presents authoritative Top-k first with scientific ranking and OCR semantics", async () => {
+    const candidates = [
+      makeUnit("ocr_0001", {
+        source_type: "ocr",
+        confidence: 0.952214777469635,
+        selection_score: -0.21643970906734467,
+      }),
+      makeUnit("transcript_exposure_0005", { selection_score: 0.44004 }),
+      makeUnit("transcript_exposure_0000", { selection_score: 0.198685 }),
+      makeUnit("transcript_exposure_0010", { selection_score: 0.122902 }),
+      makeUnit("transcript_exposure_0001", { selection_score: 0.11554 }),
+      makeUnit("transcript_exposure_0008", { selection_score: -0.019889 }),
+      makeUnit("unit-06", { selection_score: -0.03 }),
+      makeUnit("unit-07", { selection_score: -0.05 }),
+      makeUnit("unit-08", { selection_score: -0.08 }),
+      makeUnit("unit-09", { selection_score: -0.1 }),
+      makeUnit("unit-10", { selection_score: -0.15 }),
+      makeUnit("unit-11", { selection_score: -0.19 }),
+      makeUnit("unit-12", { selection_score: -0.2 }),
+      makeUnit("unit-14", { selection_score: -0.3 }),
+      makeUnit("unit-15", { selection_score: -0.4 }),
+      makeUnit("unit-16", { selection_score: -0.5 }),
+      makeUnit("unit-17", { selection_score: -0.6 }),
+      makeUnit("unit-18", { selection_score: null }),
+    ];
+    const selectedIds = [
+      "transcript_exposure_0005",
+      "transcript_exposure_0000",
+      "transcript_exposure_0010",
+      "transcript_exposure_0001",
+      "transcript_exposure_0008",
+    ];
+    vi.spyOn(apiClient, "getJobResult").mockResolvedValueOnce(
+      makeResultResponse({ candidates, selectedIds }),
+    );
+
+    renderResult();
+
+    const selectedSection = (await screen.findByRole("heading", {
+      name: "Frozen G1 Top-k Selected Units",
+    })).closest("section") as HTMLElement;
+    const candidateSection = screen
+      .getByRole("heading", { name: "Full Frozen G1 Candidate Pool" })
+      .closest("section") as HTMLElement;
+
+    expect(
+      within(selectedSection)
+        .getAllByText(/^transcript_exposure_/)
+        .map((node) => node.textContent),
+    ).toEqual(selectedIds);
+    expect(
+      within(candidateSection)
+        .getAllByText(/^(ocr_0001|transcript_exposure_|unit-)/)
+        .map((node) => node.textContent),
+    ).toEqual(candidates.map((unit) => unit.unit_id));
+
+    const ocrIdentifier = within(candidateSection).getByText("ocr_0001");
+    const ocrCard = ocrIdentifier.closest(".evidence-unit");
+    expect(ocrCard).not.toBeNull();
+    expect(within(ocrCard as HTMLElement).getByText("-0.2164")).toBeVisible();
+    expect(within(ocrCard as HTMLElement).getByText("13 / 18")).toBeVisible();
+    expect(within(ocrCard as HTMLElement).getByText("Not selected")).toBeVisible();
+    expect(
+      within(ocrCard as HTMLElement).getByText("OCR recognition confidence"),
+    ).toBeVisible();
+    expect(within(ocrCard as HTMLElement).getByText("95.2%")).toBeVisible();
+
+    expect(
+      screen.getByText(/Selection scores are raw claim-conditioned ranking values, not probabilities/),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/A negative score does not by itself mean that a unit is invalid or incorrect/),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/Top-k selection is explanation-only/),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/all valid Frozen G1 candidate units using the frozen class-wise max-pooling rule/),
+    ).toBeVisible();
+    expect(screen.queryByText(/selection probability/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Top-k determines the verdict/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/selected units are the only basis/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/negative score means invalid/i),
+    ).not.toBeInTheDocument();
   });
 
   it("renders real OCR frames, recorded regions, and the accessible lightbox", async () => {

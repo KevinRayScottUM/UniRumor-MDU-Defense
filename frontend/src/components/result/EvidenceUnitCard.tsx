@@ -1,6 +1,7 @@
 import type { PublicEvidenceUnit } from "../../types";
 import { Badge, Card } from "../ui";
 import { EvidenceFrameGallery } from "./EvidenceFrameGallery";
+import type { SelectionPresentationMetadata } from "./selectionPresentation";
 
 export type EvidenceUnitVariant = "candidate" | "selected" | "supplemental";
 
@@ -9,6 +10,7 @@ export interface EvidenceUnitCardProps {
   variant?: EvidenceUnitVariant;
   jobId?: string;
   onVisualXAIReady?: () => void;
+  selectionPresentation?: SelectionPresentationMetadata;
 }
 
 const SOURCE_LABELS: Record<PublicEvidenceUnit["source_type"], string> = {
@@ -20,6 +22,21 @@ const SOURCE_LABELS: Record<PublicEvidenceUnit["source_type"], string> = {
 
 function numericValue(value: number): string {
   return String(value);
+}
+
+function formattedSelectionScore(value: number): string {
+  return `${value > 0 ? "+" : ""}${value.toFixed(4)}`;
+}
+
+function confidenceMetadata(unit: PublicEvidenceUnit) {
+  if (unit.confidence === null) return null;
+  if (unit.source_type === "ocr") {
+    return {
+      label: "OCR recognition confidence",
+      value: `${(unit.confidence * 100).toFixed(1)}%`,
+    };
+  }
+  return { label: "Source confidence", value: numericValue(unit.confidence) };
 }
 
 function timeRange(unit: PublicEvidenceUnit): string | undefined {
@@ -38,9 +55,7 @@ function optionalMetadata(unit: PublicEvidenceUnit) {
     unit.frame_ids.length > 0
       ? { label: "Frames", value: unit.frame_ids.join(", ") }
       : null,
-    unit.confidence !== null
-      ? { label: "Confidence", value: numericValue(unit.confidence) }
-      : null,
+    confidenceMetadata(unit),
     unit.source_index !== null
       ? { label: "Source index", value: String(unit.source_index) }
       : null,
@@ -84,12 +99,16 @@ export function EvidenceUnitCard({
   variant = "candidate",
   jobId,
   onVisualXAIReady,
+  selectionPresentation,
 }: EvidenceUnitCardProps) {
   const metadata = optionalMetadata(unit);
-  const selectionLabel =
-    unit.selection_score === null
-      ? undefined
-      : `Selection score ${numericValue(unit.selection_score)}`;
+  const summaryHeading =
+    variant === "selected"
+      ? "Selected explanation unit"
+      : variant === "supplemental"
+        ? "Supplemental visual observation"
+        : "Candidate unit content";
+  const showSelection = variant !== "supplemental" && selectionPresentation;
 
   return (
     <Card
@@ -102,21 +121,74 @@ export function EvidenceUnitCard({
             {SOURCE_LABELS[unit.source_type]}
           </Badge>
           {variant === "selected" ? (
-            <Badge tone="success">Selected explanation</Badge>
+            <Badge tone="success">Frozen G1 selected</Badge>
+          ) : null}
+          {variant === "candidate" ? (
+            <Badge tone="neutral">Frozen G1 candidate</Badge>
           ) : null}
           {variant === "supplemental" ? (
             <Badge tone="research">Supplemental</Badge>
           ) : null}
         </div>
-        {selectionLabel ? (
-          <span className="evidence-unit__selection">{selectionLabel}</span>
+        {variant === "selected" && selectionPresentation?.topKDisplayRank ? (
+          <span
+            aria-label={`Top-k explanation display rank ${String(selectionPresentation.topKDisplayRank)}`}
+            className="evidence-unit__top-k-rank"
+          >
+            #{selectionPresentation.topKDisplayRank}
+          </span>
         ) : null}
       </div>
+
+      {showSelection ? (
+        <dl className="evidence-unit__selection-metrics">
+          <div>
+            <dt>Raw selection ranking score</dt>
+            <dd
+              aria-label={
+                unit.selection_score === null
+                  ? "Raw selection ranking score not available"
+                  : `Raw selection ranking score full raw value ${numericValue(unit.selection_score)}`
+              }
+              title={
+                unit.selection_score === null
+                  ? undefined
+                  : `Full raw value: ${numericValue(unit.selection_score)}`
+              }
+            >
+              {unit.selection_score === null
+                ? "Not available"
+                : formattedSelectionScore(unit.selection_score)}
+            </dd>
+          </div>
+          <div>
+            <dt>Selection rank</dt>
+            <dd>
+              {selectionPresentation.selectionRank === null
+                ? "Not available"
+                : `${String(selectionPresentation.selectionRank)} / ${String(selectionPresentation.selectionRankTotal)}`}
+            </dd>
+          </div>
+          <div>
+            <dt>Top-k explanation</dt>
+            <dd>{selectionPresentation.topKSelected ? "Selected" : "Not selected"}</dd>
+          </div>
+        </dl>
+      ) : null}
+
+      {unit.source_type === "ocr" &&
+      unit.confidence !== null &&
+      unit.selection_score !== null ? (
+        <p className="evidence-unit__ocr-boundary">
+          OCR recognition confidence measures text-recognition quality; the
+          selection score measures claim-conditioned explanation ranking.
+        </p>
+      ) : null}
 
       <section className="evidence-unit__summary" aria-label="Evidence summary">
         <div className="evidence-unit__section-heading">
           <p>Evidence summary</p>
-          <h4>Authoritative candidate content</h4>
+          <h4>{summaryHeading}</h4>
         </div>
         <div className="evidence-unit__identity">
           <p>Unit identifier</p>
