@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -95,8 +96,54 @@ class MockTargetScorer:
         return output
 
 
+class SimulatedCudaOutOfMemory(RuntimeError):
+    pass
+
+
+class PreparedAdaptiveTargetScorer(MockTargetScorer):
+    def __init__(self, oom_batch_sizes=(), non_oom_batch_sizes=()):
+        super().__init__()
+        self.oom_batch_sizes = set(oom_batch_sizes)
+        self.non_oom_batch_sizes = set(non_oom_batch_sizes)
+        self.prepare_calls = 0
+        self.batch_sizes = []
+        self.empty_cache_calls = 0
+
+    def prepare_target_scoring(self, frames, target_sequence, spans):
+        self.prepare_calls += 1
+        return (target_sequence, tuple(spans))
+
+    def score_prepared_target_logprob_batch(self, frame_batches, prepared):
+        batch_size = len(frame_batches)
+        self.batch_sizes.append(batch_size)
+        is_occlusion = any(
+            "variant_" in frame.frame_path.name
+            for frames in frame_batches
+            for frame in frames
+        )
+        if is_occlusion and batch_size in self.oom_batch_sizes:
+            raise SimulatedCudaOutOfMemory("simulated concrete CUDA OOM")
+        if is_occlusion and batch_size in self.non_oom_batch_sizes:
+            raise RuntimeError("ordinary runtime failure")
+        target_sequence, spans = prepared
+        return super().score_target_logprob_batch(
+            frame_batches, target_sequence, spans
+        )
+
+    @staticmethod
+    def is_cuda_out_of_memory(error):
+        return isinstance(error, SimulatedCudaOutOfMemory)
+
+    def clear_cuda_oom_cache(self):
+        self.empty_cache_calls += 1
+
+
 class SlowTokenizer:
+    def __init__(self):
+        self.calls = 0
+
     def __call__(self, text, **kwargs):
+        self.calls += 1
         if kwargs.get("return_offsets_mapping"):
             raise NotImplementedError("slow tokenizer has no offsets")
         return {"input_ids": [ord(character) for character in text]}
@@ -113,8 +160,10 @@ class FakeScoreInputs(dict):
 class FakeScoreProcessor:
     def __init__(self):
         self.tokenizer = SlowTokenizer()
+        self.template_calls = 0
 
     def apply_chat_template(self, messages, **kwargs):
+        self.template_calls += 1
         if len(messages) == 1:
             return "PROMPT"
         return "PROMPT" + messages[-1]["content"]
@@ -172,7 +221,8 @@ class FakeScoreTorch:
 
 
 class QwenFixedTargetScoringTests(unittest.TestCase):
-    def test_slow_tokenizer_fallback_maps_exact_phrase_tokens_without_generation(self):
+    @staticmethod
+    def _observer_and_frame():
         processor = FakeScoreProcessor()
         observer = QwenVisualObserver(
             QwenVisualObserverConfig(model_path=Path("/not-loaded")),
@@ -193,6 +243,10 @@ class QwenFixedTargetScoringTests(unittest.TestCase):
             image_sha256="a" * 64,
             retrieval_rank=1,
         )
+        return observer, processor, frame
+
+    def test_slow_tokenizer_fallback_maps_exact_phrase_tokens_without_generation(self):
+        observer, _, frame = self._observer_and_frame()
         target = "speaker stage"
         spans = (
             VisualTargetSpan("observation", "observation", "Whole observation", 0, 13),
@@ -207,6 +261,47 @@ class QwenFixedTargetScoringTests(unittest.TestCase):
         self.assertEqual(5, result.token_count("phrase_02"))
         self.assertEqual(-1.75, result.log_probability("phrase_01"))
         self.assertEqual(-1.25, result.log_probability("phrase_02"))
+
+    def test_fixed_text_token_and_phrase_preprocessing_is_reused(self):
+        observer, processor, frame = self._observer_and_frame()
+        target = "speaker stage"
+        spans = (
+            VisualTargetSpan("observation", "observation", "Whole observation", 0, 13),
+            VisualTargetSpan("phrase_01", "phrase", "speaker", 0, 7),
+        )
+
+        prepared = observer.prepare_target_scoring([frame], target, spans)
+        tokenizer_calls = processor.tokenizer.calls
+        template_calls = processor.template_calls
+        observer.score_prepared_target_logprob_batch([[frame], [frame]], prepared)
+        observer.score_prepared_target_logprob_batch([[frame]], prepared)
+
+        self.assertEqual(tokenizer_calls, processor.tokenizer.calls)
+        self.assertEqual(template_calls, processor.template_calls)
+        self.assertEqual(("observation", "phrase_01"), tuple(
+            span.span_id for span in prepared.spans
+        ))
+
+    def test_qwen_cuda_oom_detection_uses_concrete_cuda_type_only(self):
+        class ConcreteCudaOOM(RuntimeError):
+            pass
+
+        observer, _, _ = self._observer_and_frame()
+        cleared = []
+        observer._device = "cuda:0"
+        observer._torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                OutOfMemoryError=ConcreteCudaOOM,
+                empty_cache=lambda: cleared.append(True),
+            )
+        )
+
+        self.assertTrue(observer.is_cuda_out_of_memory(ConcreteCudaOOM()))
+        self.assertFalse(observer.is_cuda_out_of_memory(RuntimeError("CUDA OOM text")))
+        observer.clear_cuda_oom_cache()
+        self.assertEqual([True], cleared)
+        observer._device = "cpu"
+        self.assertFalse(observer.is_cuda_out_of_memory(ConcreteCudaOOM()))
 
 
 class VisualXAIAttributorTests(unittest.TestCase):
@@ -288,6 +383,172 @@ class VisualXAIAttributorTests(unittest.TestCase):
             numpy_module=self.numpy,
         )
 
+    def configured_attributor(
+        self,
+        scorer,
+        *,
+        batch_size,
+        batch_mode="fixed",
+        grid_size=6,
+        cache_name=None,
+    ):
+        return VisualXAIAttributor(
+            scorer,
+            VisualXAIConfig(
+                cache_root=self.root
+                / (cache_name or f"xai-{batch_mode}-{batch_size}"),
+                profile="public",
+                grid_rows=grid_size,
+                grid_columns=grid_size,
+                attribution_batch_size=batch_size,
+                batch_mode=batch_mode,
+                blur_kernel_size=3,
+                timeout_seconds=30.0,
+            ),
+            cv2_module=self.cv2,
+            numpy_module=self.numpy,
+        )
+
+    def test_adaptive_mode_starts_at_largest_configured_candidate(self):
+        scorer = PreparedAdaptiveTargetScorer()
+        artifact = self.configured_attributor(
+            scorer, batch_size=8, batch_mode="adaptive"
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertEqual("available", artifact.status)
+        self.assertEqual(8, artifact.requested_batch_size)
+        self.assertEqual(8, artifact.effective_batch_size)
+        self.assertTrue(artifact.adaptive_batching)
+        self.assertEqual(0, artifact.oom_retry_count)
+        self.assertEqual(6, artifact.heavy_scorer_batches)
+        self.assertEqual([1, 8, 8, 8, 8, 4], scorer.batch_sizes)
+        self.assertEqual(1, scorer.prepare_calls)
+        serialized = artifact.to_dict()
+        self.assertEqual(8, serialized["requested_batch_size"])
+        self.assertEqual(8, serialized["effective_batch_size"])
+        self.assertTrue(serialized["adaptive_batching"])
+        self.assertEqual(0, serialized["oom_retry_count"])
+        self.assertNotIn(str(self.root), json.dumps(serialized, sort_keys=True))
+
+    def test_cuda_oom_falls_back_from_eight_to_four(self):
+        scorer = PreparedAdaptiveTargetScorer(oom_batch_sizes={8})
+        artifact = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-oom-8-to-4",
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertEqual("available", artifact.status)
+        self.assertEqual(4, artifact.effective_batch_size)
+        self.assertEqual(1, artifact.oom_retry_count)
+        self.assertEqual(11, artifact.heavy_scorer_batches)
+        self.assertEqual([1, 8, 4], scorer.batch_sizes[:3])
+        self.assertEqual(1, scorer.empty_cache_calls)
+
+    def test_repeated_cuda_oom_falls_back_to_one(self):
+        scorer = PreparedAdaptiveTargetScorer(oom_batch_sizes={8, 4, 2})
+        artifact = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-oom-to-one",
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertEqual("available", artifact.status)
+        self.assertEqual(1, artifact.effective_batch_size)
+        self.assertEqual(3, artifact.oom_retry_count)
+        self.assertEqual(40, artifact.heavy_scorer_batches)
+        self.assertEqual([1, 8, 4, 2, 1], scorer.batch_sizes[:5])
+        self.assertEqual(3, scorer.empty_cache_calls)
+
+    def test_cuda_oom_at_batch_one_fails_safely_after_all_retries(self):
+        scorer = PreparedAdaptiveTargetScorer(oom_batch_sizes={8, 4, 2, 1})
+        artifact = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-oom-exhausted",
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertEqual("unavailable", artifact.status)
+        self.assertEqual("attribution_failed", artifact.unavailable_reason)
+        self.assertEqual(1, artifact.effective_batch_size)
+        self.assertEqual(3, artifact.oom_retry_count)
+        self.assertEqual(5, artifact.heavy_scorer_batches)
+        self.assertEqual([1, 8, 4, 2, 1], scorer.batch_sizes)
+        self.assertEqual(3, scorer.empty_cache_calls)
+
+    def test_non_oom_runtime_error_does_not_trigger_fallback(self):
+        scorer = PreparedAdaptiveTargetScorer(non_oom_batch_sizes={8})
+        artifact = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-non-oom",
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertEqual("unavailable", artifact.status)
+        self.assertEqual("attribution_failed", artifact.unavailable_reason)
+        self.assertEqual([1, 8], scorer.batch_sizes)
+        self.assertEqual(0, scorer.empty_cache_calls)
+
+    def test_fixed_batch_sizes_produce_equivalent_attribution_and_ranking(self):
+        artifacts = {}
+        for batch_size in (1, 2, 4, 8):
+            scorer = PreparedAdaptiveTargetScorer()
+            artifacts[batch_size] = self.configured_attributor(
+                scorer,
+                batch_size=batch_size,
+                cache_name=f"xai-equivalence-{batch_size}",
+            ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        reference = artifacts[1]
+        for batch_size in (2, 4, 8):
+            candidate = artifacts[batch_size]
+            self.assertEqual(
+                [item.raw_importance for item in reference.maps],
+                [item.raw_importance for item in candidate.maps],
+            )
+            self.assertEqual(
+                [item.normalized_importance for item in reference.maps],
+                [item.normalized_importance for item in candidate.maps],
+            )
+            for reference_map, candidate_map in zip(
+                reference.maps, candidate.maps
+            ):
+                reference_ranking = sorted(
+                    range(36),
+                    key=lambda index: (
+                        -reference_map.raw_importance[index // 6][index % 6],
+                        index,
+                    ),
+                )
+                candidate_ranking = sorted(
+                    range(36),
+                    key=lambda index: (
+                        -candidate_map.raw_importance[index // 6][index % 6],
+                        index,
+                    ),
+                )
+                self.assertEqual(reference_ranking, candidate_ranking)
+
+    def test_phrase_count_shares_the_same_heavy_image_scoring_passes(self):
+        scorer = PreparedAdaptiveTargetScorer()
+        artifact = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-shared-phrase-passes",
+        ).attribute([self.snapshot], [self.frame], RAW_GENERATION)[0]
+
+        self.assertGreater(len(artifact.maps), 1)
+        self.assertEqual(6, artifact.heavy_scorer_batches)
+        self.assertEqual(37, sum(scorer.batch_sizes))
+        self.assertTrue(
+            all(len(call[2]) == len(artifact.maps) for call in scorer.calls)
+        )
+
     def test_occlusion_scores_strong_and_irrelevant_regions_and_phrase_tokens(self):
         original_sha = hashlib.sha256(self.frame_path.read_bytes()).hexdigest()
         scorer = MockTargetScorer()
@@ -348,6 +609,62 @@ class VisualXAIAttributorTests(unittest.TestCase):
                 for item in second.maps
             ],
         )
+
+    def test_pre_adaptive_persistent_cache_key_remains_readable(self):
+        scorer = PreparedAdaptiveTargetScorer()
+        attributor = self.configured_attributor(
+            scorer,
+            batch_size=8,
+            batch_mode="adaptive",
+            cache_name="xai-legacy-cache",
+        )
+        model_fingerprint = attributor._model_fingerprint(
+            self.snapshot, scorer
+        )
+        phrases = attributor.phrase_spans(
+            self.snapshot.observation_text,
+            attributor.config.maximum_phrase_count,
+        )
+        legacy_key = attributor._cache_key(
+            self.snapshot,
+            self.frame,
+            (self.frame,),
+            model_fingerprint,
+            phrase_spans=phrases,
+            legacy_batch_size=2,
+        )
+        legacy = attributor._unavailable(
+            self.snapshot,
+            self.snapshot.frame_references[0],
+            model_fingerprint,
+            legacy_key,
+            "attribution_failed",
+            effective_batch_size=2,
+        )
+        legacy = replace(
+            legacy,
+            artifact_id="0" * 64,
+            attribution_batch_size=2,
+            requested_batch_size=2,
+            effective_batch_size=2,
+            adaptive_batching=False,
+            configuration_fingerprint=(
+                attributor.config.legacy_configuration_fingerprint(2)
+            ),
+        )
+        legacy = replace(
+            legacy,
+            artifact_id=legacy.compute_identity(legacy.identity_payload()),
+        )
+        attributor._write_cache(legacy)
+
+        cached = attributor.cached_artifacts(
+            self.snapshot, (self.frame,)
+        )
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(legacy.artifact_id, cached[0].artifact_id)
+        self.assertEqual([], scorer.calls)
 
     def test_corrupted_persistent_cache_recomputes_safely(self):
         scorer = MockTargetScorer()
@@ -455,6 +772,10 @@ class VisualXAIAttributorTests(unittest.TestCase):
         public = ProductionResultBuilder(evidence_root=self.root).build(result)
         frame = public.visual_supplemental_units[0].to_dict()["evidence_frames"][0]
         self.assertEqual("available", frame["xai"]["status"])
+        self.assertEqual(2, frame["xai"]["requested_batch_size"])
+        self.assertEqual(2, frame["xai"]["effective_batch_size"])
+        self.assertFalse(frame["xai"]["adaptive_batching"])
+        self.assertEqual(0, frame["xai"]["oom_retry_count"])
         self.assertTrue(
             frame["xai"]["attribution_maps"][0]["heatmap_image"].startswith(
                 "data:image/png;base64,"

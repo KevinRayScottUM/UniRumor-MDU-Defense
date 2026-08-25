@@ -138,6 +138,10 @@ class ProductionVisualXAI:
     grid_rows: int
     grid_columns: int
     attribution_batch_size: int
+    requested_batch_size: int
+    effective_batch_size: int
+    adaptive_batching: bool
+    oom_retry_count: int
     occlusion_baseline: str
     configuration_version: str
     configuration_fingerprint: str
@@ -163,6 +167,10 @@ class ProductionVisualXAI:
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
             "attribution_batch_size": self.attribution_batch_size,
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.effective_batch_size,
+            "adaptive_batching": self.adaptive_batching,
+            "oom_retry_count": self.oom_retry_count,
             "occlusion_baseline": self.occlusion_baseline,
             "configuration_version": self.configuration_version,
             "configuration_fingerprint": self.configuration_fingerprint,
@@ -570,6 +578,10 @@ class ProductionResultBuilder:
             grid_rows=artifact.grid_rows,
             grid_columns=artifact.grid_columns,
             attribution_batch_size=artifact.attribution_batch_size,
+            requested_batch_size=artifact.requested_batch_size,
+            effective_batch_size=artifact.effective_batch_size,
+            adaptive_batching=artifact.adaptive_batching,
+            oom_retry_count=artifact.oom_retry_count,
             occlusion_baseline=artifact.occlusion_baseline,
             configuration_version=artifact.configuration_version,
             configuration_fingerprint=artifact.configuration_fingerprint,
@@ -628,6 +640,16 @@ class ProductionResultBuilder:
                 "grid_rows": status.grid_rows,
                 "grid_columns": status.grid_columns,
                 "attribution_batch_size": status.attribution_batch_size,
+                "requested_batch_size": getattr(
+                    status, "requested_batch_size", status.attribution_batch_size
+                ),
+                "effective_batch_size": getattr(
+                    status, "effective_batch_size", None
+                ),
+                "adaptive_batching": getattr(
+                    status, "adaptive_batching", False
+                ),
+                "oom_retry_count": getattr(status, "oom_retry_count", 0),
                 "occlusion_baseline": QWEN_OCCLUSION_BASELINE,
                 "configuration_version": None,
                 "configuration_fingerprint": status.configuration_fingerprint,
@@ -647,6 +669,16 @@ class ProductionResultBuilder:
                 "compute_time_ms": status.compute_time_ms,
                 "source_frame_count": status.source_frame_count,
                 "heavy_scorer_batches": status.heavy_scorer_batches,
+                "requested_batch_size": getattr(
+                    status, "requested_batch_size", status.attribution_batch_size
+                ),
+                "effective_batch_size": getattr(
+                    status, "effective_batch_size", None
+                ),
+                "adaptive_batching": getattr(
+                    status, "adaptive_batching", False
+                ),
+                "oom_retry_count": getattr(status, "oom_retry_count", 0),
             }
         )
         return public_artifact

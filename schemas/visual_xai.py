@@ -262,6 +262,10 @@ class VisualAttributionArtifact:
     heavy_scorer_batches: int
     maps: Tuple[VisualAttributionMap, ...]
     cache_key: str
+    requested_batch_size: Optional[int] = None
+    effective_batch_size: Optional[int] = None
+    adaptive_batching: bool = False
+    oom_retry_count: int = 0
 
     def __post_init__(self) -> None:
         if self.schema_version != VISUAL_XAI_SCHEMA_VERSION:
@@ -318,6 +322,22 @@ class VisualAttributionArtifact:
             or self.attribution_batch_size < 1
         ):
             raise ValueError("attribution_batch_size must be a positive integer")
+        if self.requested_batch_size is None:
+            object.__setattr__(
+                self, "requested_batch_size", self.attribution_batch_size
+            )
+        if self.effective_batch_size is None:
+            object.__setattr__(
+                self, "effective_batch_size", self.attribution_batch_size
+            )
+        for field_name in ("requested_batch_size", "effective_batch_size"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        if type(self.adaptive_batching) is not bool:
+            raise TypeError("adaptive_batching must be a bool")
+        if type(self.oom_retry_count) is not int or self.oom_retry_count < 0:
+            raise ValueError("oom_retry_count must be non-negative")
         if type(self.heavy_scorer_batches) is not int or self.heavy_scorer_batches < 0:
             raise ValueError("heavy_scorer_batches must be non-negative")
         if not isinstance(self.maps, tuple) or not all(
@@ -367,7 +387,14 @@ class VisualAttributionArtifact:
         }
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"artifact_id": self.artifact_id, **self.identity_payload()}
+        return {
+            "artifact_id": self.artifact_id,
+            **self.identity_payload(),
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.effective_batch_size,
+            "adaptive_batching": self.adaptive_batching,
+            "oom_retry_count": self.oom_retry_count,
+        }
 
     @staticmethod
     def compute_identity(payload: Mapping[str, Any]) -> str:

@@ -37,8 +37,12 @@ VISUAL_XAI_FAILURE_WARNING = "Visual attribution unavailable."
 VISUAL_XAI_PROFILE_ENV = "MDU_VISUAL_XAI_PROFILE"
 VISUAL_XAI_GRID_SIZE_ENV = "MDU_VISUAL_XAI_GRID_SIZE"
 VISUAL_XAI_MAX_CONCURRENCY_ENV = "MDU_VISUAL_XAI_MAX_CONCURRENCY"
+VISUAL_XAI_BATCH_MODE_ENV = "MDU_VISUAL_XAI_BATCH_MODE"
+VISUAL_XAI_BATCH_SIZE_ENV = "MDU_VISUAL_XAI_BATCH_SIZE"
+VISUAL_XAI_MAX_BATCH_SIZE_ENV = "MDU_VISUAL_XAI_MAX_BATCH_SIZE"
 VISUAL_XAI_PUBLIC_GRID_SIZE = 6
 VISUAL_XAI_RESEARCH_GRID_SIZE = 8
+VISUAL_XAI_ADAPTIVE_BATCH_CANDIDATES = (8, 4, 2, 1)
 _SAFE_UNAVAILABLE_REASONS = {
     "attribution_failed",
     "attribution_timeout",
@@ -119,6 +123,20 @@ _SAFE_CAPITALIZED_CONCEPTS = {
 }
 
 
+class _AttributionScoringFailure(RuntimeError):
+    def __init__(
+        self,
+        *,
+        effective_batch_size: int,
+        oom_retry_count: int,
+        heavy_scorer_batches: int,
+    ) -> None:
+        super().__init__("visual attribution scoring failed")
+        self.effective_batch_size = effective_batch_size
+        self.oom_retry_count = oom_retry_count
+        self.heavy_scorer_batches = heavy_scorer_batches
+
+
 @dataclass(frozen=True, slots=True)
 class VisualXAIConfig:
     cache_root: Path
@@ -126,6 +144,7 @@ class VisualXAIConfig:
     grid_rows: int = 8
     grid_columns: int = 8
     attribution_batch_size: int = 2
+    batch_mode: str = "fixed"
     blur_kernel_size: int = 31
     overlay_alpha: float = 0.62
     timeout_seconds: float = 300.0
@@ -136,6 +155,8 @@ class VisualXAIConfig:
         object.__setattr__(self, "cache_root", Path(self.cache_root).resolve())
         if self.profile not in {"public", "research"}:
             raise ValueError("profile must be public or research")
+        if self.batch_mode not in {"adaptive", "fixed"}:
+            raise ValueError("batch_mode must be adaptive or fixed")
         for field_name in (
             "grid_rows",
             "grid_columns",
@@ -157,14 +178,36 @@ class VisualXAIConfig:
             raise ValueError("timeout_seconds must be positive")
         if not self.configuration_version:
             raise ValueError("configuration_version is required")
+        if (
+            self.batch_mode == "adaptive"
+            and self.attribution_batch_size
+            not in VISUAL_XAI_ADAPTIVE_BATCH_CANDIDATES
+        ):
+            raise ValueError("adaptive batch size must be one of 8, 4, 2, or 1")
 
     @property
-    def configuration_fingerprint(self) -> str:
+    def adaptive_batching(self) -> bool:
+        return self.batch_mode == "adaptive"
+
+    @property
+    def requested_batch_size(self) -> int:
+        return self.attribution_batch_size
+
+    @property
+    def batch_candidates(self) -> Tuple[int, ...]:
+        if not self.adaptive_batching:
+            return (self.attribution_batch_size,)
+        return tuple(
+            size
+            for size in VISUAL_XAI_ADAPTIVE_BATCH_CANDIDATES
+            if size <= self.attribution_batch_size
+        )
+
+    def _fingerprint(self, *, legacy_batch_size: Optional[int] = None) -> str:
         payload = {
             "profile": self.profile,
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
-            "attribution_batch_size": self.attribution_batch_size,
             "blur_kernel_size": self.blur_kernel_size,
             "overlay_alpha": self.overlay_alpha,
             "maximum_phrase_count": self.maximum_phrase_count,
@@ -173,8 +216,17 @@ class VisualXAIConfig:
             "method": QWEN_OCCLUSION_METHOD,
             "baseline": QWEN_OCCLUSION_BASELINE,
         }
+        if legacy_batch_size is not None:
+            payload["attribution_batch_size"] = legacy_batch_size
         rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        return self._fingerprint()
+
+    def legacy_configuration_fingerprint(self, batch_size: int) -> str:
+        return self._fingerprint(legacy_batch_size=batch_size)
 
     @classmethod
     def from_environment(
@@ -182,7 +234,7 @@ class VisualXAIConfig:
         cache_root: Path,
         *,
         environ: Optional[Mapping[str, str]] = None,
-        attribution_batch_size: int = 2,
+        attribution_batch_size: Optional[int] = None,
     ) -> "VisualXAIConfig":
         values = os.environ if environ is None else environ
         profile = values.get(VISUAL_XAI_PROFILE_ENV, "research").strip().lower()
@@ -210,12 +262,52 @@ class VisualXAIConfig:
                 VISUAL_XAI_RESEARCH_GRID_SIZE,
             }:
                 raise ValueError(f"{VISUAL_XAI_GRID_SIZE_ENV} must be 6 or 8")
+
+        raw_fixed_batch = values.get(VISUAL_XAI_BATCH_SIZE_ENV)
+        if raw_fixed_batch is not None and raw_fixed_batch.strip():
+            try:
+                batch_size = int(raw_fixed_batch)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{VISUAL_XAI_BATCH_SIZE_ENV} must be a positive integer"
+                ) from None
+            if batch_size < 1:
+                raise ValueError(
+                    f"{VISUAL_XAI_BATCH_SIZE_ENV} must be a positive integer"
+                )
+            batch_mode = "fixed"
+        elif attribution_batch_size is not None:
+            if type(attribution_batch_size) is not int or attribution_batch_size < 1:
+                raise ValueError("attribution_batch_size must be a positive integer")
+            batch_size = attribution_batch_size
+            batch_mode = "fixed"
+        else:
+            batch_mode = values.get(
+                VISUAL_XAI_BATCH_MODE_ENV, "adaptive"
+            ).strip().lower()
+            if batch_mode != "adaptive":
+                raise ValueError(
+                    f"{VISUAL_XAI_BATCH_MODE_ENV} must be adaptive unless "
+                    f"{VISUAL_XAI_BATCH_SIZE_ENV} supplies a fixed override"
+                )
+            raw_maximum = values.get(VISUAL_XAI_MAX_BATCH_SIZE_ENV, "8")
+            try:
+                batch_size = int(raw_maximum)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{VISUAL_XAI_MAX_BATCH_SIZE_ENV} must be one of 8, 4, 2, or 1"
+                ) from None
+            if batch_size not in VISUAL_XAI_ADAPTIVE_BATCH_CANDIDATES:
+                raise ValueError(
+                    f"{VISUAL_XAI_MAX_BATCH_SIZE_ENV} must be one of 8, 4, 2, or 1"
+                )
         return cls(
             cache_root=cache_root,
             profile=profile,
             grid_rows=grid,
             grid_columns=grid,
-            attribution_batch_size=attribution_batch_size,
+            attribution_batch_size=batch_size,
+            batch_mode=batch_mode,
         )
 
 
@@ -318,6 +410,7 @@ class VisualXAIAttributor:
         snapshot: VisualObservationSnapshot,
         raw_generation: str,
         maximum_phrases: int,
+        phrase_spans: Optional[Sequence[Tuple[str, int, int]]] = None,
     ) -> Tuple[VisualTargetSpan, ...]:
         text = snapshot.observation_text
         starts = [match.start() for match in re.finditer(re.escape(text), raw_generation)]
@@ -333,9 +426,12 @@ class VisualXAIAttributor:
                 end_character=observation_start + len(text),
             )
         ]
-        for phrase_index, (label, start, end) in enumerate(
-            cls.phrase_spans(text, maximum_phrases), start=1
-        ):
+        phrases = (
+            cls.phrase_spans(text, maximum_phrases)
+            if phrase_spans is None
+            else tuple(phrase_spans)
+        )
+        for phrase_index, (label, start, end) in enumerate(phrases, start=1):
             spans.append(
                 VisualTargetSpan(
                     span_id=f"phrase_{phrase_index:02d}",
@@ -353,7 +449,18 @@ class VisualXAIAttributor:
         source_frame: VisualFrame,
         all_frames: Sequence[VisualFrame],
         model_fingerprint: str,
+        *,
+        phrase_spans: Optional[Sequence[Tuple[str, int, int]]] = None,
+        legacy_batch_size: Optional[int] = None,
     ) -> str:
+        phrases = (
+            self.phrase_spans(
+                snapshot.observation_text,
+                self.config.maximum_phrase_count,
+            )
+            if phrase_spans is None
+            else tuple(phrase_spans)
+        )
         payload = {
             "method": QWEN_OCCLUSION_METHOD,
             "model_fingerprint": model_fingerprint,
@@ -368,22 +475,77 @@ class VisualXAIAttributor:
             "profile": self.config.profile,
             "grid_rows": self.config.grid_rows,
             "grid_columns": self.config.grid_columns,
-            "attribution_batch_size": self.config.attribution_batch_size,
             "blur_kernel_size": self.config.blur_kernel_size,
             "overlay_alpha": self.config.overlay_alpha,
             "configuration_version": self.config.configuration_version,
-            "configuration_fingerprint": self.config.configuration_fingerprint,
+            "configuration_fingerprint": (
+                self.config.configuration_fingerprint
+                if legacy_batch_size is None
+                else self.config.legacy_configuration_fingerprint(
+                    legacy_batch_size
+                )
+            ),
             "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
             "phrase_spans": [
                 {"label": label, "start": start, "end": end}
-                for label, start, end in self.phrase_spans(
-                    snapshot.observation_text,
-                    self.config.maximum_phrase_count,
-                )
+                for label, start, end in phrases
             ],
         }
+        if legacy_batch_size is not None:
+            payload["attribution_batch_size"] = legacy_batch_size
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _compatible_cache_keys(
+        self,
+        snapshot: VisualObservationSnapshot,
+        source_frame: VisualFrame,
+        all_frames: Sequence[VisualFrame],
+        model_fingerprint: str,
+        phrase_spans: Sequence[Tuple[str, int, int]],
+    ) -> Tuple[str, ...]:
+        """Return the scientific key followed by pre-adaptive legacy keys."""
+
+        current = self._cache_key(
+            snapshot,
+            source_frame,
+            all_frames,
+            model_fingerprint,
+            phrase_spans=phrase_spans,
+        )
+        legacy_sizes = tuple(
+            dict.fromkeys(
+                (
+                    self.config.attribution_batch_size,
+                    2,
+                    *VISUAL_XAI_ADAPTIVE_BATCH_CANDIDATES,
+                )
+            )
+        )
+        return (
+            current,
+            *(
+                self._cache_key(
+                    snapshot,
+                    source_frame,
+                    all_frames,
+                    model_fingerprint,
+                    phrase_spans=phrase_spans,
+                    legacy_batch_size=batch_size,
+                )
+                for batch_size in legacy_sizes
+            ),
+        )
+
+    def _load_compatible_cache(
+        self,
+        cache_keys: Sequence[str],
+    ) -> Optional[VisualAttributionArtifact]:
+        for cache_key in cache_keys:
+            artifact = self._load_cache(cache_key)
+            if artifact is not None:
+                return artifact
+        return None
 
     def _cache_paths(self, cache_key: str) -> Tuple[Path, Path]:
         category = f"xai_{cache_key}"
@@ -534,6 +696,152 @@ class VisualXAIAttributor:
         if not cv2_module.imwrite(str(target), variant):
             raise ValueError("could not write an occluded frame variant")
 
+    def _prepare_target_scoring(
+        self,
+        all_frames: Sequence[VisualFrame],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+    ) -> Any:
+        prepare = getattr(self.scorer, "prepare_target_scoring", None)
+        score_prepared = getattr(
+            self.scorer, "score_prepared_target_logprob_batch", None
+        )
+        if callable(prepare) and callable(score_prepared):
+            return prepare(tuple(all_frames), target_sequence, tuple(spans))
+        return None
+
+    def _score_target_batch(
+        self,
+        frame_batches: Sequence[Sequence[VisualFrame]],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+        prepared: Any,
+    ) -> List[VisualTargetScore]:
+        if prepared is not None:
+            return self.scorer.score_prepared_target_logprob_batch(
+                frame_batches, prepared
+            )
+        return self.scorer.score_target_logprob_batch(
+            frame_batches, target_sequence, spans
+        )
+
+    def _is_cuda_out_of_memory(self, error: BaseException) -> bool:
+        detector = getattr(self.scorer, "is_cuda_out_of_memory", None)
+        return bool(callable(detector) and detector(error))
+
+    def _clear_cuda_oom_cache(self) -> None:
+        clear = getattr(self.scorer, "clear_cuda_oom_cache", None)
+        if callable(clear):
+            clear()
+
+    @staticmethod
+    def _cleanup_paths(paths: Iterable[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _score_occlusion_grid(
+        self,
+        *,
+        image: Any,
+        blurred: Any,
+        source_frame: VisualFrame,
+        all_frames: Sequence[VisualFrame],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+        baseline: VisualTargetScore,
+        prepared: Any,
+        temporary_directory: Path,
+        cv2_module: Any,
+        started: float,
+    ) -> Tuple[Dict[str, List[float]], int, int, int]:
+        """Score one grid, retrying the full grid only after a genuine CUDA OOM."""
+
+        heavy_scorer_batches = 1  # The fixed, unoccluded baseline pass.
+        oom_retry_count = 0
+        cell_count = self.config.grid_rows * self.config.grid_columns
+        candidates = self.config.batch_candidates
+        for candidate_index, batch_size in enumerate(candidates):
+            raw_by_span: Dict[str, List[float]] = {
+                span.span_id: [] for span in spans
+            }
+            retry_smaller = False
+            for batch_start in range(0, cell_count, batch_size):
+                if self._clock() - started > self.config.timeout_seconds:
+                    raise TimeoutError("visual XAI attribution timeout")
+                batch_frames = []
+                temporary_paths = []
+                try:
+                    for cell_index in range(
+                        batch_start,
+                        min(batch_start + batch_size, cell_count),
+                    ):
+                        row, column = divmod(
+                            cell_index, self.config.grid_columns
+                        )
+                        path = temporary_directory / (
+                            f"variant_r{row:02d}_c{column:02d}.png"
+                        )
+                        self._write_variant(
+                            image, blurred, row, column, path, cv2_module
+                        )
+                        temporary_paths.append(path)
+                        batch_frames.append(
+                            tuple(
+                                replace(frame, frame_path=path)
+                                if frame.frame_id == source_frame.frame_id
+                                else frame
+                                for frame in all_frames
+                            )
+                        )
+                    heavy_scorer_batches += 1
+                    scores = self._score_target_batch(
+                        batch_frames,
+                        target_sequence,
+                        spans,
+                        prepared,
+                    )
+                except Exception as error:
+                    has_smaller_candidate = candidate_index + 1 < len(candidates)
+                    if (
+                        self.config.adaptive_batching
+                        and has_smaller_candidate
+                        and self._is_cuda_out_of_memory(error)
+                    ):
+                        oom_retry_count += 1
+                        self._clear_cuda_oom_cache()
+                        retry_smaller = True
+                        break
+                    raise _AttributionScoringFailure(
+                        effective_batch_size=batch_size,
+                        oom_retry_count=oom_retry_count,
+                        heavy_scorer_batches=heavy_scorer_batches,
+                    ) from error
+                finally:
+                    self._cleanup_paths(temporary_paths)
+
+                if len(scores) != len(batch_frames) or not all(
+                    isinstance(score, VisualTargetScore) for score in scores
+                ):
+                    raise ValueError("visual scorer returned an invalid batch")
+                for score in scores:
+                    for span in spans:
+                        raw_by_span[span.span_id].append(
+                            baseline.log_probability(span.span_id)
+                            - score.log_probability(span.span_id)
+                        )
+            if retry_smaller:
+                continue
+            return (
+                raw_by_span,
+                batch_size,
+                oom_retry_count,
+                heavy_scorer_batches,
+            )
+        raise RuntimeError("adaptive visual XAI batching exhausted")
+
     def _write_overlay(
         self,
         image: Any,
@@ -574,6 +882,10 @@ class VisualXAIAttributor:
         model_fingerprint: str,
         cache_key: str,
         reason: str,
+        *,
+        effective_batch_size: Optional[int] = None,
+        oom_retry_count: int = 0,
+        heavy_scorer_batches: int = 0,
     ) -> VisualAttributionArtifact:
         if reason not in _SAFE_UNAVAILABLE_REASONS:
             reason = "attribution_failed"
@@ -602,14 +914,26 @@ class VisualXAIAttributor:
             "configuration_version": self.config.configuration_version,
             "configuration_fingerprint": self.config.configuration_fingerprint,
             "phrase_policy": VISUAL_XAI_PHRASE_POLICY,
-            "heavy_scorer_batches": 0,
+            "heavy_scorer_batches": heavy_scorer_batches,
             "maps": (),
             "cache_key": cache_key,
+            "requested_batch_size": self.config.requested_batch_size,
+            "effective_batch_size": (
+                effective_batch_size or self.config.requested_batch_size
+            ),
+            "adaptive_batching": self.config.adaptive_batching,
+            "oom_retry_count": oom_retry_count,
         }
-        artifact_id = VisualAttributionArtifact.compute_identity(
-            {**payload, "maps": []}
+        provisional = VisualAttributionArtifact(
+            artifact_id="0" * 64,
+            **payload,
         )
-        return VisualAttributionArtifact(artifact_id=artifact_id, **payload)
+        return replace(
+            provisional,
+            artifact_id=VisualAttributionArtifact.compute_identity(
+                provisional.identity_payload()
+            ),
+        )
 
     def _attribute_frame(
         self,
@@ -620,7 +944,11 @@ class VisualXAIAttributor:
     ) -> VisualAttributionArtifact:
         model_fingerprint = self._model_fingerprint(snapshot, self.scorer)
         source_frame = self._source_frame(reference.frame_id, all_frames)
-        cache_key = self._cache_key(
+        phrases = self.phrase_spans(
+            snapshot.observation_text,
+            self.config.maximum_phrase_count,
+        )
+        cache_keys = self._compatible_cache_keys(
             snapshot,
             source_frame
             if source_frame is not None
@@ -635,8 +963,10 @@ class VisualXAIAttributor:
             ),
             all_frames,
             model_fingerprint,
+            phrases,
         )
-        cached = self._load_cache(cache_key)
+        cache_key = cache_keys[0]
+        cached = self._load_compatible_cache(cache_keys)
         if cached is not None:
             return self._rebind_cached_artifact(cached, snapshot)
         if source_frame is None or not source_frame.frame_path.is_file():
@@ -661,7 +991,10 @@ class VisualXAIAttributor:
             return artifact
         try:
             spans = self._target_spans(
-                snapshot, raw_generation, self.config.maximum_phrase_count
+                snapshot,
+                raw_generation,
+                self.config.maximum_phrase_count,
+                phrases,
             )
         except ValueError:
             artifact = self._unavailable(
@@ -692,57 +1025,38 @@ class VisualXAIAttributor:
             (self.config.blur_kernel_size, self.config.blur_kernel_size),
             sigmaX=0,
         )
-        baseline = self.scorer.score_target_logprob_batch(
-            [tuple(all_frames)], raw_generation, spans
-        )[0]
-        heavy_scorer_batches = 1
-        raw_by_span = {span.span_id: [] for span in spans}
+        prepared = self._prepare_target_scoring(
+            all_frames, raw_generation, spans
+        )
+        baseline_scores = self._score_target_batch(
+            [tuple(all_frames)], raw_generation, spans, prepared
+        )
+        if len(baseline_scores) != 1 or not isinstance(
+            baseline_scores[0], VisualTargetScore
+        ):
+            raise ValueError("visual scorer returned an invalid baseline")
+        baseline = baseline_scores[0]
         directory, _ = self._cache_paths(cache_key)
         temporary_directory = directory / "working"
         try:
-            cell_count = self.config.grid_rows * self.config.grid_columns
-            for batch_start in range(0, cell_count, self.config.attribution_batch_size):
-                if self._clock() - started > self.config.timeout_seconds:
-                    raise TimeoutError("visual XAI attribution timeout")
-                batch_frames = []
-                temporary_paths = []
-                for cell_index in range(
-                    batch_start,
-                    min(batch_start + self.config.attribution_batch_size, cell_count),
-                ):
-                    row, column = divmod(cell_index, self.config.grid_columns)
-                    path = temporary_directory / f"variant_r{row:02d}_c{column:02d}.png"
-                    self._write_variant(
-                        image, blurred, row, column, path, cv2_module
-                    )
-                    temporary_paths.append(path)
-                    batch_frames.append(
-                        tuple(
-                            replace(frame, frame_path=path)
-                            if frame.frame_id == source_frame.frame_id
-                            else frame
-                            for frame in all_frames
-                        )
-                    )
-                scores = self.scorer.score_target_logprob_batch(
-                    batch_frames, raw_generation, spans
-                )
-                heavy_scorer_batches += 1
-                if len(scores) != len(batch_frames) or not all(
-                    isinstance(score, VisualTargetScore) for score in scores
-                ):
-                    raise ValueError("visual scorer returned an invalid batch")
-                for score in scores:
-                    for span in spans:
-                        raw_by_span[span.span_id].append(
-                            baseline.log_probability(span.span_id)
-                            - score.log_probability(span.span_id)
-                        )
-                for path in temporary_paths:
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
+            (
+                raw_by_span,
+                effective_batch_size,
+                oom_retry_count,
+                heavy_scorer_batches,
+            ) = self._score_occlusion_grid(
+                image=image,
+                blurred=blurred,
+                source_frame=source_frame,
+                all_frames=all_frames,
+                target_sequence=raw_generation,
+                spans=spans,
+                baseline=baseline,
+                prepared=prepared,
+                temporary_directory=temporary_directory,
+                cv2_module=cv2_module,
+                started=started,
+            )
         finally:
             if temporary_directory.exists():
                 for child in temporary_directory.iterdir():
@@ -817,14 +1131,20 @@ class VisualXAIAttributor:
             "heavy_scorer_batches": heavy_scorer_batches,
             "maps": tuple(maps),
             "cache_key": cache_key,
+            "requested_batch_size": self.config.requested_batch_size,
+            "effective_batch_size": effective_batch_size,
+            "adaptive_batching": self.config.adaptive_batching,
+            "oom_retry_count": oom_retry_count,
         }
-        identity_payload = {
+        provisional = VisualAttributionArtifact(
+            artifact_id="0" * 64,
             **payload,
-            "maps": [item.to_dict() for item in maps],
-        }
-        artifact = VisualAttributionArtifact(
-            artifact_id=VisualAttributionArtifact.compute_identity(identity_payload),
-            **payload,
+        )
+        artifact = replace(
+            provisional,
+            artifact_id=VisualAttributionArtifact.compute_identity(
+                provisional.identity_payload()
+            ),
         )
         self._write_cache(artifact)
         return artifact
@@ -842,18 +1162,23 @@ class VisualXAIAttributor:
         if not all(isinstance(item, VisualFrame) for item in frames):
             raise TypeError("selected_frames must contain VisualFrame only")
         model_fingerprint = self._model_fingerprint(visual_snapshot, self.scorer)
+        phrases = self.phrase_spans(
+            visual_snapshot.observation_text,
+            self.config.maximum_phrase_count,
+        )
         artifacts = []
         for reference in visual_snapshot.frame_references:
             source_frame = self._source_frame(reference.frame_id, frames)
             if source_frame is None:
                 return None
-            cache_key = self._cache_key(
+            cache_keys = self._compatible_cache_keys(
                 visual_snapshot,
                 source_frame,
                 frames,
                 model_fingerprint,
+                phrases,
             )
-            artifact = self._load_cache(cache_key)
+            artifact = self._load_compatible_cache(cache_keys)
             if artifact is None:
                 return None
             artifacts.append(
@@ -884,6 +1209,37 @@ class VisualXAIAttributor:
                             snapshot, reference, frames, raw_generation
                         )
                     )
+                except _AttributionScoringFailure as failure:
+                    model_fingerprint = self._model_fingerprint(snapshot, self.scorer)
+                    source_frame = self._source_frame(reference.frame_id, frames)
+                    cache_key = self._cache_key(
+                        snapshot,
+                        source_frame
+                        if source_frame is not None
+                        else VisualFrame(
+                            frame_id=reference.frame_id,
+                            frame_path=Path("unavailable"),
+                            frame_index=reference.frame_index,
+                            timestamp_sec=reference.timestamp_seconds,
+                            frame_rank=reference.frame_rank,
+                            image_sha256=reference.image_sha256,
+                            retrieval_rank=reference.retrieval_rank,
+                        ),
+                        frames,
+                        model_fingerprint,
+                    )
+                    artifact = self._unavailable(
+                        snapshot,
+                        reference,
+                        model_fingerprint,
+                        cache_key,
+                        "attribution_failed",
+                        effective_batch_size=failure.effective_batch_size,
+                        oom_retry_count=failure.oom_retry_count,
+                        heavy_scorer_batches=failure.heavy_scorer_batches,
+                    )
+                    self._write_cache(artifact)
+                    artifacts.append(artifact)
                 except TimeoutError:
                     model_fingerprint = self._model_fingerprint(snapshot, self.scorer)
                     source_frame = self._source_frame(reference.frame_id, frames)

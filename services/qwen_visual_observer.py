@@ -126,6 +126,19 @@ class QwenVisualObservationResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class QwenPreparedTargetScoring:
+    """Image-independent state for one fixed teacher-forced target."""
+
+    frame_ids: Tuple[str, ...]
+    prompt: str
+    rendered_text: str
+    target_sequence: str
+    spans: Tuple[VisualTargetSpan, ...]
+    target_token_ids: Tuple[int, ...]
+    span_relative_indices: Tuple[Tuple[str, Tuple[int, ...]], ...]
+
+
 class QwenVisualObserver:
     def __init__(
         self,
@@ -417,22 +430,16 @@ Return JSON in this shape:
             materialized = materialized[0]
         return list(materialized)
 
-    def score_target_logprob_batch(
-        self,
-        frame_batches: Sequence[Sequence[VisualFrame]],
+    @staticmethod
+    def _validate_target_scoring_request(
+        frames: Sequence[VisualFrame],
         target_sequence: str,
         spans: Sequence[VisualTargetSpan],
-    ) -> List[VisualTargetScore]:
-        """Teacher-force the exact prior generation and score requested spans.
-
-        No decoding or free-form regeneration occurs. Each sample uses the same
-        claim-blind observer prompt and its supplied source-frame sequence.
-        """
-
-        batches = [tuple(frames) for frames in frame_batches]
+    ) -> Tuple[Tuple[VisualFrame, ...], Tuple[VisualTargetSpan, ...]]:
+        prepared_frames = tuple(frames)
         requested_spans = tuple(spans)
-        if not batches or any(not frames for frames in batches):
-            raise ValueError("frame_batches must contain non-empty frame sequences")
+        if not prepared_frames:
+            raise ValueError("frames must not be empty")
         if not isinstance(target_sequence, str) or not target_sequence:
             raise ValueError("target_sequence is required")
         if not requested_spans or not all(
@@ -441,42 +448,182 @@ Return JSON in this shape:
             raise TypeError("spans must contain VisualTargetSpan objects")
         if any(span.end_character > len(target_sequence) for span in requested_spans):
             raise ValueError("target span exceeds the fixed target sequence")
+        return prepared_frames, requested_spans
 
+    def prepare_target_scoring(
+        self,
+        frames: Sequence[VisualFrame],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+    ) -> QwenPreparedTargetScoring:
+        """Prepare fixed text/token/span state once without running the model.
+
+        Image decoding and processor tensor construction remain batch-specific.
+        The prompt, rendered target, target token IDs, deterministic spans, and
+        phrase-to-token mapping are invariant across Gaussian-blur variants.
+        """
+
+        prepared_frames, requested_spans = self._validate_target_scoring_request(
+            frames, target_sequence, spans
+        )
+        self.load()
+        prompt = self.build_prompt(prepared_frames)
+        content = [
+            {"type": "image", "image": str(frame.frame_path)}
+            for frame in prepared_frames
+        ]
+        content.append({"type": "text", "text": prompt})
+        user_messages = [{"role": "user", "content": content}]
+        messages = [
+            *user_messages,
+            {"role": "assistant", "content": target_sequence},
+        ]
+        prompt_rendered = self._processor.apply_chat_template(
+            user_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        rendered = self._processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        target_start = rendered.rfind(target_sequence)
+        if target_start < 0:
+            raise ValueError("fixed target is absent from the rendered prompt")
+        target_end = target_start + len(target_sequence)
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        if not callable(tokenizer):
+            raise RuntimeError("Qwen processor tokenizer offsets are unavailable")
+
+        try:
+            tokenized = tokenizer(
+                rendered,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            text_ids = self._flat_tokenizer_value(tokenized["input_ids"])
+            offsets = self._flat_tokenizer_value(tokenized["offset_mapping"])
+            target_text_indices = [
+                index
+                for index, offset in enumerate(offsets)
+                if len(offset) == 2
+                and int(offset[1]) > target_start
+                and int(offset[0]) < target_end
+            ]
+            if not target_text_indices:
+                raise ValueError("fixed target has no scoreable tokens")
+            target_token_ids = tuple(
+                int(text_ids[index]) for index in target_text_indices
+            )
+            span_relative_indices = []
+            for span in requested_spans:
+                absolute_start = target_start + span.start_character
+                absolute_end = target_start + span.end_character
+                relative_indices = tuple(
+                    target_index
+                    for target_index, text_index in enumerate(target_text_indices)
+                    if int(offsets[text_index][1]) > absolute_start
+                    and int(offsets[text_index][0]) < absolute_end
+                )
+                if not relative_indices:
+                    raise ValueError(f"target span {span.span_id!r} has no tokens")
+                span_relative_indices.append((span.span_id, relative_indices))
+        except (NotImplementedError, TypeError, ValueError):
+            full_tokenized = tokenizer(rendered, add_special_tokens=False)
+            prompt_tokenized = tokenizer(prompt_rendered, add_special_tokens=False)
+            full_text_ids = self._flat_tokenizer_value(full_tokenized["input_ids"])
+            prompt_text_ids = self._flat_tokenizer_value(
+                prompt_tokenized["input_ids"]
+            )
+            if full_text_ids[: len(prompt_text_ids)] != prompt_text_ids:
+                raise ValueError(
+                    "assistant target does not follow the generation prompt"
+                )
+            target_token_ids = tuple(
+                int(value) for value in full_text_ids[len(prompt_text_ids) :]
+            )
+            decode = getattr(tokenizer, "decode", None)
+            if not callable(decode):
+                raise RuntimeError("Qwen tokenizer decoding is unavailable")
+            decoded_prefixes = [""]
+            for end_index in range(1, len(target_token_ids) + 1):
+                decoded_prefixes.append(
+                    decode(
+                        target_token_ids[:end_index],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                )
+            decoded_assistant = decoded_prefixes[-1]
+            decoded_target_start = decoded_assistant.find(target_sequence)
+            if (
+                decoded_target_start < 0
+                or decoded_assistant.find(target_sequence, decoded_target_start + 1)
+                >= 0
+            ):
+                raise ValueError("decoded fixed target does not map uniquely")
+            span_relative_indices = []
+            for span in requested_spans:
+                absolute_start = decoded_target_start + span.start_character
+                absolute_end = decoded_target_start + span.end_character
+                relative_indices = tuple(
+                    index
+                    for index in range(len(target_token_ids))
+                    if len(decoded_prefixes[index + 1]) > absolute_start
+                    and len(decoded_prefixes[index]) < absolute_end
+                )
+                if not relative_indices:
+                    raise ValueError(
+                        f"target span {span.span_id!r} has no decoded tokens"
+                    )
+                span_relative_indices.append((span.span_id, relative_indices))
+
+        return QwenPreparedTargetScoring(
+            frame_ids=tuple(frame.frame_id for frame in prepared_frames),
+            prompt=prompt,
+            rendered_text=rendered,
+            target_sequence=target_sequence,
+            spans=requested_spans,
+            target_token_ids=target_token_ids,
+            span_relative_indices=tuple(span_relative_indices),
+        )
+
+    def score_prepared_target_logprob_batch(
+        self,
+        frame_batches: Sequence[Sequence[VisualFrame]],
+        prepared: QwenPreparedTargetScoring,
+    ) -> List[VisualTargetScore]:
+        """Score image variants using one immutable fixed-target preparation."""
+
+        if not isinstance(prepared, QwenPreparedTargetScoring):
+            raise TypeError("prepared must be QwenPreparedTargetScoring")
+        batches = [tuple(frames) for frames in frame_batches]
+        if not batches or any(not frames for frames in batches):
+            raise ValueError("frame_batches must contain non-empty frame sequences")
+        if any(
+            tuple(frame.frame_id for frame in frames) != prepared.frame_ids
+            for frames in batches
+        ):
+            raise ValueError("frame batch identity/order differs from prepared target")
         self.load()
         messages_batch = []
-        rendered_batch = []
-        prompt_rendered_batch = []
         for frames in batches:
-            prompt = self.build_prompt(frames)
             content = [
                 {"type": "image", "image": str(frame.frame_path)}
                 for frame in frames
             ]
-            content.append({"type": "text", "text": prompt})
-            user_messages = [{"role": "user", "content": content}]
-            messages = [
-                *user_messages,
-                {"role": "assistant", "content": target_sequence},
-            ]
-            messages_batch.append(messages)
-            prompt_rendered_batch.append(
-                self._processor.apply_chat_template(
-                    user_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            )
-            rendered_batch.append(
-                self._processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+            content.append({"type": "text", "text": prepared.prompt})
+            messages_batch.append(
+                [
+                    {"role": "user", "content": content},
+                    {"role": "assistant", "content": prepared.target_sequence},
+                ]
             )
 
         image_inputs, video_inputs = self._process_vision_info(messages_batch)
         inputs = self._processor(
-            text=rendered_batch,
+            text=[prepared.rendered_text] * len(batches),
             images=image_inputs,
             videos=video_inputs,
             padding=True,
@@ -484,17 +631,11 @@ Return JSON in this shape:
         )
         inputs = inputs.to(self._device) if hasattr(inputs, "to") else inputs
 
-        tokenizer = getattr(self._processor, "tokenizer", None)
-        if not callable(tokenizer):
-            raise RuntimeError("Qwen processor tokenizer offsets are unavailable")
         mappings = []
         input_ids_batch = inputs["input_ids"]
         attention_batch = inputs.get("attention_mask")
-        for row_index, rendered in enumerate(rendered_batch):
-            target_start = rendered.rfind(target_sequence)
-            if target_start < 0:
-                raise ValueError("fixed target is absent from the rendered prompt")
-            target_end = target_start + len(target_sequence)
+        relative_by_span = dict(prepared.span_relative_indices)
+        for row_index in range(len(batches)):
             raw_ids = input_ids_batch[row_index]
             raw_ids = raw_ids.tolist() if hasattr(raw_ids, "tolist") else list(raw_ids)
             if attention_batch is None:
@@ -510,128 +651,22 @@ Return JSON in this shape:
                     index for index, value in enumerate(raw_mask) if int(value) != 0
                 ]
             active_ids = [int(raw_ids[index]) for index in active_positions]
-            try:
-                tokenized = tokenizer(
-                    rendered,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
+            sequence_start = self._find_unique_subsequence(
+                active_ids, prepared.target_token_ids
+            )
+            span_positions = {}
+            for span in prepared.spans:
+                relative_indices = relative_by_span[span.span_id]
+                model_positions = tuple(
+                    active_positions[sequence_start + index]
+                    for index in relative_indices
                 )
-                text_ids = self._flat_tokenizer_value(tokenized["input_ids"])
-                offsets = self._flat_tokenizer_value(tokenized["offset_mapping"])
-                target_text_indices = [
-                    index
-                    for index, offset in enumerate(offsets)
-                    if len(offset) == 2
-                    and int(offset[1]) > target_start
-                    and int(offset[0]) < target_end
-                ]
-                if not target_text_indices:
-                    raise ValueError("fixed target has no scoreable tokens")
-                target_token_ids = [text_ids[index] for index in target_text_indices]
-                sequence_start = self._find_unique_subsequence(
-                    active_ids, [int(value) for value in target_token_ids]
+                model_token_ids = tuple(
+                    prepared.target_token_ids[index] for index in relative_indices
                 )
-                span_positions = {}
-                for span in requested_spans:
-                    absolute_start = target_start + span.start_character
-                    absolute_end = target_start + span.end_character
-                    relative_indices = [
-                        target_index
-                        for target_index, text_index in enumerate(target_text_indices)
-                        if int(offsets[text_index][1]) > absolute_start
-                        and int(offsets[text_index][0]) < absolute_end
-                    ]
-                    if not relative_indices:
-                        raise ValueError(
-                            f"target span {span.span_id!r} has no tokens"
-                        )
-                    model_positions = tuple(
-                        active_positions[sequence_start + index]
-                        for index in relative_indices
-                    )
-                    model_token_ids = tuple(
-                        int(target_token_ids[index]) for index in relative_indices
-                    )
-                    if any(position < 1 for position in model_positions):
-                        raise ValueError(
-                            "fixed target begins before a scoreable position"
-                        )
-                    span_positions[span.span_id] = (
-                        model_positions,
-                        model_token_ids,
-                    )
-            except (NotImplementedError, TypeError, ValueError):
-                full_tokenized = tokenizer(rendered, add_special_tokens=False)
-                prompt_tokenized = tokenizer(
-                    prompt_rendered_batch[row_index], add_special_tokens=False
-                )
-                full_text_ids = self._flat_tokenizer_value(
-                    full_tokenized["input_ids"]
-                )
-                prompt_text_ids = self._flat_tokenizer_value(
-                    prompt_tokenized["input_ids"]
-                )
-                if full_text_ids[: len(prompt_text_ids)] != prompt_text_ids:
-                    raise ValueError(
-                        "assistant target does not follow the generation prompt"
-                    )
-                assistant_ids = [
-                    int(value) for value in full_text_ids[len(prompt_text_ids) :]
-                ]
-                sequence_start = self._find_unique_subsequence(
-                    active_ids, assistant_ids
-                )
-                decode = getattr(tokenizer, "decode", None)
-                if not callable(decode):
-                    raise RuntimeError("Qwen tokenizer decoding is unavailable")
-                decoded_prefixes = [""]
-                for end_index in range(1, len(assistant_ids) + 1):
-                    decoded_prefixes.append(
-                        decode(
-                            assistant_ids[:end_index],
-                            skip_special_tokens=True,
-                            clean_up_tokenization_spaces=False,
-                        )
-                    )
-                decoded_assistant = decoded_prefixes[-1]
-                decoded_target_start = decoded_assistant.find(target_sequence)
-                if (
-                    decoded_target_start < 0
-                    or decoded_assistant.find(
-                        target_sequence, decoded_target_start + 1
-                    )
-                    >= 0
-                ):
-                    raise ValueError("decoded fixed target does not map uniquely")
-                span_positions = {}
-                for span in requested_spans:
-                    absolute_start = decoded_target_start + span.start_character
-                    absolute_end = decoded_target_start + span.end_character
-                    relative_indices = [
-                        index
-                        for index in range(len(assistant_ids))
-                        if len(decoded_prefixes[index + 1]) > absolute_start
-                        and len(decoded_prefixes[index]) < absolute_end
-                    ]
-                    if not relative_indices:
-                        raise ValueError(
-                            f"target span {span.span_id!r} has no decoded tokens"
-                        )
-                    model_positions = tuple(
-                        active_positions[sequence_start + index]
-                        for index in relative_indices
-                    )
-                    model_token_ids = tuple(
-                        assistant_ids[index] for index in relative_indices
-                    )
-                    if any(position < 1 for position in model_positions):
-                        raise ValueError(
-                            "fixed target begins before a scoreable position"
-                        )
-                    span_positions[span.span_id] = (
-                        model_positions,
-                        model_token_ids,
-                    )
+                if any(position < 1 for position in model_positions):
+                    raise ValueError("fixed target begins before a scoreable position")
+                span_positions[span.span_id] = (model_positions, model_token_ids)
             mappings.append(span_positions)
 
         with self._torch.inference_mode():
@@ -641,7 +676,7 @@ Return JSON in this shape:
         for row_index, span_positions in enumerate(mappings):
             span_scores = []
             span_counts = []
-            for span in requested_spans:
+            for span in prepared.spans:
                 positions, token_ids = span_positions[span.span_id]
                 total = 0.0
                 for position, token_id in zip(positions, token_ids):
@@ -659,6 +694,53 @@ Return JSON in this shape:
                 )
             )
         return results
+
+    def is_cuda_out_of_memory(self, error: BaseException) -> bool:
+        """Recognize only PyTorch's concrete CUDA OOM exception types."""
+
+        torch_module = self._torch
+        if (
+            torch_module is None
+            or not isinstance(self._device, str)
+            or not self._device.startswith("cuda")
+        ):
+            return False
+        oom_type = getattr(
+            getattr(torch_module, "cuda", None), "OutOfMemoryError", None
+        )
+        return isinstance(oom_type, type) and isinstance(error, oom_type)
+
+    def clear_cuda_oom_cache(self) -> None:
+        """Release cached CUDA blocks only at an adaptive OOM retry boundary."""
+
+        cuda = getattr(self._torch, "cuda", None)
+        empty_cache = getattr(cuda, "empty_cache", None)
+        if (
+            isinstance(self._device, str)
+            and self._device.startswith("cuda")
+            and callable(empty_cache)
+        ):
+            empty_cache()
+
+    def score_target_logprob_batch(
+        self,
+        frame_batches: Sequence[Sequence[VisualFrame]],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+    ) -> List[VisualTargetScore]:
+        """Teacher-force the exact prior generation and score requested spans.
+
+        No decoding or free-form regeneration occurs. Each sample uses the same
+        claim-blind observer prompt and its supplied source-frame sequence.
+        """
+
+        batches = [tuple(frames) for frames in frame_batches]
+        if not batches:
+            raise ValueError("frame_batches must contain non-empty frame sequences")
+        prepared = self.prepare_target_scoring(
+            batches[0], target_sequence, spans
+        )
+        return self.score_prepared_target_logprob_batch(batches, prepared)
 
     def observe(self, frames: Sequence[VisualFrame]) -> QwenVisualObservationResult:
         selected = list(frames)

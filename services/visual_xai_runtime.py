@@ -55,6 +55,10 @@ class VisualXAIStatusSnapshot:
     grid_rows: int
     grid_columns: int
     attribution_batch_size: int
+    requested_batch_size: int
+    effective_batch_size: Optional[int]
+    adaptive_batching: bool
+    oom_retry_count: int
     configuration_fingerprint: str
     source_frame_count: int
     observer_runtime_ms: float
@@ -76,6 +80,10 @@ class VisualXAIStatusSnapshot:
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
             "attribution_batch_size": self.attribution_batch_size,
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.effective_batch_size,
+            "adaptive_batching": self.adaptive_batching,
+            "oom_retry_count": self.oom_retry_count,
             "configuration_fingerprint": self.configuration_fingerprint,
             "source_frame_count": self.source_frame_count,
             "cache_hit": self.cache_hit,
@@ -101,6 +109,10 @@ class _VisualXAIRequestRecord:
     queue_wait_ms: Optional[float] = None
     compute_time_ms: Optional[float] = None
     heavy_scorer_batches: int = 0
+    requested_batch_size: Optional[int] = None
+    effective_batch_size: Optional[int] = None
+    adaptive_batching: bool = False
+    oom_retry_count: int = 0
     unavailable_reason: Optional[str] = None
     future: Optional[Future] = field(default=None, repr=False)
 
@@ -334,6 +346,10 @@ class VisualXAIRuntimeService:
             "queue_wait_ms": record.queue_wait_ms,
             "compute_time_ms": record.compute_time_ms,
             "heavy_scorer_batches": record.heavy_scorer_batches,
+            "requested_batch_size": record.requested_batch_size,
+            "effective_batch_size": record.effective_batch_size,
+            "adaptive_batching": record.adaptive_batching,
+            "oom_retry_count": record.oom_retry_count,
             "unavailable_reason": record.unavailable_reason,
             "artifact_cache_keys": [item.cache_key for item in record.artifacts],
         }
@@ -387,6 +403,25 @@ class VisualXAIRuntimeService:
                 queue_wait_ms=payload.get("queue_wait_ms"),
                 compute_time_ms=payload.get("compute_time_ms"),
                 heavy_scorer_batches=int(payload.get("heavy_scorer_batches", 0)),
+                requested_batch_size=payload.get(
+                    "requested_batch_size",
+                    self.attributor.config.requested_batch_size,
+                ),
+                effective_batch_size=payload.get(
+                    "effective_batch_size",
+                    (
+                        min(item.effective_batch_size for item in artifacts)
+                        if artifacts
+                        else None
+                    ),
+                ),
+                adaptive_batching=bool(
+                    payload.get(
+                        "adaptive_batching",
+                        self.attributor.config.adaptive_batching,
+                    )
+                ),
+                oom_retry_count=int(payload.get("oom_retry_count", 0)),
                 unavailable_reason=payload.get("unavailable_reason"),
             )
         except (
@@ -438,6 +473,12 @@ class VisualXAIRuntimeService:
                         raw_generation=raw_generation,
                         request_fingerprint=fingerprint,
                         observer_runtime_ms=float(observer_runtime_ms),
+                        requested_batch_size=(
+                            self.attributor.config.requested_batch_size
+                        ),
+                        adaptive_batching=(
+                            self.attributor.config.adaptive_batching
+                        ),
                     )
                 self._records[key] = record
                 self._persist(record)
@@ -464,6 +505,12 @@ class VisualXAIRuntimeService:
             grid_rows=config.grid_rows,
             grid_columns=config.grid_columns,
             attribution_batch_size=config.attribution_batch_size,
+            requested_batch_size=(
+                record.requested_batch_size or config.requested_batch_size
+            ),
+            effective_batch_size=record.effective_batch_size,
+            adaptive_batching=record.adaptive_batching,
+            oom_retry_count=record.oom_retry_count,
             configuration_fingerprint=config.configuration_fingerprint,
             source_frame_count=len(record.snapshot.frame_references),
             observer_runtime_ms=record.observer_runtime_ms,
@@ -512,6 +559,12 @@ class VisualXAIRuntimeService:
                     None,
                 )
                 record.heavy_scorer_batches = 0
+                record.requested_batch_size = self.attributor.config.requested_batch_size
+                record.effective_batch_size = min(
+                    item.effective_batch_size for item in cached
+                )
+                record.adaptive_batching = self.attributor.config.adaptive_batching
+                record.oom_retry_count = 0
                 self._persist(record)
                 _LOGGER.info("VISUAL_XAI_CACHE_HIT unit=%s", unit_id)
                 return self._snapshot(record)
@@ -569,6 +622,16 @@ class VisualXAIRuntimeService:
                 record.heavy_scorer_batches = sum(
                     item.heavy_scorer_batches for item in artifacts
                 )
+                record.requested_batch_size = self.attributor.config.requested_batch_size
+                record.effective_batch_size = (
+                    min(item.effective_batch_size for item in artifacts)
+                    if artifacts
+                    else None
+                )
+                record.adaptive_batching = self.attributor.config.adaptive_batching
+                record.oom_retry_count = sum(
+                    item.oom_retry_count for item in artifacts
+                )
                 record.unavailable_reason = reason
                 self._persist(record)
                 _LOGGER.info(
@@ -584,6 +647,7 @@ class VisualXAIRuntimeService:
                 record.cache_hit = False
                 record.unavailable_reason = VISUAL_XAI_FAILED_REASON
                 record.compute_time_ms = None
+                record.effective_batch_size = None
                 self._persist(record)
 
     def wait_for_terminal(

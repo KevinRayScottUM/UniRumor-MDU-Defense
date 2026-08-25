@@ -18,8 +18,11 @@ from schemas import (
 )
 from services.siglip_visual_retriever import VisualFrame
 from services.visual_xai_attributor import (
+    VISUAL_XAI_BATCH_MODE_ENV,
+    VISUAL_XAI_BATCH_SIZE_ENV,
     VISUAL_XAI_CONFIGURATION_VERSION,
     VISUAL_XAI_GRID_SIZE_ENV,
+    VISUAL_XAI_MAX_BATCH_SIZE_ENV,
     VISUAL_XAI_PROFILE_ENV,
     VisualXAIAttributor,
     VisualXAIConfig,
@@ -153,8 +156,33 @@ class VisualXAIProfileTests(unittest.TestCase):
         self.assertEqual((public.grid_rows, public.grid_columns), (6, 6))
         self.assertEqual((research.grid_rows, research.grid_columns), (8, 8))
         self.assertEqual((override.grid_rows, override.grid_columns), (8, 8))
-        self.assertEqual(1 + 36 // public.attribution_batch_size, 19)
-        self.assertEqual(1 + 64 // research.attribution_batch_size, 33)
+        self.assertTrue(public.adaptive_batching)
+        self.assertTrue(research.adaptive_batching)
+        self.assertEqual(public.batch_candidates, (8, 4, 2, 1))
+        self.assertEqual(1 + (36 + 8 - 1) // 8, 6)
+        self.assertEqual(1 + (64 + 8 - 1) // 8, 9)
+
+    def test_fixed_override_wins_and_adaptive_maximum_is_bounded(self):
+        root = Path("/tmp/visual-xai-profile-fixture")
+        fixed = VisualXAIConfig.from_environment(
+            root,
+            environ={
+                VISUAL_XAI_BATCH_MODE_ENV: "adaptive",
+                VISUAL_XAI_BATCH_SIZE_ENV: "3",
+                VISUAL_XAI_MAX_BATCH_SIZE_ENV: "8",
+            },
+        )
+        bounded = VisualXAIConfig.from_environment(
+            root,
+            environ={
+                VISUAL_XAI_BATCH_MODE_ENV: "adaptive",
+                VISUAL_XAI_MAX_BATCH_SIZE_ENV: "4",
+            },
+        )
+        self.assertEqual("fixed", fixed.batch_mode)
+        self.assertEqual((3,), fixed.batch_candidates)
+        self.assertEqual("adaptive", bounded.batch_mode)
+        self.assertEqual((4, 2, 1), bounded.batch_candidates)
 
     def test_invalid_profile_grid_and_concurrency_are_rejected(self):
         root = Path("/tmp/visual-xai-profile-fixture")
@@ -172,6 +200,11 @@ class VisualXAIProfileTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             visual_xai_max_concurrency({"MDU_VISUAL_XAI_MAX_CONCURRENCY": "0"})
+        with self.assertRaises(ValueError):
+            VisualXAIConfig.from_environment(
+                root,
+                environ={VISUAL_XAI_MAX_BATCH_SIZE_ENV: "6"},
+            )
 
 
 class VisualXAIRuntimeServiceTests(unittest.TestCase):
@@ -245,6 +278,13 @@ class VisualXAIRuntimeServiceTests(unittest.TestCase):
             self.assertIs(finished.state, VisualXAIState.READY)
             self.assertEqual(compute.call_count, 1)
             self.assertEqual(finished.heavy_scorer_batches, 19)
+            self.assertEqual(finished.requested_batch_size, 2)
+            self.assertEqual(finished.effective_batch_size, 2)
+            self.assertFalse(finished.adaptive_batching)
+            self.assertEqual(finished.oom_retry_count, 0)
+            self.assertEqual(
+                finished.to_public_dict()["effective_batch_size"], 2
+            )
 
     def test_cache_hit_bypasses_model_computation_and_survives_reload(self):
         service = self._service()
@@ -265,6 +305,7 @@ class VisualXAIRuntimeServiceTests(unittest.TestCase):
             self.assertIs(ready.state, VisualXAIState.READY)
             self.assertTrue(ready.cache_hit)
             self.assertEqual(ready.heavy_scorer_batches, 0)
+            self.assertEqual(ready.oom_retry_count, 0)
         self.assertTrue(service.shutdown(1))
 
         reloaded = self._service()
@@ -382,6 +423,41 @@ class VisualXAIRuntimeServiceTests(unittest.TestCase):
             ),
             6,
         )
+
+    def test_execution_batch_size_does_not_change_scientific_cache_key(self):
+        model = self.attributor._model_fingerprint(
+            self.snapshot, self.attributor.scorer
+        )
+        keys = []
+        fingerprints = []
+        for batch_size in (1, 2, 4, 8):
+            attributor = VisualXAIAttributor(
+                _UnusedScorer(),
+                VisualXAIConfig(
+                    cache_root=self.root / f"batch-{batch_size}",
+                    profile="public",
+                    grid_rows=6,
+                    grid_columns=6,
+                    attribution_batch_size=batch_size,
+                ),
+            )
+            keys.append(
+                attributor._cache_key(
+                    self.snapshot, self.frame, (self.frame,), model
+                )
+            )
+            fingerprints.append(attributor.config.configuration_fingerprint)
+        self.assertEqual(1, len(set(keys)))
+        self.assertEqual(1, len(set(fingerprints)))
+
+    def test_old_artifact_shape_uses_backward_compatible_batch_metadata(self):
+        self.assertEqual(2, self.artifact.requested_batch_size)
+        self.assertEqual(2, self.artifact.effective_batch_size)
+        self.assertFalse(self.artifact.adaptive_batching)
+        self.assertEqual(0, self.artifact.oom_retry_count)
+        serialized = self.artifact.to_dict()
+        self.assertEqual(2, serialized["requested_batch_size"])
+        self.assertNotIn(str(self.root), str(serialized))
 
     def test_registration_rejects_source_frame_outside_runtime_cache(self):
         service = self._service()
