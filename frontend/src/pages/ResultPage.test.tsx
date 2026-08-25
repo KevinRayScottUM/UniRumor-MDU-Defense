@@ -5,6 +5,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../api";
 import { AppRoutes } from "../app/App";
 import { apiClient } from "../app/api";
+import {
+  VISUAL_XAI_QA_FRAME,
+  VISUAL_XAI_QA_OBSERVATION,
+  VISUAL_XAI_QA_ORIGINAL,
+  VISUAL_XAI_QA_PHRASE_HEATMAP,
+  VISUAL_XAI_QA_WHOLE_HEATMAP,
+} from "../test/visualXaiFixture";
 import type {
   DisplayVerdict,
   JobResultResponse,
@@ -309,6 +316,98 @@ describe("explainable result experience", () => {
       within(dialog).getByRole("img", { name: "2 grounded OCR regions" }),
     ).toBeVisible();
 
+  });
+
+  it("renders faithful visual XAI, switches phrase maps, and preserves lightbox access", async () => {
+    const visual = makeUnit("visual-xai-1", {
+      source_type: "visual_observation",
+      text: VISUAL_XAI_QA_OBSERVATION,
+      frame_id: "F001",
+      frame_ids: ["F001"],
+      evidence_refs: ["F001"],
+      producer: "Qwen/Qwen2.5-VL-7B-Instruct",
+      eligible_for_frozen_g1: false,
+      selection_score: null,
+      logits: null,
+      observation_type: "scene",
+      evidence_frames: [VISUAL_XAI_QA_FRAME],
+    });
+    vi.spyOn(apiClient, "getJobResult").mockResolvedValueOnce(
+      makeResultResponse({ supplemental: [visual] }),
+    );
+
+    renderResult();
+
+    const viewer = await screen.findByRole("region", {
+      name: "XAI attribution for F001",
+    });
+    expect(within(viewer).getByText("Qwen occlusion attribution")).toBeVisible();
+    expect(within(viewer).getByText("Occlusion attribution")).toBeVisible();
+    expect(within(viewer).getByText(/does not affect the authoritative verification verdict/)).toBeVisible();
+    expect(within(viewer).getByText(/does not participate in the Frozen G1 verdict/)).toBeVisible();
+    expect(within(viewer).getByAltText("F001 XAI attribution")).toHaveAttribute(
+      "src",
+      VISUAL_XAI_QA_WHOLE_HEATMAP,
+    );
+
+    fireEvent.click(within(viewer).getByRole("button", { name: "Microphones" }));
+    expect(within(viewer).getByAltText("F001 XAI attribution")).toHaveAttribute(
+      "src",
+      VISUAL_XAI_QA_PHRASE_HEATMAP,
+    );
+    expect(within(viewer).getByText(/support for the phrase “Microphones”/)).toBeVisible();
+
+    const thumbnail = screen.getByRole("button", { name: "Inspect F001" });
+    thumbnail.focus();
+    fireEvent.click(thumbnail);
+    let dialog = screen.getByRole("dialog", { name: "F001" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Original" }));
+    expect(within(dialog).getByAltText("F001 original")).toHaveAttribute("src", VISUAL_XAI_QA_ORIGINAL);
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "F001" })).not.toBeInTheDocument());
+    expect(thumbnail).toHaveFocus();
+
+    fireEvent.click(thumbnail);
+    dialog = screen.getByRole("dialog", { name: "F001" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close evidence viewer" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "F001" })).not.toBeInTheDocument());
+
+    fireEvent.click(thumbnail);
+    dialog = screen.getByRole("dialog", { name: "F001" });
+    fireEvent.click(dialog);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "F001" })).not.toBeInTheDocument());
+  });
+
+  it("shows an explicit unavailable state for older visual results without XAI", async () => {
+    const visual = makeUnit("visual-legacy", {
+      source_type: "visual_observation",
+      text: "A generic person stands near a stage.",
+      frame_id: "F002",
+      frame_ids: ["F002"],
+      eligible_for_frozen_g1: false,
+      selection_score: null,
+      logits: null,
+      evidence_frames: [
+        {
+          frame_id: "F002",
+          frame_index: 30,
+          timestamp: 1.2,
+          original_image: null,
+          annotated_image: null,
+          bbox: null,
+          regions: [],
+          explanation: "Frame metadata only.",
+        },
+      ],
+    });
+    vi.spyOn(apiClient, "getJobResult").mockResolvedValueOnce(
+      makeResultResponse({ supplemental: [visual] }),
+    );
+
+    renderResult();
+
+    expect(await screen.findByText("XAI attribution unavailable")).toBeVisible();
+    expect(screen.getByText("This older result does not contain an XAI artifact.")).toBeVisible();
   });
 
   it("maps failed, expired, and not-completed public errors", async () => {

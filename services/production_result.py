@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from schemas import (
     DisplayVerdict,
@@ -14,6 +14,9 @@ from schemas import (
     ModelVerdict,
     RuntimeUnit,
     SourceType,
+    VISUAL_XAI_BOUNDARY,
+    VISUAL_XAI_DISCLAIMER,
+    VisualAttributionArtifact,
 )
 from services.evidence_sufficiency_policy import (
     EvidenceSufficiencyAssessment,
@@ -91,6 +94,78 @@ class ProductionEvidenceRegion:
 
 
 @dataclass(frozen=True)
+class ProductionVisualXAIMap:
+    map_id: str
+    scope: str
+    label: str
+    heatmap_image: Optional[str]
+    target_token_count: int
+    baseline_target_log_probability: float
+    raw_importance: Tuple[Tuple[float, ...], ...]
+    normalized_importance: Tuple[Tuple[float, ...], ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "map_id": self.map_id,
+            "scope": self.scope,
+            "label": self.label,
+            "heatmap_image": self.heatmap_image,
+            "target_token_count": self.target_token_count,
+            "baseline_target_log_probability": self.baseline_target_log_probability,
+            "raw_importance": [list(row) for row in self.raw_importance],
+            "normalized_importance": [
+                list(row) for row in self.normalized_importance
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class ProductionVisualXAI:
+    status: str
+    unavailable_reason: Optional[str]
+    method: str
+    model_id: str
+    model_revision: str
+    model_fingerprint: str
+    source_frame_sha256: str
+    observation_unit_id: str
+    observation_text_sha256: str
+    raw_generation_sha256: str
+    grid_rows: int
+    grid_columns: int
+    occlusion_baseline: str
+    configuration_version: str
+    phrase_policy: str
+    disclaimer: str
+    scientific_boundary: str
+    attribution_maps: Tuple[ProductionVisualXAIMap, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "unavailable_reason": self.unavailable_reason,
+            "method": self.method,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "model_fingerprint": self.model_fingerprint,
+            "source_frame_sha256": self.source_frame_sha256,
+            "observation_unit_id": self.observation_unit_id,
+            "observation_text_sha256": self.observation_text_sha256,
+            "raw_generation_sha256": self.raw_generation_sha256,
+            "grid_rows": self.grid_rows,
+            "grid_columns": self.grid_columns,
+            "occlusion_baseline": self.occlusion_baseline,
+            "configuration_version": self.configuration_version,
+            "phrase_policy": self.phrase_policy,
+            "disclaimer": self.disclaimer,
+            "scientific_boundary": self.scientific_boundary,
+            "attribution_maps": [
+                item.to_dict() for item in self.attribution_maps
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class ProductionEvidenceFrame:
     frame_id: Optional[str]
     frame_index: Optional[int]
@@ -100,6 +175,7 @@ class ProductionEvidenceFrame:
     bbox: Optional[Tuple[float, float, float, float]]
     regions: Tuple[ProductionEvidenceRegion, ...]
     explanation: str
+    xai: Optional[ProductionVisualXAI] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -111,6 +187,7 @@ class ProductionEvidenceFrame:
             "bbox": None if self.bbox is None else list(self.bbox),
             "regions": [region.to_dict() for region in self.regions],
             "explanation": self.explanation,
+            "xai": None if self.xai is None else self.xai.to_dict(),
         }
 
 
@@ -383,6 +460,7 @@ class ProductionResultBuilder:
         self,
         unit: RuntimeUnit,
         remaining_bytes: list,
+        xai_by_frame: Mapping[Tuple[str, str], VisualAttributionArtifact],
     ) -> Tuple[ProductionEvidenceFrame, ...]:
         referenced = unit.provenance.details.get("referenced_frames")
         metadata = (
@@ -405,9 +483,15 @@ class ProductionResultBuilder:
             if not isinstance(item, dict):
                 continue
             image = self._image_data_url(item.get("frame_path"), remaining_bytes)
+            frame_id = _optional_text(item.get("frame_id"))
+            artifact = (
+                None
+                if frame_id is None
+                else xai_by_frame.get((unit.unit_id, frame_id))
+            )
             frames.append(
                 ProductionEvidenceFrame(
-                    frame_id=_optional_text(item.get("frame_id")),
+                    frame_id=frame_id,
                     frame_index=_optional_index(item.get("frame_index")),
                     timestamp=_optional_number(item.get("timestamp_sec")),
                     original_image=image,
@@ -415,9 +499,11 @@ class ProductionResultBuilder:
                     bbox=None,
                     regions=(),
                     explanation=(
-                        "This observation is grounded at frame level; localized "
-                        "object, attention, and identity regions were not provided."
+                        "This is an actual observer source frame. Visual localization "
+                        "is available only when a model-derived attribution artifact "
+                        "is attached below."
                     ),
+                    xai=self._public_xai(artifact, remaining_bytes),
                 )
             )
         return tuple(frames)
@@ -426,21 +512,70 @@ class ProductionResultBuilder:
         self,
         unit: RuntimeUnit,
         remaining_bytes: list,
+        xai_by_frame: Mapping[Tuple[str, str], VisualAttributionArtifact],
     ) -> Tuple[ProductionEvidenceFrame, ...]:
         if unit.source_type is SourceType.OCR:
             return self._ocr_frames(unit, remaining_bytes)
         if unit.source_type is SourceType.VISUAL_OBSERVATION:
-            return self._visual_frames(unit, remaining_bytes)
+            return self._visual_frames(unit, remaining_bytes, xai_by_frame)
         return ()
+
+    def _public_xai(
+        self,
+        artifact: Optional[VisualAttributionArtifact],
+        remaining_bytes: list,
+    ) -> Optional[ProductionVisualXAI]:
+        if artifact is None:
+            return None
+        maps = tuple(
+            ProductionVisualXAIMap(
+                map_id=item.map_id,
+                scope=item.scope,
+                label=item.label,
+                heatmap_image=self._image_data_url(
+                    item.overlay_image_path, remaining_bytes
+                ),
+                target_token_count=item.target_token_count,
+                baseline_target_log_probability=(
+                    item.baseline_target_log_probability
+                ),
+                raw_importance=item.raw_importance,
+                normalized_importance=item.normalized_importance,
+            )
+            for item in artifact.maps
+        )
+        return ProductionVisualXAI(
+            status=artifact.status,
+            unavailable_reason=artifact.unavailable_reason,
+            method=artifact.method,
+            model_id=artifact.model_id,
+            model_revision=artifact.model_revision,
+            model_fingerprint=artifact.model_fingerprint,
+            source_frame_sha256=artifact.source_frame_sha256,
+            observation_unit_id=artifact.observation_unit_id,
+            observation_text_sha256=artifact.observation_text_sha256,
+            raw_generation_sha256=artifact.raw_generation_sha256,
+            grid_rows=artifact.grid_rows,
+            grid_columns=artifact.grid_columns,
+            occlusion_baseline=artifact.occlusion_baseline,
+            configuration_version=artifact.configuration_version,
+            phrase_policy=artifact.phrase_policy,
+            disclaimer=VISUAL_XAI_DISCLAIMER,
+            scientific_boundary=VISUAL_XAI_BOUNDARY,
+            attribution_maps=maps,
+        )
 
     def _public_unit(
         self,
         unit: RuntimeUnit,
         remaining_bytes: list,
+        xai_by_frame: Mapping[Tuple[str, str], VisualAttributionArtifact],
     ) -> ProductionEvidenceUnit:
         return ProductionEvidenceUnit.from_runtime_unit(
             unit,
-            evidence_frames=self._evidence_frames(unit, remaining_bytes),
+            evidence_frames=self._evidence_frames(
+                unit, remaining_bytes, xai_by_frame
+            ),
         )
 
     def build(self, result: VideoMultimodalResult) -> ProductionResult:
@@ -450,6 +585,10 @@ class ProductionResultBuilder:
         sufficiency = EvidenceSufficiencyPolicy().assess(result)
         verification = result.verification_result
         remaining_bytes = [MAX_EVIDENCE_PAYLOAD_BYTES]
+        xai_by_frame = {
+            (artifact.observation_unit_id, artifact.source_frame_id): artifact
+            for artifact in result.visual_xai_artifacts
+        }
         return ProductionResult(
             schema_version=SCHEMA_VERSION,
             session_id=result.session_id,
@@ -463,14 +602,14 @@ class ProductionResultBuilder:
             checkpoint_sha256=verification.checkpoint_sha256,
             sufficiency=sufficiency,
             g1_exposure_units=tuple(
-                self._public_unit(unit, remaining_bytes)
+                self._public_unit(unit, remaining_bytes, xai_by_frame)
                 for unit in result.g1_exposure_units
             ),
             g1_top_k_explanation_unit_ids=tuple(
                 unit.unit_id for unit in verification.top_k_units
             ),
             visual_supplemental_units=tuple(
-                self._public_unit(unit, remaining_bytes)
+                self._public_unit(unit, remaining_bytes, xai_by_frame)
                 for unit in result.visual_units
             ),
             runtime_ms=result.runtime_ms,

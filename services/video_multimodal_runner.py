@@ -13,6 +13,7 @@ from schemas import (
     RuntimeUnit,
     SourceType,
     VerificationResult,
+    VisualAttributionArtifact,
     VisualObservationSnapshot,
 )
 from services.claim_consistency_gate import (
@@ -26,6 +27,7 @@ from services.visual_grounding_shadow import (
     VISUAL_GROUNDING_SHADOW_FAILURE_WARNING,
     VisualGroundingShadowRunner,
 )
+from services.visual_xai_attributor import VISUAL_XAI_FAILURE_WARNING
 
 
 @dataclass
@@ -39,6 +41,9 @@ class VideoMultimodalResult:
     all_runtime_units: List[RuntimeUnit]
     verification_result: VerificationResult
     visual_grounding_shadow_units: List[GroundedVisualUnit] = field(
+        default_factory=list
+    )
+    visual_xai_artifacts: List[VisualAttributionArtifact] = field(
         default_factory=list
     )
     warnings: List[str] = field(default_factory=list)
@@ -57,6 +62,9 @@ class VideoMultimodalResult:
             "visual_grounding_shadow_units": [
                 unit.to_dict() for unit in self.visual_grounding_shadow_units
             ],
+            "visual_xai_artifacts": [
+                artifact.to_dict() for artifact in self.visual_xai_artifacts
+            ],
             "warnings": list(self.warnings),
             "runtime_ms": self.runtime_ms,
         }
@@ -70,6 +78,7 @@ class VideoMultimodalRunner:
         frozen_g1_runner: Any,
         claim_consistency_gate: Any = None,
         visual_grounding_shadow_runner: Any = None,
+        visual_xai_attributor: Any = None,
     ) -> None:
         self.video_text_ocr_runner = video_text_ocr_runner
         self.video_visual_runner = video_visual_runner
@@ -84,6 +93,11 @@ class VideoMultimodalRunner:
             if visual_grounding_shadow_runner is not None
             else VisualGroundingShadowRunner()
         )
+        if visual_xai_attributor is not None and not callable(
+            getattr(visual_xai_attributor, "attribute", None)
+        ):
+            raise TypeError("visual_xai_attributor must provide attribute()")
+        self.visual_xai_attributor = visual_xai_attributor
 
     @staticmethod
     def _insufficient_nei(
@@ -164,6 +178,7 @@ class VideoMultimodalRunner:
             verification = self._insufficient_nei(
                 session_id, claim, g1_units, warnings
             )
+        visual_snapshots = []
         visual_grounding_shadow_units = []
         try:
             visual_snapshots = [
@@ -175,6 +190,18 @@ class VideoMultimodalRunner:
             )
         except Exception:
             warnings.append(VISUAL_GROUNDING_SHADOW_FAILURE_WARNING)
+        visual_xai_artifacts = []
+        if self.visual_xai_attributor is not None:
+            try:
+                observation_result = visual_result.observation_result
+                if observation_result is not None and visual_snapshots:
+                    visual_xai_artifacts = self.visual_xai_attributor.attribute(
+                        visual_snapshots,
+                        visual_result.retrieval_result.selected_frames,
+                        observation_result.raw_generation,
+                    )
+            except Exception:
+                warnings.append(VISUAL_XAI_FAILURE_WARNING)
         return VideoMultimodalResult(
             session_id=session_id,
             claim=claim,
@@ -185,6 +212,7 @@ class VideoMultimodalRunner:
             all_runtime_units=all_units,
             verification_result=verification,
             visual_grounding_shadow_units=visual_grounding_shadow_units,
+            visual_xai_artifacts=visual_xai_artifacts,
             warnings=warnings,
             runtime_ms=(time.perf_counter() - started) * 1000.0,
         )

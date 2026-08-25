@@ -65,7 +65,12 @@ function groundedExplanation(unit: PublicEvidenceUnit): string {
   }
   if (unit.source_type === "visual_observation") {
     if (frames.length > 0) {
-      return "The observation is grounded in the referenced public frames. No face identity, object identity, saliency, or attention region is inferred by this interface.";
+      const hasAttribution = frames.some(
+        (frame) => frame.xai?.status === "available",
+      );
+      return hasAttribution
+        ? "The observation is grounded in the exact observer source frame. Highlighting is model-derived post-hoc occlusion attribution, not face recognition, object identity, or causal attention."
+        : "The observation is grounded in the referenced public frames. No visual region or identity is invented when model-derived attribution is unavailable.";
     }
     return "The observation has public provenance metadata, but no frame imagery was provided. No visual region or identity is inferred.";
   }

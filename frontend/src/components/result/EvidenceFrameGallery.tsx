@@ -11,6 +11,7 @@ import type {
   EvidenceSourceType,
   PublicEvidenceFrame,
   PublicEvidenceRegion,
+  PublicVisualXAIMap,
 } from "../../types";
 
 export interface EvidenceFrameGalleryProps {
@@ -40,6 +41,17 @@ function safeImageSource(value: string | null): string | undefined {
   }
   if (value.startsWith("/") || /^https:\/\//i.test(value)) return value;
   return undefined;
+}
+
+function xaiMethodLabel(method: string): string {
+  if (method === "qwen_occlusion_logprob_v1") return "Qwen occlusion attribution";
+  if (method === "siglip_semantic_grounding_v1") return "SigLIP semantic grounding";
+  return "Post-hoc visual attribution";
+}
+
+function defaultAttributionMap(frame: PublicEvidenceFrame): PublicVisualXAIMap | undefined {
+  const maps = frame.xai?.attribution_maps ?? [];
+  return maps.find((item) => item.scope === "observation") ?? maps[0];
 }
 
 function regionRect(
@@ -72,16 +84,19 @@ function AnnotatedFrame({
   annotated,
   frame,
   label,
+  sourceOverride,
 }: {
   annotated: boolean;
   frame: PublicEvidenceFrame;
   label: string;
+  sourceOverride?: string;
 }) {
   const [dimensions, setDimensions] = useState<ImageDimensions>();
   const original = safeImageSource(frame.original_image);
   const serverAnnotated = safeImageSource(frame.annotated_image);
-  const source = annotated ? serverAnnotated ?? original : original;
-  const shouldDrawRegions = annotated && !serverAnnotated;
+  const override = safeImageSource(sourceOverride ?? null);
+  const source = override ?? (annotated ? serverAnnotated ?? original : original);
+  const shouldDrawRegions = annotated && !override && !serverAnnotated;
   const frameLevelLabel = frame.explanation.includes("OCR region unavailable")
     ? "OCR region unavailable"
     : "Frame-level evidence";
@@ -105,7 +120,11 @@ function AnnotatedFrame({
 
   return (
     <div className="evidence-frame__image-wrap">
-      <img alt={`${label}${annotated ? " annotated evidence" : " original"}`} onLoad={recordDimensions} src={source} />
+      <img
+        alt={`${label}${override ? " XAI attribution" : annotated ? " annotated evidence" : " original"}`}
+        onLoad={recordDimensions}
+        src={source}
+      />
       {shouldDrawRegions && dimensions && frame.regions.length > 0 ? (
         <svg
           aria-label={`${String(frame.regions.length)} grounded OCR region${frame.regions.length === 1 ? "" : "s"}`}
@@ -154,14 +173,134 @@ function AnnotatedFrame({
   );
 }
 
+function VisualAttributionViewer({
+  frame,
+  label,
+}: {
+  frame: PublicEvidenceFrame;
+  label: string;
+}) {
+  const xai = frame.xai ?? null;
+  const maps = xai?.status === "available" ? xai.attribution_maps : [];
+  const wholeMap = maps.find((item) => item.scope === "observation") ?? maps[0];
+  const [selectedMapId, setSelectedMapId] = useState(wholeMap?.map_id);
+  const [view, setView] = useState<"original" | "xai">(
+    safeImageSource(wholeMap?.heatmap_image ?? null) ? "xai" : "original",
+  );
+
+  useEffect(() => {
+    setSelectedMapId(wholeMap?.map_id);
+    setView(safeImageSource(wholeMap?.heatmap_image ?? null) ? "xai" : "original");
+  }, [frame.frame_id, wholeMap?.map_id, wholeMap?.heatmap_image]);
+
+  const selectedMap =
+    maps.find((item) => item.map_id === selectedMapId) ?? wholeMap;
+  const selectedHeatmap = safeImageSource(selectedMap?.heatmap_image ?? null);
+  const xaiAvailable = xai?.status === "available" && maps.length > 0;
+  const description =
+    selectedMap?.scope === "phrase"
+      ? `Regions whose removal most reduced model support for the phrase “${selectedMap.label}”.`
+      : "Regions whose removal most reduced support for this generated observation.";
+  const disclaimer =
+    xai?.disclaimer ??
+    "This is a post-hoc perturbation attribution of the Visual Observer. It does not affect the authoritative verification verdict.";
+  const boundary =
+    xai?.scientific_boundary ??
+    "Supplemental visual XAI is explanatory only and does not participate in the Frozen G1 verdict.";
+
+  return (
+    <section className="visual-xai" aria-label={`XAI attribution for ${label}`}>
+      <div className="visual-xai__topline">
+        <div>
+          <p>Visual observer explanation</p>
+          <h4>Occlusion attribution</h4>
+        </div>
+        <span className="visual-xai__method">
+          {xai ? xaiMethodLabel(xai.method) : "XAI unavailable"}
+        </span>
+      </div>
+
+      {xaiAvailable ? (
+        <>
+          <div className="visual-xai__controls">
+            <div aria-label="Attribution view" className="visual-xai__chips" role="group">
+              {maps.map((item) => (
+                <button
+                  aria-pressed={item.map_id === selectedMap?.map_id}
+                  className={item.map_id === selectedMap?.map_id ? "is-active" : ""}
+                  key={item.map_id}
+                  onClick={() => {
+                    setSelectedMapId(item.map_id);
+                    if (safeImageSource(item.heatmap_image)) setView("xai");
+                  }}
+                  type="button"
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <div aria-label="Image presentation" className="visual-xai__toggle" role="group">
+              <button aria-pressed={view === "original"} onClick={() => setView("original")} type="button">
+                Original
+              </button>
+              <button
+                aria-pressed={view === "xai"}
+                disabled={!selectedHeatmap}
+                onClick={() => setView("xai")}
+                type="button"
+              >
+                XAI
+              </button>
+            </div>
+          </div>
+
+          <figure className="visual-xai__preview">
+            <AnnotatedFrame
+              annotated={false}
+              frame={frame}
+              label={label}
+              sourceOverride={view === "xai" ? selectedHeatmap : undefined}
+            />
+            <figcaption>
+              <strong>{view === "xai" ? selectedMap?.label : "Original observer source frame"}</strong>
+              <span>{view === "xai" ? description : "The unmodified frame supplied to the Visual Observer."}</span>
+            </figcaption>
+          </figure>
+          {!selectedHeatmap && view === "original" ? (
+            <p className="visual-xai__unavailable" role="status">
+              Attribution metadata is present, but the public heatmap image was omitted by payload safety limits.
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <div className="visual-xai__unavailable" role="status">
+          <strong>XAI attribution unavailable</strong>
+          <span>
+            {xai?.unavailable_reason
+              ? `Safe reason: ${xai.unavailable_reason.replaceAll("_", " ")}.`
+              : "This older result does not contain an XAI artifact."}
+          </span>
+        </div>
+      )}
+
+      <div className="visual-xai__disclosure">
+        <p>{disclaimer}</p>
+        <strong>{boundary}</strong>
+      </div>
+    </section>
+  );
+}
+
 function EvidenceLightbox({
   frame,
   frameIndex,
   onClose,
+  sourceType,
 }: {
   frame: PublicEvidenceFrame;
   frameIndex: number;
   onClose: () => void;
+  sourceType: EvidenceSourceType;
 }) {
   const [closing, setClosing] = useState(false);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -216,38 +355,44 @@ function EvidenceLightbox({
           </button>
         </header>
 
-        <div className="evidence-lightbox__views">
-          <figure>
-            <AnnotatedFrame annotated={false} frame={frame} label={label} />
-            <figcaption>Original public evidence frame</figcaption>
-          </figure>
-          <figure>
-            <AnnotatedFrame annotated frame={frame} label={label} />
-            <figcaption>
-              {frame.regions.length > 0
-                ? "Annotated OCR regions"
-                : "Frame-level grounding; localized region unavailable"}
-            </figcaption>
-          </figure>
-        </div>
+        {sourceType === "visual_observation" ? (
+          <VisualAttributionViewer frame={frame} label={label} />
+        ) : (
+          <>
+            <div className="evidence-lightbox__views">
+              <figure>
+                <AnnotatedFrame annotated={false} frame={frame} label={label} />
+                <figcaption>Original public evidence frame</figcaption>
+              </figure>
+              <figure>
+                <AnnotatedFrame annotated frame={frame} label={label} />
+                <figcaption>
+                  {frame.regions.length > 0
+                    ? "Annotated OCR regions"
+                    : "Frame-level grounding; localized region unavailable"}
+                </figcaption>
+              </figure>
+            </div>
 
-        <div className="evidence-lightbox__details">
-          <p>{frame.explanation}</p>
-          {frame.regions.length > 0 ? (
-            <ul aria-label="Recognized OCR regions">
-              {frame.regions.map((region, index) => (
-                <li key={`${regionLabel(region, index)}-${String(index)}`}>
-                  <strong>{regionLabel(region, index)}</strong>
-                  <span>
-                    {region.confidence === null
-                      ? "Confidence unavailable"
-                      : `Confidence ${String(region.confidence)}`}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
+            <div className="evidence-lightbox__details">
+              <p>{frame.explanation}</p>
+              {frame.regions.length > 0 ? (
+                <ul aria-label="Recognized OCR regions">
+                  {frame.regions.map((region, index) => (
+                    <li key={`${regionLabel(region, index)}-${String(index)}`}>
+                      <strong>{regionLabel(region, index)}</strong>
+                      <span>
+                        {region.confidence === null
+                          ? "Confidence unavailable"
+                          : `Confidence ${String(region.confidence)}`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          </>
+        )}
       </article>
     </div>,
     document.body,
@@ -256,6 +401,7 @@ function EvidenceLightbox({
 
 export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGalleryProps) {
   const [selectedIndex, setSelectedIndex] = useState<number>();
+  const [previewIndex, setPreviewIndex] = useState(0);
   const heading = sourceType === "ocr" ? "OCR Evidence Frames" : "Visual Evidence Frames";
   const closeLightbox = useCallback(() => setSelectedIndex(undefined), []);
 
@@ -270,26 +416,48 @@ export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGaller
       </div>
 
       {frames.length > 0 ? (
-        <div className="evidence-frames__rail">
-          {frames.map((frame, index) => {
-            const label = frameName(frame, index);
-            return (
-              <button
-                aria-label={`Inspect ${label}`}
-                className="evidence-frame-card"
-                key={`${label}-${String(index)}`}
-                onClick={() => setSelectedIndex(index)}
-                type="button"
-              >
-                <AnnotatedFrame annotated frame={frame} label={label} />
-                <span className="evidence-frame-card__caption">
-                  <strong>{label}</strong>
-                  <small>{frameTime(frame) ?? "Timestamp unavailable"}</small>
-                </span>
-              </button>
-            );
-          })}
-        </div>
+        <>
+          {sourceType === "visual_observation" && frames[previewIndex] ? (
+            <VisualAttributionViewer
+              frame={frames[previewIndex]}
+              label={frameName(frames[previewIndex], previewIndex)}
+            />
+          ) : null}
+          <div className="evidence-frames__rail">
+            {frames.map((frame, index) => {
+              const label = frameName(frame, index);
+              const attribution = defaultAttributionMap(frame);
+              return (
+                <button
+                  aria-label={`Inspect ${label}`}
+                  className={`evidence-frame-card${previewIndex === index ? " is-current" : ""}`}
+                  key={`${label}-${String(index)}`}
+                  onClick={() => {
+                    setPreviewIndex(index);
+                    setSelectedIndex(index);
+                  }}
+                  type="button"
+                >
+                  <AnnotatedFrame
+                    annotated={sourceType === "ocr"}
+                    frame={frame}
+                    label={label}
+                    sourceOverride={
+                      sourceType === "visual_observation"
+                        ? safeImageSource(attribution?.heatmap_image ?? null)
+                        : undefined
+                    }
+                  />
+                  <span className="evidence-frame-card__caption">
+                    <strong>{label}</strong>
+                    <small>{frameTime(frame) ?? "Timestamp unavailable"}</small>
+                    {sourceType === "visual_observation" ? <em>Observer source</em> : null}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </>
       ) : (
         <div className="evidence-frames__empty">
           <strong>Frame imagery was not included in this public result.</strong>
@@ -302,6 +470,7 @@ export function EvidenceFrameGallery({ frames, sourceType }: EvidenceFrameGaller
           frame={frames[selectedIndex]}
           frameIndex={selectedIndex}
           onClose={closeLightbox}
+          sourceType={sourceType}
         />
       ) : null}
     </section>

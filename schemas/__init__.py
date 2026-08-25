@@ -22,6 +22,18 @@ from .result import EvidenceStatus, DisplayVerdict, ModelVerdict, VerificationRe
 from .stage import PipelineStage, StageName, StageStatus
 from .unit import RuntimeUnit, SourceType
 from .visual_observation_snapshot import VisualObservationSnapshot
+from .visual_xai import (
+    QWEN_OCCLUSION_BASELINE,
+    QWEN_OCCLUSION_METHOD,
+    VISUAL_XAI_ARTIFACT_TYPE,
+    VISUAL_XAI_BOUNDARY,
+    VISUAL_XAI_DISCLAIMER,
+    VISUAL_XAI_SCHEMA_VERSION,
+    VisualAttributionArtifact,
+    VisualAttributionMap,
+    VisualTargetScore,
+    VisualTargetSpan,
+)
 
 __all__ = [
     "DisplayVerdict",
@@ -47,5 +59,15 @@ __all__ = [
     "VerificationRequest",
     "VerificationResult",
     "VisualObservationSnapshot",
+    "QWEN_OCCLUSION_BASELINE",
+    "QWEN_OCCLUSION_METHOD",
+    "VISUAL_XAI_ARTIFACT_TYPE",
+    "VISUAL_XAI_BOUNDARY",
+    "VISUAL_XAI_DISCLAIMER",
+    "VISUAL_XAI_SCHEMA_VERSION",
+    "VisualAttributionArtifact",
+    "VisualAttributionMap",
+    "VisualTargetScore",
+    "VisualTargetSpan",
     "WhisperRuntimeConfig",
 ]

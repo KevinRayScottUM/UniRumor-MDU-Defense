@@ -24,6 +24,7 @@ from services.video_multimodal_runner import VideoMultimodalRunner
 from services.video_ocr_runner import VideoOCRRunner
 from services.video_text_ocr_runner import VideoTextOCRRunner
 from services.video_visual_runner import VideoVisualRunner
+from services.visual_xai_attributor import VisualXAIAttributor, VisualXAIConfig
 from services.whisper_asr_service import WhisperASRConfig, WhisperASRService
 
 
@@ -42,6 +43,7 @@ class ProductionRuntimeServices:
     siglip_retriever: SigLIPVisualRetriever
     qwen_observer: QwenVisualObserver
     video_visual_runner: VideoVisualRunner
+    visual_xai_attributor: VisualXAIAttributor
     video_multimodal_runner: VideoMultimodalRunner
 
 
@@ -196,10 +198,15 @@ class ProductionRuntimeFactory:
             retriever=siglip_retriever,
             observer=qwen_observer,
         )
+        visual_xai_attributor = VisualXAIAttributor(
+            scorer=qwen_observer,
+            config=VisualXAIConfig(cache_root=config.cache_root / "visual_xai"),
+        )
         video_multimodal_runner = VideoMultimodalRunner(
             video_text_ocr_runner=video_text_ocr_runner,
             video_visual_runner=video_visual_runner,
             frozen_g1_runner=frozen_g1_runner,
+            visual_xai_attributor=visual_xai_attributor,
         )
 
         return ProductionRuntimeServices(
@@ -216,5 +223,6 @@ class ProductionRuntimeFactory:
             siglip_retriever=siglip_retriever,
             qwen_observer=qwen_observer,
             video_visual_runner=video_visual_runner,
+            visual_xai_attributor=visual_xai_attributor,
             video_multimodal_runner=video_multimodal_runner,
         )

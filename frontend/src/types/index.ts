@@ -20,10 +20,13 @@ export type {
   PublicEvidenceFrame,
   PublicEvidenceRegion,
   PublicEvidenceUnit,
+  PublicVisualXAI,
+  PublicVisualXAIMap,
   PublicSufficiency,
   PublicVerdict,
   ReadinessResponse,
   ReadinessStatus,
   SubmitJobInput,
   SuccessfulProductionExecutionOutcome,
+  VisualXAIMethod,
 } from "./api";

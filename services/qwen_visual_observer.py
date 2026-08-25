@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from schemas.visual_xai import VisualTargetScore, VisualTargetSpan
 from services.siglip_visual_retriever import (
     VisualFrame,
     runtime_tree_sha256,
@@ -143,6 +144,12 @@ class QwenVisualObserver:
         self._processor = None
         self._model = None
         self._device = None
+
+    @property
+    def runtime_fingerprint(self) -> str:
+        """Frozen model-tree identity used by deterministic XAI cache keys."""
+
+        return QWEN_RUNTIME_TREE_SHA256
 
     @staticmethod
     def build_prompt(frames: Sequence[VisualFrame]) -> str:
@@ -311,6 +318,8 @@ Return JSON in this shape:
             )
         self._verify_assets()
         transformers_module, torch_module, process_vision_info = self._dependencies()
+        self._transformers = transformers_module
+        self._torch = torch_module
         cuda_available = bool(torch_module.cuda.is_available())
         device = self.config.device
         if device == "auto":
@@ -383,6 +392,273 @@ Return JSON in this shape:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
+
+    @staticmethod
+    def _find_unique_subsequence(
+        values: Sequence[int], target: Sequence[int]
+    ) -> int:
+        if not target or len(target) > len(values):
+            raise ValueError("fixed target tokens are unavailable")
+        matches = [
+            index
+            for index in range(len(values) - len(target) + 1)
+            if list(values[index : index + len(target)]) == list(target)
+        ]
+        if len(matches) != 1:
+            raise ValueError("fixed target tokens do not map uniquely")
+        return matches[0]
+
+    @staticmethod
+    def _flat_tokenizer_value(value: Any) -> List[Any]:
+        materialized = value.tolist() if hasattr(value, "tolist") else list(value)
+        if materialized and isinstance(materialized[0], list):
+            if len(materialized) != 1:
+                raise ValueError("expected one tokenized text sequence")
+            materialized = materialized[0]
+        return list(materialized)
+
+    def score_target_logprob_batch(
+        self,
+        frame_batches: Sequence[Sequence[VisualFrame]],
+        target_sequence: str,
+        spans: Sequence[VisualTargetSpan],
+    ) -> List[VisualTargetScore]:
+        """Teacher-force the exact prior generation and score requested spans.
+
+        No decoding or free-form regeneration occurs. Each sample uses the same
+        claim-blind observer prompt and its supplied source-frame sequence.
+        """
+
+        batches = [tuple(frames) for frames in frame_batches]
+        requested_spans = tuple(spans)
+        if not batches or any(not frames for frames in batches):
+            raise ValueError("frame_batches must contain non-empty frame sequences")
+        if not isinstance(target_sequence, str) or not target_sequence:
+            raise ValueError("target_sequence is required")
+        if not requested_spans or not all(
+            isinstance(span, VisualTargetSpan) for span in requested_spans
+        ):
+            raise TypeError("spans must contain VisualTargetSpan objects")
+        if any(span.end_character > len(target_sequence) for span in requested_spans):
+            raise ValueError("target span exceeds the fixed target sequence")
+
+        self.load()
+        messages_batch = []
+        rendered_batch = []
+        prompt_rendered_batch = []
+        for frames in batches:
+            prompt = self.build_prompt(frames)
+            content = [
+                {"type": "image", "image": str(frame.frame_path)}
+                for frame in frames
+            ]
+            content.append({"type": "text", "text": prompt})
+            user_messages = [{"role": "user", "content": content}]
+            messages = [
+                *user_messages,
+                {"role": "assistant", "content": target_sequence},
+            ]
+            messages_batch.append(messages)
+            prompt_rendered_batch.append(
+                self._processor.apply_chat_template(
+                    user_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+            rendered_batch.append(
+                self._processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+
+        image_inputs, video_inputs = self._process_vision_info(messages_batch)
+        inputs = self._processor(
+            text=rendered_batch,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._device) if hasattr(inputs, "to") else inputs
+
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        if not callable(tokenizer):
+            raise RuntimeError("Qwen processor tokenizer offsets are unavailable")
+        mappings = []
+        input_ids_batch = inputs["input_ids"]
+        attention_batch = inputs.get("attention_mask")
+        for row_index, rendered in enumerate(rendered_batch):
+            target_start = rendered.rfind(target_sequence)
+            if target_start < 0:
+                raise ValueError("fixed target is absent from the rendered prompt")
+            target_end = target_start + len(target_sequence)
+            raw_ids = input_ids_batch[row_index]
+            raw_ids = raw_ids.tolist() if hasattr(raw_ids, "tolist") else list(raw_ids)
+            if attention_batch is None:
+                active_positions = list(range(len(raw_ids)))
+            else:
+                raw_mask = attention_batch[row_index]
+                raw_mask = (
+                    raw_mask.tolist()
+                    if hasattr(raw_mask, "tolist")
+                    else list(raw_mask)
+                )
+                active_positions = [
+                    index for index, value in enumerate(raw_mask) if int(value) != 0
+                ]
+            active_ids = [int(raw_ids[index]) for index in active_positions]
+            try:
+                tokenized = tokenizer(
+                    rendered,
+                    add_special_tokens=False,
+                    return_offsets_mapping=True,
+                )
+                text_ids = self._flat_tokenizer_value(tokenized["input_ids"])
+                offsets = self._flat_tokenizer_value(tokenized["offset_mapping"])
+                target_text_indices = [
+                    index
+                    for index, offset in enumerate(offsets)
+                    if len(offset) == 2
+                    and int(offset[1]) > target_start
+                    and int(offset[0]) < target_end
+                ]
+                if not target_text_indices:
+                    raise ValueError("fixed target has no scoreable tokens")
+                target_token_ids = [text_ids[index] for index in target_text_indices]
+                sequence_start = self._find_unique_subsequence(
+                    active_ids, [int(value) for value in target_token_ids]
+                )
+                span_positions = {}
+                for span in requested_spans:
+                    absolute_start = target_start + span.start_character
+                    absolute_end = target_start + span.end_character
+                    relative_indices = [
+                        target_index
+                        for target_index, text_index in enumerate(target_text_indices)
+                        if int(offsets[text_index][1]) > absolute_start
+                        and int(offsets[text_index][0]) < absolute_end
+                    ]
+                    if not relative_indices:
+                        raise ValueError(
+                            f"target span {span.span_id!r} has no tokens"
+                        )
+                    model_positions = tuple(
+                        active_positions[sequence_start + index]
+                        for index in relative_indices
+                    )
+                    model_token_ids = tuple(
+                        int(target_token_ids[index]) for index in relative_indices
+                    )
+                    if any(position < 1 for position in model_positions):
+                        raise ValueError(
+                            "fixed target begins before a scoreable position"
+                        )
+                    span_positions[span.span_id] = (
+                        model_positions,
+                        model_token_ids,
+                    )
+            except (NotImplementedError, TypeError, ValueError):
+                full_tokenized = tokenizer(rendered, add_special_tokens=False)
+                prompt_tokenized = tokenizer(
+                    prompt_rendered_batch[row_index], add_special_tokens=False
+                )
+                full_text_ids = self._flat_tokenizer_value(
+                    full_tokenized["input_ids"]
+                )
+                prompt_text_ids = self._flat_tokenizer_value(
+                    prompt_tokenized["input_ids"]
+                )
+                if full_text_ids[: len(prompt_text_ids)] != prompt_text_ids:
+                    raise ValueError(
+                        "assistant target does not follow the generation prompt"
+                    )
+                assistant_ids = [
+                    int(value) for value in full_text_ids[len(prompt_text_ids) :]
+                ]
+                sequence_start = self._find_unique_subsequence(
+                    active_ids, assistant_ids
+                )
+                decode = getattr(tokenizer, "decode", None)
+                if not callable(decode):
+                    raise RuntimeError("Qwen tokenizer decoding is unavailable")
+                decoded_prefixes = [""]
+                for end_index in range(1, len(assistant_ids) + 1):
+                    decoded_prefixes.append(
+                        decode(
+                            assistant_ids[:end_index],
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=False,
+                        )
+                    )
+                decoded_assistant = decoded_prefixes[-1]
+                decoded_target_start = decoded_assistant.find(target_sequence)
+                if (
+                    decoded_target_start < 0
+                    or decoded_assistant.find(
+                        target_sequence, decoded_target_start + 1
+                    )
+                    >= 0
+                ):
+                    raise ValueError("decoded fixed target does not map uniquely")
+                span_positions = {}
+                for span in requested_spans:
+                    absolute_start = decoded_target_start + span.start_character
+                    absolute_end = decoded_target_start + span.end_character
+                    relative_indices = [
+                        index
+                        for index in range(len(assistant_ids))
+                        if len(decoded_prefixes[index + 1]) > absolute_start
+                        and len(decoded_prefixes[index]) < absolute_end
+                    ]
+                    if not relative_indices:
+                        raise ValueError(
+                            f"target span {span.span_id!r} has no decoded tokens"
+                        )
+                    model_positions = tuple(
+                        active_positions[sequence_start + index]
+                        for index in relative_indices
+                    )
+                    model_token_ids = tuple(
+                        assistant_ids[index] for index in relative_indices
+                    )
+                    if any(position < 1 for position in model_positions):
+                        raise ValueError(
+                            "fixed target begins before a scoreable position"
+                        )
+                    span_positions[span.span_id] = (
+                        model_positions,
+                        model_token_ids,
+                    )
+            mappings.append(span_positions)
+
+        with self._torch.inference_mode():
+            outputs = self._model(**inputs, use_cache=False)
+        logits = outputs.logits
+        results = []
+        for row_index, span_positions in enumerate(mappings):
+            span_scores = []
+            span_counts = []
+            for span in requested_spans:
+                positions, token_ids = span_positions[span.span_id]
+                total = 0.0
+                for position, token_id in zip(positions, token_ids):
+                    token_logits = logits[row_index, position - 1]
+                    log_probabilities = self._torch.log_softmax(
+                        token_logits.float(), dim=-1
+                    )
+                    total += float(log_probabilities[token_id].item())
+                span_scores.append((span.span_id, total))
+                span_counts.append((span.span_id, len(positions)))
+            results.append(
+                VisualTargetScore(
+                    span_log_probabilities=tuple(span_scores),
+                    span_token_counts=tuple(span_counts),
+                )
+            )
+        return results
 
     def observe(self, frames: Sequence[VisualFrame]) -> QwenVisualObservationResult:
         selected = list(frames)

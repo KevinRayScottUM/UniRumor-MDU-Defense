@@ -87,6 +87,42 @@ export interface PublicEvidenceRegion {
   confidence: number | null;
 }
 
+export type VisualXAIMethod =
+  | "qwen_occlusion_logprob_v1"
+  | "siglip_semantic_grounding_v1";
+
+export interface PublicVisualXAIMap {
+  map_id: string;
+  scope: "observation" | "phrase";
+  label: string;
+  heatmap_image: string | null;
+  target_token_count: number;
+  baseline_target_log_probability: number;
+  raw_importance: number[][];
+  normalized_importance: number[][];
+}
+
+export interface PublicVisualXAI {
+  status: "available" | "unavailable";
+  unavailable_reason: string | null;
+  method: VisualXAIMethod;
+  model_id: string;
+  model_revision: string;
+  model_fingerprint: string;
+  source_frame_sha256: string;
+  observation_unit_id: string;
+  observation_text_sha256: string;
+  raw_generation_sha256: string;
+  grid_rows: number;
+  grid_columns: number;
+  occlusion_baseline: string;
+  configuration_version: string;
+  phrase_policy: string;
+  disclaimer: string;
+  scientific_boundary: string;
+  attribution_maps: PublicVisualXAIMap[];
+}
+
 export interface PublicEvidenceFrame {
   frame_id: string | null;
   frame_index: number | null;
@@ -96,6 +132,7 @@ export interface PublicEvidenceFrame {
   bbox: number[] | null;
   regions: PublicEvidenceRegion[];
   explanation: string;
+  xai?: PublicVisualXAI | null;
 }
 
 export interface PublicEvidenceUnit {
