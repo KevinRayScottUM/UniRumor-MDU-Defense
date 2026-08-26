@@ -36,12 +36,28 @@ Frozen G1 candidate input.
 Top-k membership, candidate hashing, and relevance metrics. It does not replace
 the single-case audit.
 
+Cross-case discovery recognizes two explicit reference contracts:
+
+- `PUBLIC_RESULT`: the existing production-style result containing ordered
+  `g1_exposure_units` and public Top-k explanation IDs;
+- `NATIVE_PHASE4A`: a native prediction record containing `claim`, ordered
+  `unit_outputs`, and `top_k_selection_units`.
+
+For native records, score-blind discovery reconstructs candidates exclusively
+from `unit_id`, `unit_type`, `modality`, and `text`. Selection scores, unit
+veracity logits, Top-k contents, sample logits, probabilities, and prediction
+are first consulted during the reproduction stage, after
+`selected_case_manifest.json` has been written.
+
 Discovery is score-blind: cases are deduplicated by the model-input candidate
-hash, one lexically first case is selected per dataset, and remaining slots are
-filled by stable `(dataset, case_id, candidate hash, artifact key)` order. The
-scanner prunes and rejects exact `Validation`/`Test` path components before
-opening files. Every selected case must replay its original source claim within
-the declared `1e-6` reproduction tolerance before automatic probes are made.
+hash and by canonical underlying identity. Canonicalization removes only exact
+colon-delimited split tokens (`train`, `test`, `validation`, `val`) and retains
+dataset/example identity. One lexically first independent case is selected per
+dataset; remaining slots use stable metadata order. The scanner prunes exact
+`Validation`/`Test` and `selector_fidelity_audit` path components, excludes the
+current output directory, and rejects forbidden input roots before opening
+files. Every selected case must replay its original source claim within the
+declared `1e-6` reproduction tolerance before automatic probes are made.
 
 The balanced direct-grounding manifest and its SHA-256 are written before any
 new probe scoring. Real execution remains DICC-only:

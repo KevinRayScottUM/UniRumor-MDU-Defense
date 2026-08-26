@@ -16,6 +16,7 @@ import re
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -39,6 +40,10 @@ from .audit import (
 TARGET_CASE_COUNT = 5
 MIN_CONCLUSIVE_CASE_COUNT = 4
 PROBES_PER_MODALITY_PER_CASE = 2
+PUBLIC_RESULT = "PUBLIC_RESULT"
+NATIVE_PHASE4A = "NATIVE_PHASE4A"
+ARTIFACT_CONTRACTS = {PUBLIC_RESULT, NATIVE_PHASE4A}
+_SPLIT_IDENTITY_TOKENS = {"train", "test", "validation", "val"}
 CROSS_CASE_CLASSIFICATIONS = {
     "CROSS_CASE_MODALITY_BIAS_CONFIRMED",
     "CASE_LOCAL_OR_MIXED_EFFECT",
@@ -48,10 +53,14 @@ CROSS_CASE_CLASSIFICATIONS = {
 _FORBIDDEN_RESULT_KEYS = {
     "selection_score",
     "top_k",
+    "top_k_selection_units",
     "top_k_membership",
     "veracity_logits",
     "logits",
+    "sample_logits",
+    "probabilities",
     "prediction",
+    "prediction_id",
 }
 _RANKING_COLUMNS = (
     "case_id",
@@ -93,6 +102,8 @@ class DiscoveryRoot:
 class CandidateCase:
     dataset: str
     case_id: str
+    canonical_underlying_case_id: str
+    artifact_contract: str
     artifact_key: str
     artifact_path: Path
     record_index: int
@@ -143,6 +154,102 @@ def _case_scalar(payload: Any, names: Sequence[str]) -> Any:
     return None
 
 
+def detect_artifact_contract(payload: Any) -> str:
+    """Detect structure without consulting any selector-output value."""
+
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("claim"), str)
+        and isinstance(payload.get("unit_outputs"), list)
+        and isinstance(payload.get("top_k_selection_units"), list)
+    ):
+        return NATIVE_PHASE4A
+    try:
+        _candidate_records(payload)
+    except AuditInputError as exc:
+        raise AuditInputError("unsupported selector audit artifact contract") from exc
+    return PUBLIC_RESULT
+
+
+def _native_source_type(unit_type: Any, modality: Any, field: str) -> SourceType:
+    normalized_type = _nonblank(unit_type, f"{field}.unit_type").casefold()
+    normalized_modality = _nonblank(modality, f"{field}.modality").casefold()
+    mapping = {
+        "text": SourceType.TEXT,
+        "transcript": SourceType.TRANSCRIPT,
+        "ocr": SourceType.OCR,
+    }
+    if normalized_type not in mapping:
+        raise AuditInputError(f"{field}.unit_type is not text/transcript/OCR")
+    expected_modality = "ocr" if normalized_type == "ocr" else "text"
+    if normalized_modality != expected_modality:
+        raise AuditInputError(f"{field} has inconsistent unit_type/modality")
+    return mapping[normalized_type]
+
+
+def reconstruct_native_candidate_pool(payload: Any) -> List[RuntimeUnit]:
+    """Stage-A reconstruction from native metadata fields only."""
+
+    if detect_artifact_contract(payload) != NATIVE_PHASE4A:
+        raise AuditInputError("native candidate reconstruction requires NATIVE_PHASE4A")
+    outputs = payload["unit_outputs"]
+    if not outputs:
+        raise AuditInputError("native unit_outputs must be non-empty")
+    units: List[RuntimeUnit] = []
+    seen_ids = set()
+    for index, item in enumerate(outputs):
+        field = f"unit_outputs[{index}]"
+        if not isinstance(item, dict):
+            raise AuditInputError(f"{field} must be an object")
+        unit_id = _nonblank(item.get("unit_id"), f"{field}.unit_id")
+        if unit_id in seen_ids:
+            raise AuditInputError(f"duplicate native candidate unit ID: {unit_id}")
+        seen_ids.add(unit_id)
+        units.append(
+            RuntimeUnit(
+                unit_id=unit_id,
+                source_type=_native_source_type(
+                    item.get("unit_type"), item.get("modality"), field
+                ),
+                text=_nonblank(item.get("text"), f"{field}.text"),
+                producer="selector_fidelity_native_phase4a_reference",
+                eligible_for_frozen_g1=True,
+            )
+        )
+    return units
+
+
+def reconstruct_candidate_pool(payload: Any, artifact_contract: str) -> List[RuntimeUnit]:
+    if artifact_contract == NATIVE_PHASE4A:
+        return reconstruct_native_candidate_pool(payload)
+    if artifact_contract == PUBLIC_RESULT:
+        return load_candidate_pool_payload(payload)
+    raise AuditInputError("unsupported selector audit artifact contract")
+
+
+def canonicalize_underlying_case_id(dataset: str, case_id: str) -> str:
+    """Remove only explicit split tokens while retaining semantic identity."""
+
+    dataset_value = _nonblank(dataset, "dataset")
+    case_value = _nonblank(case_id, "case_id")
+
+    def retained_parts(value: str) -> List[str]:
+        return [
+            part.strip()
+            for part in value.split(":")
+            if part.strip() and part.strip().casefold() not in _SPLIT_IDENTITY_TOKENS
+        ]
+
+    dataset_parts = retained_parts(dataset_value)
+    case_parts = retained_parts(case_value)
+    if not dataset_parts or not case_parts:
+        raise AuditInputError("dataset/case identity cannot consist only of split tokens")
+    prefix = [part.casefold() for part in dataset_parts]
+    current = [part.casefold() for part in case_parts[: len(dataset_parts)]]
+    canonical_parts = case_parts if current == prefix else dataset_parts + case_parts
+    return ":".join(canonical_parts)
+
+
 def _is_candidate_list(payload: Any) -> bool:
     return (
         isinstance(payload, list)
@@ -178,17 +285,37 @@ def _read_artifact_records(path: Path) -> Iterator[Tuple[int, Any]]:
         yield 0, payload
 
 
-def _iter_artifact_paths(root: DiscoveryRoot) -> Iterator[Path]:
+def _path_is_within(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def _iter_artifact_paths(
+    root: DiscoveryRoot,
+    excluded_paths: Sequence[Path] = (),
+) -> Iterator[Path]:
     if not root.path.is_dir():
         raise AuditInputError(f"discovery root is not a directory: {root.path.name}")
+    excluded = tuple(Path(path).expanduser().resolve() for path in excluded_paths)
+    if (
+        "selector_fidelity_audit" in {part.casefold() for part in root.path.parts}
+        or any(_path_is_within(root.path, path) for path in excluded)
+    ):
+        return
     for directory, directories, filenames in os.walk(root.path):
+        base = Path(directory).resolve()
         directories[:] = sorted(
-            name for name in directories if name.casefold() not in {"validation", "test"}
+            name
+            for name in directories
+            if name.casefold()
+            not in {"validation", "test", "selector_fidelity_audit"}
+            and not any(_path_is_within((base / name).resolve(), path) for path in excluded)
         )
-        base = Path(directory)
         for filename in sorted(filenames):
             path = base / filename
-            if path.suffix.casefold() in {".json", ".jsonl"}:
+            if (
+                path.suffix.casefold() in {".json", ".jsonl"}
+                and not any(_path_is_within(path.resolve(), item) for item in excluded)
+            ):
                 _reject_formal_data_path(path)
                 yield path
 
@@ -228,6 +355,7 @@ def _safe_case_id(value: Any, artifact_key: str) -> str:
 
 def discover_eligible_cases(
     roots: Sequence[DiscoveryRoot],
+    excluded_paths: Sequence[Path] = (),
 ) -> Tuple[Dict[str, Any], List[CandidateCase]]:
     """Discover cases without consulting scores, logits, Top-k, or predictions."""
 
@@ -237,9 +365,8 @@ def discover_eligible_cases(
     unreadable_records = 0
     excluded = Counter()
     eligible: List[CandidateCase] = []
-    seen_hashes = set()
     for root in sorted(roots, key=lambda item: (item.dataset.casefold(), str(item.path))):
-        for path in _iter_artifact_paths(root):
+        for path in _iter_artifact_paths(root, excluded_paths):
             relative = path.relative_to(root.path).as_posix()
             try:
                 records = list(_read_artifact_records(path))
@@ -250,7 +377,8 @@ def discover_eligible_cases(
                 inspected_records += 1
                 artifact_key = f"{root.dataset}:{relative}#{record_index}"
                 try:
-                    units = load_candidate_pool_payload(payload)
+                    artifact_contract = detect_artifact_contract(payload)
+                    units = reconstruct_candidate_pool(payload, artifact_contract)
                     claim = _nonblank(_case_scalar(payload, ("claim",)), "source claim")
                 except (AuditInputError, KeyError, TypeError, ValueError):
                     excluded["not_reconstructable"] += 1
@@ -260,10 +388,6 @@ def discover_eligible_cases(
                     excluded[reason] += 1
                     continue
                 pool_hash = candidate_pool_sha256(units)
-                if pool_hash in seen_hashes:
-                    excluded["duplicate_candidate_pool"] += 1
-                    continue
-                seen_hashes.add(pool_hash)
                 dataset_value = _case_scalar(payload, ("dataset", "source_dataset"))
                 dataset = (
                     str(dataset_value).strip()
@@ -272,12 +396,17 @@ def discover_eligible_cases(
                 )
                 case_value = _case_scalar(
                     payload,
-                    ("session_id", "case_id", "job_id", "prediction_id"),
+                    ("session_id", "case_id", "job_id"),
                 )
+                case_id = _safe_case_id(case_value, artifact_key)
                 eligible.append(
                     CandidateCase(
                         dataset=dataset,
-                        case_id=_safe_case_id(case_value, artifact_key),
+                        case_id=case_id,
+                        canonical_underlying_case_id=canonicalize_underlying_case_id(
+                            dataset, case_id
+                        ),
+                        artifact_contract=artifact_contract,
                         artifact_key=artifact_key,
                         artifact_path=path,
                         record_index=record_index,
@@ -290,11 +419,12 @@ def discover_eligible_cases(
     eligible.sort(key=_case_sort_key)
     inventory = {
         "schema_version": 1,
-        "discovery_method": "score_blind_public_artifact_scan",
+        "discovery_method": "score_blind_dual_contract_artifact_scan",
         "formal_test_accessed": False,
         "selector_outputs_inspected_for_case_selection": False,
         "inspected_record_count": inspected_records,
         "unreadable_artifact_count": unreadable_records,
+        "self_discovery_excluded": True,
         "excluded_reason_counts": dict(sorted(excluded.items())),
         "eligible_case_count": len(eligible),
         "eligible_cases": [_public_case_record(case) for case in eligible],
@@ -302,9 +432,10 @@ def discover_eligible_cases(
     return inventory, eligible
 
 
-def _case_sort_key(case: CandidateCase) -> Tuple[str, str, str, str]:
+def _case_sort_key(case: CandidateCase) -> Tuple[str, str, str, str, str]:
     return (
         case.dataset.casefold(),
+        case.canonical_underlying_case_id.casefold(),
         case.case_id.casefold(),
         case.candidate_pool_sha256,
         case.artifact_key,
@@ -320,17 +451,37 @@ def select_cases_score_blind(
     if type(target_count) is not int or target_count <= 0:
         raise AuditInputError("target case count must be a positive integer")
     ordered = sorted(cases, key=_case_sort_key)
-    first_by_dataset: Dict[str, CandidateCase] = {}
+    independent: List[CandidateCase] = []
+    seen_underlying_ids = set()
+    seen_hashes = set()
     for case in ordered:
+        underlying_key = case.canonical_underlying_case_id.casefold()
+        if underlying_key in seen_underlying_ids:
+            continue
+        if case.candidate_pool_sha256 in seen_hashes:
+            continue
+        independent.append(case)
+        seen_underlying_ids.add(underlying_key)
+        seen_hashes.add(case.candidate_pool_sha256)
+    first_by_dataset: Dict[str, CandidateCase] = {}
+    for case in independent:
         first_by_dataset.setdefault(case.dataset.casefold(), case)
     selected = [first_by_dataset[key] for key in sorted(first_by_dataset)][:target_count]
     selected_hashes = {case.candidate_pool_sha256 for case in selected}
-    for case in ordered:
+    selected_underlying_ids = {
+        case.canonical_underlying_case_id.casefold() for case in selected
+    }
+    for case in independent:
         if len(selected) >= target_count:
             break
-        if case.candidate_pool_sha256 not in selected_hashes:
+        if (
+            case.candidate_pool_sha256 not in selected_hashes
+            and case.canonical_underlying_case_id.casefold()
+            not in selected_underlying_ids
+        ):
             selected.append(case)
             selected_hashes.add(case.candidate_pool_sha256)
+            selected_underlying_ids.add(case.canonical_underlying_case_id.casefold())
     return selected
 
 
@@ -338,7 +489,9 @@ def _public_case_record(case: CandidateCase) -> Dict[str, Any]:
     counts = Counter(unit.source_type.value for unit in case.units)
     return {
         "case_id": case.case_id,
+        "canonical_underlying_case_id": case.canonical_underlying_case_id,
         "dataset": case.dataset,
+        "artifact_contract": case.artifact_contract,
         "artifact_key": case.artifact_key,
         "candidate_pool_sha256": case.candidate_pool_sha256,
         "candidate_count": len(case.units),
@@ -356,7 +509,12 @@ def _finite_number(value: Any, field: str) -> float:
     return number
 
 
-def _top_k_ids(payload: Any) -> Tuple[str, ...]:
+def _numeric_difference(actual: Any, expected: float, field: str) -> float:
+    actual_value = _finite_number(actual, field)
+    return float(abs(Decimal(str(actual_value)) - Decimal(str(expected))))
+
+
+def _public_top_k_ids(payload: Any) -> Tuple[str, ...]:
     current = _unwrap_result(payload)
     candidates: List[Any] = []
     if isinstance(current, dict):
@@ -367,13 +525,10 @@ def _top_k_ids(payload: Any) -> Tuple[str, ...]:
             [
                 current.get("g1_top_k_explanation_unit_ids"),
                 current.get("top_k_units"),
-                current.get("top_k_selection_units"),
             ]
         )
     if isinstance(payload, dict):
-        candidates.extend(
-            [payload.get("top_k_units"), payload.get("top_k_selection_units")]
-        )
+        candidates.append(payload.get("top_k_units"))
     for value in candidates:
         if not isinstance(value, list):
             continue
@@ -390,8 +545,42 @@ def _top_k_ids(payload: Any) -> Tuple[str, ...]:
     raise AuditInputError("reference Top-k unit IDs are unavailable")
 
 
+def _native_top_k_ids(payload: Any) -> Tuple[str, ...]:
+    if not isinstance(payload, dict):
+        raise AuditInputError("native Phase4A reference must be an object")
+    value = payload.get("top_k_selection_units")
+    if not isinstance(value, list) or not value:
+        raise AuditInputError("native top_k_selection_units must be non-empty")
+    ids: List[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise AuditInputError(f"top_k_selection_units[{index}] must be an object")
+        ids.append(
+            _nonblank(
+                item.get("unit_id"),
+                f"top_k_selection_units[{index}].unit_id",
+            )
+        )
+    if len(set(ids)) != len(ids):
+        raise AuditInputError("native top_k_selection_units contains duplicate IDs")
+    return tuple(ids)
+
+
 def extract_reference_snapshot(case: CandidateCase) -> ReferenceSnapshot:
-    records = _candidate_records(case.payload)
+    if case.artifact_contract == NATIVE_PHASE4A:
+        if not isinstance(case.payload, dict):
+            raise AuditInputError("native Phase4A reference must be an object")
+        records = case.payload.get("unit_outputs")
+        if not isinstance(records, list):
+            raise AuditInputError("native Phase4A unit_outputs must be a list")
+        logits_field = "veracity_logits"
+        top_k_unit_ids = _native_top_k_ids(case.payload)
+    elif case.artifact_contract == PUBLIC_RESULT:
+        records = _candidate_records(case.payload)
+        logits_field = "logits"
+        top_k_unit_ids = _public_top_k_ids(case.payload)
+    else:
+        raise AuditInputError("unsupported selector audit artifact contract")
     selection_scores: Dict[str, float] = {}
     fake_logits: Dict[str, float] = {}
     real_logits: Dict[str, float] = {}
@@ -403,7 +592,7 @@ def extract_reference_snapshot(case: CandidateCase) -> ReferenceSnapshot:
             record.get("selection_score"),
             f"reference[{index}].selection_score",
         )
-        logits = record.get("logits", record.get("veracity_logits"))
+        logits = record.get(logits_field)
         if not isinstance(logits, dict) or set(logits) != {"fake", "real"}:
             raise AuditInputError(f"reference[{index}] requires fake/real logits")
         fake_logits[unit_id] = _finite_number(
@@ -418,7 +607,7 @@ def extract_reference_snapshot(case: CandidateCase) -> ReferenceSnapshot:
         selection_scores=selection_scores,
         fake_logits=fake_logits,
         real_logits=real_logits,
-        top_k_unit_ids=_top_k_ids(case.payload),
+        top_k_unit_ids=top_k_unit_ids,
     )
 
 
@@ -430,7 +619,9 @@ def _session_component(value: str) -> str:
 def run_reproduction_gate(case: CandidateCase, runner: Any) -> Dict[str, Any]:
     base = {
         "case_id": case.case_id,
+        "canonical_underlying_case_id": case.canonical_underlying_case_id,
         "dataset": case.dataset,
+        "artifact_contract": case.artifact_contract,
         "candidate_pool_sha256": case.candidate_pool_sha256,
         "tolerance": 1e-6,
         "passed": False,
@@ -469,13 +660,25 @@ def run_reproduction_gate(case: CandidateCase, runner: Any) -> Dict[str, Any]:
             if unit.selection_score is None or unit.logits is None:
                 raise AuditInputError("reproduction omitted selector outputs")
             score_differences.append(
-                abs(float(unit.selection_score) - reference.selection_scores[unit_id])
+                _numeric_difference(
+                    unit.selection_score,
+                    reference.selection_scores[unit_id],
+                    f"reproduction[{unit_id}].selection_score",
+                )
             )
             fake_differences.append(
-                abs(float(unit.logits["fake"]) - reference.fake_logits[unit_id])
+                _numeric_difference(
+                    unit.logits["fake"],
+                    reference.fake_logits[unit_id],
+                    f"reproduction[{unit_id}].logits.fake",
+                )
             )
             real_differences.append(
-                abs(float(unit.logits["real"]) - reference.real_logits[unit_id])
+                _numeric_difference(
+                    unit.logits["real"],
+                    reference.real_logits[unit_id],
+                    f"reproduction[{unit_id}].logits.real",
+                )
             )
         base["max_selection_score_difference"] = max(score_differences, default=0.0)
         base["max_fake_logit_difference"] = max(fake_differences, default=0.0)
@@ -579,7 +782,9 @@ def build_pre_scoring_manifest(
         "cases": [
             {
                 "case_id": case.case_id,
+                "canonical_underlying_case_id": case.canonical_underlying_case_id,
                 "dataset": case.dataset,
+                "artifact_contract": case.artifact_contract,
                 "candidate_pool_sha256": case.candidate_pool_sha256,
                 "candidate_unit_ids_in_exposure_order": list(case.candidate_ids),
                 "probes": [
@@ -622,7 +827,9 @@ def _write_candidate_exports(root: Path, cases: Sequence[CandidateCase]) -> None
         payload = {
             "schema_version": 1,
             "case_id": case.case_id,
+            "canonical_underlying_case_id": case.canonical_underlying_case_id,
             "dataset": case.dataset,
+            "artifact_contract": case.artifact_contract,
             "candidate_pool_sha256": case.candidate_pool_sha256,
             "g1_exposure_units": [
                 {
@@ -935,7 +1142,7 @@ def _summary_markdown(
         f"- Cases selected score-blind: {len(selected)}",
         f"- Cases passing reproduction: {metrics['reproduced_case_count']}",
         f"- Formal Test accessed: `{str(metrics['formal_test_accessed']).lower()}`",
-        "- Selection rule: one lexically first unique pool per dataset, then stable dataset/case/hash order.",
+        "- Selection rule: require unique canonical underlying identity and candidate hash; prefer one lexical case per dataset, then stable metadata order.",
         "",
         "## Reproduction gates",
         "",
@@ -1006,11 +1213,15 @@ def run_cross_case_audit(
     _reject_formal_data_path(Path(runtime_config_path).expanduser().resolve())
     report_root = Path(output_dir).expanduser().resolve()
     report_root.mkdir(parents=True, exist_ok=True)
-    inventory, eligible = discover_eligible_cases(discovery_roots)
+    inventory, eligible = discover_eligible_cases(
+        discovery_roots,
+        excluded_paths=(report_root,),
+    )
     selected = select_cases_score_blind(eligible, target_case_count)
     selection_rule = (
-        "Deduplicate by model-input candidate hash; take the lexically first case "
-        "from each dataset, then fill by (dataset, case_id, candidate hash, artifact key)."
+        "Require unique canonical_underlying_case_id and model-input candidate hash; "
+        "take the lexically first independent case from each dataset, then fill by "
+        "(dataset, canonical underlying case ID, case ID, candidate hash, artifact key)."
     )
     selected_manifest = {
         "schema_version": 1,
