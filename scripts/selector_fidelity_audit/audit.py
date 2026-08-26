@@ -180,10 +180,14 @@ def _candidate_records(payload: Any) -> List[Mapping[str, Any]]:
     return records
 
 
-def load_candidate_pool(path: Path) -> List[RuntimeUnit]:
-    candidate_path = Path(path).expanduser().resolve()
-    _reject_formal_data_path(candidate_path)
-    records = _candidate_records(_read_json(candidate_path))
+def load_candidate_pool_payload(payload: Any) -> List[RuntimeUnit]:
+    """Load the exact ordered Frozen G1 pool from an already-read artifact.
+
+    Keeping this transformation shared prevents the cross-case audit from
+    introducing a second candidate interpretation or ranking boundary.
+    """
+
+    records = _candidate_records(payload)
     units: List[RuntimeUnit] = []
     seen_ids = set()
     for index, item in enumerate(records):
@@ -218,6 +222,12 @@ def load_candidate_pool(path: Path) -> List[RuntimeUnit]:
             )
         )
     return units
+
+
+def load_candidate_pool(path: Path) -> List[RuntimeUnit]:
+    candidate_path = Path(path).expanduser().resolve()
+    _reject_formal_data_path(candidate_path)
+    return load_candidate_pool_payload(_read_json(candidate_path))
 
 
 def _fresh_units(units: Iterable[RuntimeUnit]) -> List[RuntimeUnit]:
