@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -101,6 +102,63 @@ def _row(dataset: str, case_id: str, candidates: Optional[list] = None, **extra:
     }
     record.update(extra)
     return record
+
+
+def _write_phase4a_layout(
+    project: Path,
+    *,
+    engine_source: Optional[str] = None,
+) -> Dict[str, Path]:
+    phase3_dir = project / "MDU" / "scripts" / "clip12_phase3_common"
+    phase4a_dir = (
+        project / "MDU" / "scripts" / "clip12_phase4a_inference_handoff"
+    )
+    phase3_dir.mkdir(parents=True)
+    phase4a_dir.mkdir(parents=True)
+    files = {
+        "clip12p3_common.py": phase3_dir / "clip12p3_common.py",
+        "clip12p3_model.py": phase3_dir / "clip12p3_model.py",
+        "clip12p4a_common.py": phase4a_dir / "clip12p4a_common.py",
+        "clip12p4a_engine.py": phase4a_dir / "clip12p4a_engine.py",
+    }
+    files["clip12p3_common.py"].write_text(
+        "def common_marker():\n"
+        "    return 'phase3-common'\n",
+        encoding="utf-8",
+    )
+    files["clip12p3_model.py"].write_text(
+        "from clip12p3_common import common_marker\n\n"
+        "def model_marker():\n"
+        "    return common_marker() + ':model'\n",
+        encoding="utf-8",
+    )
+    files["clip12p4a_common.py"].write_text(
+        "def phase4a_marker():\n"
+        "    return 'phase4a-common'\n",
+        encoding="utf-8",
+    )
+    files["clip12p4a_engine.py"].write_text(
+        engine_source
+        or (
+            "import sys\n"
+            "from clip12p3_common import common_marker\n"
+            "from clip12p3_model import model_marker\n"
+            "from clip12p4a_common import phase4a_marker\n\n"
+            "IMPORT_PATH_SNAPSHOT = tuple(sys.path)\n\n"
+            "def normalize_request(request, config):\n"
+            "    assert common_marker() == 'phase3-common'\n"
+            "    assert model_marker() == 'phase3-common:model'\n"
+            "    assert phase4a_marker() == 'phase4a-common'\n"
+            "    limit = int(config['maximum_units_per_sample'])\n"
+            "    result = dict(request)\n"
+            "    result['candidate_units'] = list(request['candidate_units'])[:limit]\n"
+            "    result['truncated_unit_count'] = max(0, len(request['candidate_units']) - limit)\n"
+            "    result['dropped_unsupported_count'] = 0\n"
+            "    return result\n"
+        ),
+        encoding="utf-8",
+    )
+    return files
 
 
 class ControlledExposureAdapter:
@@ -494,24 +552,7 @@ class SelectorRelevanceCalibrationDatasetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
-            engine = (
-                project
-                / "MDU"
-                / "scripts"
-                / "clip12_phase4a_inference_handoff"
-                / "clip12p4a_engine.py"
-            )
-            engine.parent.mkdir(parents=True)
-            engine.write_text(
-                "def normalize_request(request, config):\n"
-                "    limit = int(config['maximum_units_per_sample'])\n"
-                "    result = dict(request)\n"
-                "    result['candidate_units'] = list(request['candidate_units'])[:limit]\n"
-                "    result['truncated_unit_count'] = max(0, len(request['candidate_units']) - limit)\n"
-                "    result['dropped_unsupported_count'] = 0\n"
-                "    return result\n",
-                encoding="utf-8",
-            )
+            _write_phase4a_layout(project)
             config = root / "config.json"
             config.write_text('{"maximum_units_per_sample":4}\n', encoding="utf-8")
             adapter = builder.Phase4ANormalizationExposureAdapter.from_project_root(
@@ -527,6 +568,139 @@ class SelectorRelevanceCalibrationDatasetTests(unittest.TestCase):
         self.assertEqual(4, len(result.candidate_units))
         self.assertEqual(1, result.truncated_count)
         self.assertEqual(0, result.dropped_unsupported_count)
+
+    def test_real_exposure_loader_uses_exact_flat_import_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            _write_phase4a_layout(project)
+            config = root / "config.json"
+            config.write_text('{"maximum_units_per_sample":24}\n', encoding="utf-8")
+            adapter = builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                project, config
+            )
+            import_path = adapter._normalize_request.__globals__[  # type: ignore[attr-defined]
+                "IMPORT_PATH_SNAPSHOT"
+            ]
+        self.assertEqual(
+            str(
+                (
+                    project / "MDU" / "scripts" / "clip12_phase3_common"
+                ).resolve()
+            ),
+            import_path[0],
+        )
+        self.assertEqual(
+            str(
+                (
+                    project
+                    / "MDU"
+                    / "scripts"
+                    / "clip12_phase4a_inference_handoff"
+                ).resolve()
+            ),
+            import_path[1],
+        )
+
+    def test_real_exposure_loader_does_not_rely_on_mdu_scripts_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            _write_phase4a_layout(project)
+            config = root / "config.json"
+            config.write_text('{"maximum_units_per_sample":24}\n', encoding="utf-8")
+            adapter = builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                project, config
+            )
+            import_path = adapter._normalize_request.__globals__[  # type: ignore[attr-defined]
+                "IMPORT_PATH_SNAPSHOT"
+            ]
+        self.assertNotIn(str((project / "MDU" / "scripts").resolve()), import_path)
+
+    def test_real_exposure_loader_restores_sys_path_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            _write_phase4a_layout(project)
+            config = root / "config.json"
+            config.write_text('{"maximum_units_per_sample":24}\n', encoding="utf-8")
+            original_sys_path = list(sys.path)
+            builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                project, config
+            )
+            self.assertEqual(original_sys_path, sys.path)
+
+    def test_real_exposure_loader_restores_sys_path_after_failed_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            _write_phase4a_layout(
+                project,
+                engine_source=(
+                    "from clip12p3_common import common_marker\n"
+                    "from clip12p3_model import model_marker\n"
+                    "from clip12p4a_common import phase4a_marker\n"
+                    "raise RuntimeError('fixture import failure')\n"
+                ),
+            )
+            config = root / "config.json"
+            config.write_text('{"maximum_units_per_sample":24}\n', encoding="utf-8")
+            original_sys_path = list(sys.path)
+            with self.assertRaisesRegex(
+                FrozenExposureUnavailableError,
+                "cannot import actual Phase4A normalization module",
+            ):
+                builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                    project, config
+                )
+            self.assertEqual(original_sys_path, sys.path)
+
+    def test_real_exposure_loader_requires_every_real_dependency_file(self):
+        required_names = (
+            "clip12p3_common.py",
+            "clip12p3_model.py",
+            "clip12p4a_common.py",
+            "clip12p4a_engine.py",
+        )
+        for missing_name in required_names:
+            with self.subTest(missing_name=missing_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    project = root / "project"
+                    files = _write_phase4a_layout(project)
+                    files[missing_name].unlink()
+                    config = root / "config.json"
+                    config.write_text(
+                        '{"maximum_units_per_sample":24}\n', encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        FrozenExposureUnavailableError, missing_name
+                    ):
+                        builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                            project, config
+                        )
+
+    def test_real_exposure_loader_missing_normalizer_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            _write_phase4a_layout(
+                project,
+                engine_source=(
+                    "from clip12p3_common import common_marker\n"
+                    "from clip12p3_model import model_marker\n"
+                    "from clip12p4a_common import phase4a_marker\n"
+                ),
+            )
+            config = root / "config.json"
+            config.write_text('{"maximum_units_per_sample":24}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                FrozenExposureUnavailableError,
+                "Phase4A normalize_request is unavailable",
+            ):
+                builder.Phase4ANormalizationExposureAdapter.from_project_root(
+                    project, config
+                )
 
     def test_real_exposure_loader_accepts_request_only_pure_normalizer(self):
         adapter = builder.Phase4ANormalizationExposureAdapter(

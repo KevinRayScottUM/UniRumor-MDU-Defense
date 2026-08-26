@@ -805,35 +805,66 @@ class Phase4ANormalizationExposureAdapter:
         project_root = Path(project_root).expanduser().resolve()
         config_path = _reject_formal_path(phase4a_config_path, "Phase4A config")
         config = _read_json(config_path, "Phase4A config")
-        engine_path = project_root / "MDU" / "scripts" / "clip12_phase4a_inference_handoff" / "clip12p4a_engine.py"
-        if not engine_path.is_file():
+        phase3_common_dir = (
+            project_root / "MDU" / "scripts" / "clip12_phase3_common"
+        )
+        phase4a_dir = (
+            project_root
+            / "MDU"
+            / "scripts"
+            / "clip12_phase4a_inference_handoff"
+        )
+        required_files = (
+            phase3_common_dir / "clip12p3_common.py",
+            phase3_common_dir / "clip12p3_model.py",
+            phase4a_dir / "clip12p4a_common.py",
+            phase4a_dir / "clip12p4a_engine.py",
+        )
+        missing_files = [path.name for path in required_files if not path.is_file()]
+        if missing_files:
             raise FrozenExposureUnavailableError(
-                "actual Phase4A normalize_request implementation is missing"
+                "required Phase4A normalization dependency is missing: "
+                + ", ".join(missing_files)
             )
+        engine_path = phase4a_dir / "clip12p4a_engine.py"
         module_name = "_selector_relevance_phase4a_engine"
         spec = importlib.util.spec_from_file_location(module_name, engine_path)
         if spec is None or spec.loader is None:
             raise FrozenExposureUnavailableError("cannot load Phase4A normalization module")
         module = importlib.util.module_from_spec(spec)
-        desired_entries = [str(project_root), str(engine_path.parent)]
-        inserted = []
-        for entry in reversed(desired_entries):
-            if entry not in sys.path:
-                sys.path.insert(0, entry)
-                inserted.append(entry)
-        sys.modules[module_name] = module
+        dependency_entries = (str(phase3_common_dir), str(phase4a_dir))
+        original_sys_path = list(sys.path)
+        isolated_module_names = (
+            module_name,
+            "clip12p3_common",
+            "clip12p3_model",
+            "clip12p4a_common",
+        )
+        missing_module = object()
+        original_modules = {
+            name: sys.modules.get(name, missing_module)
+            for name in isolated_module_names
+        }
         try:
+            sys.path[:] = list(dependency_entries) + [
+                entry for entry in original_sys_path if entry not in dependency_entries
+            ]
+            for name in isolated_module_names:
+                sys.modules.pop(name, None)
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
+            function = getattr(module, "normalize_request", None)
         except Exception as exc:
             raise FrozenExposureUnavailableError(
                 "cannot import actual Phase4A normalization module"
             ) from exc
         finally:
-            sys.modules.pop(module_name, None)
-            for entry in inserted:
-                if entry in sys.path:
-                    sys.path.remove(entry)
-        function = getattr(module, "normalize_request", None)
+            sys.path[:] = original_sys_path
+            for name, original_module in original_modules.items():
+                if original_module is missing_module:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = original_module
         return cls(function, config)
 
     def _call(self, request: Mapping[str, Any]) -> Any:
