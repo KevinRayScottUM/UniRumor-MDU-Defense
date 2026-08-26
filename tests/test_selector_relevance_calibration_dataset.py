@@ -569,6 +569,49 @@ class SelectorRelevanceCalibrationDatasetTests(unittest.TestCase):
         self.assertEqual(1, result.truncated_count)
         self.assertEqual(0, result.dropped_unsupported_count)
 
+    def test_real_dicc_signature_receives_required_strict_visual_policy(self):
+        calls = []
+
+        def normalize_request(
+            request,
+            config,
+            *,
+            drop_unsupported_visual,
+        ):
+            calls.append(
+                {
+                    "request": request,
+                    "config": config,
+                    "drop_unsupported_visual": drop_unsupported_visual,
+                }
+            )
+            result = dict(request)
+            result["candidate_units"] = list(request["candidate_units"])
+            result["truncated_unit_count"] = 0
+            result["dropped_unsupported_count"] = 0
+            return result
+
+        config = {"maximum_units_per_sample": 24}
+        adapter = builder.Phase4ANormalizationExposureAdapter(
+            normalize_request, config
+        )
+        self.assertEqual([], calls)
+        self.assertEqual(
+            "config_keyword_with_strict_visual_policy", adapter._invocation
+        )
+        request = {
+            "candidate_units": _balanced_candidates("strict-visual-policy"),
+            "claim": "claim",
+            "dataset": "DatasetA",
+            "case_id": "case",
+        }
+        result = adapter.normalize(request)
+        self.assertEqual(len(request["candidate_units"]), len(result.candidate_units))
+        self.assertEqual(1, len(calls))
+        self.assertIs(request, calls[0]["request"])
+        self.assertIs(config, calls[0]["config"])
+        self.assertIs(False, calls[0]["drop_unsupported_visual"])
+
     def test_real_exposure_loader_uses_exact_flat_import_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

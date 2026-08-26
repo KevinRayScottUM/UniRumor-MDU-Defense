@@ -780,6 +780,13 @@ class Phase4ANormalizationExposureAdapter:
                 "Phase4A normalize_request signature cannot be inspected"
             ) from exc
         probes = (
+            (
+                "config_keyword_with_strict_visual_policy",
+                (
+                    ({},),
+                    {"config": {}, "drop_unsupported_visual": False},
+                ),
+            ),
             ("config_keyword", (({},), {"config": {}})),
             ("request_keywords", ((), {"request": {}, "config": {}})),
             ("row_keywords", ((), {"row": {}, "config": {}})),
@@ -868,6 +875,12 @@ class Phase4ANormalizationExposureAdapter:
         return cls(function, config)
 
     def _call(self, request: Mapping[str, Any]) -> Any:
+        if self._invocation == "config_keyword_with_strict_visual_policy":
+            return self._normalize_request(
+                request,
+                config=self._config,
+                drop_unsupported_visual=False,
+            )
         if self._invocation == "config_keyword":
             return self._normalize_request(request, config=self._config)
         if self._invocation == "request_keywords":
