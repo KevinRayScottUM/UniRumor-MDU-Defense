@@ -26,7 +26,7 @@ from scripts.selector_fidelity_audit.cross_case import (
 
 
 SCHEMA_VERSION = 1
-IMPLEMENTATION_REVISION = "step2.6r-1a-v1"
+IMPLEMENTATION_REVISION = "step2.6r-1a-v2"
 CALIBRATED_SELECTOR_ID = "G1-RelevanceSelector-Cal-v1"
 CPAC_HELDOUT_ID = "GroundLie360:13025004"
 AUTHORITATIVE_TRAIN_SHA256 = (
@@ -162,9 +162,16 @@ class SourceCase:
     source_dataset: str
     source_case_id: str
     canonical_underlying_case_id: str
+    source_split: str
     source_row_index: int
     request: Mapping[str, Any]
     candidates: Tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ProvenanceAssessment:
+    ambiguous: bool
+    accepted_inherited_test_unit_id_count: int
 
 
 @dataclass(frozen=True)
@@ -398,6 +405,70 @@ def row_has_ambiguous_provenance(candidates: Sequence[Mapping[str, Any]]) -> boo
     return False
 
 
+def _groundlie_inherited_test_case_id(
+    source_case: SourceCase,
+    train_source_sha256: str,
+) -> Optional[str]:
+    if train_source_sha256 != AUTHORITATIVE_TRAIN_SHA256:
+        return None
+    if normalize_text(source_case.source_dataset).casefold() != "groundlie360":
+        return None
+    if normalize_text(source_case.source_split).casefold() != "train":
+        return None
+    canonical_parts = source_case.canonical_underlying_case_id.split(":")
+    if (
+        len(canonical_parts) != 2
+        or canonical_parts[0].casefold() != "groundlie360"
+        or not canonical_parts[1]
+    ):
+        return None
+    return canonical_parts[1]
+
+
+def _is_exact_groundlie_inherited_test_unit_id(value: Any, case_id: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    prefix = f"GroundLie360:test:{case_id}:"
+    if not value.startswith(prefix):
+        return False
+    remainder = value[len(prefix) :]
+    if not remainder:
+        return False
+    return not _ambiguous_string(":" + remainder)
+
+
+def assess_source_case_provenance(
+    source_case: SourceCase,
+    train_source_sha256: str,
+) -> ProvenanceAssessment:
+    inherited_case_id = _groundlie_inherited_test_case_id(
+        source_case, train_source_sha256
+    )
+    accepted_count = 0
+    for candidate in source_case.candidates:
+        for field in _PROVENANCE_FIELDS:
+            value = candidate.get(field)
+            if not _provenance_value_is_ambiguous(value):
+                continue
+            if (
+                field == "unit_id"
+                and inherited_case_id is not None
+                and _is_exact_groundlie_inherited_test_unit_id(
+                    value, inherited_case_id
+                )
+            ):
+                accepted_count += 1
+                continue
+            return ProvenanceAssessment(
+                ambiguous=True,
+                accepted_inherited_test_unit_id_count=0,
+            )
+    return ProvenanceAssessment(
+        ambiguous=False,
+        accepted_inherited_test_unit_id_count=accepted_count,
+    )
+
+
 def _candidate_request_record(candidate: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "unit_id": candidate.get("unit_id"),
@@ -431,6 +502,7 @@ def _source_case_from_row(row: Mapping[str, Any], row_index: int) -> SourceCase:
     candidates = tuple(raw_candidates)
     source_dataset = dataset.strip()
     source_case_id = str(case_id).strip()
+    source_split = normalize_text(row.get("split"))
     request = {
         "dataset": source_dataset,
         "case_id": source_case_id,
@@ -443,6 +515,7 @@ def _source_case_from_row(row: Mapping[str, Any], row_index: int) -> SourceCase:
         canonical_underlying_case_id=canonicalize_underlying_case_id(
             source_dataset, source_case_id
         ),
+        source_split=source_split,
         source_row_index=row_index,
         request=request,
         candidates=candidates,
@@ -739,6 +812,7 @@ def _dataset_card(report: Mapping[str, Any]) -> str:
             "- Step 2.5B five cases and the CPAC strict case are held out.",
             "- Formal Validation was not used.",
             "- Formal Test was not used.",
+            "- GroundLie360 unit IDs in the locked Train artifact retain a historical `:test:` identifier token. A full Train-artifact audit found this convention across all GroundLie360 Train rows and only in `unit_id`. The builder therefore permits this exact same-case unit-ID pattern under the immutable Train SHA, while retaining fail-closed rejection for all other ambiguous provenance.",
             "- No source-specific inference bonus or modality quota is introduced.",
             "- No selector outputs, veracity labels, model, or checkpoint were used.",
             f"- Eligible cases: {report['eligible_case_count']}.",
@@ -982,6 +1056,8 @@ def build_calibration_dataset(
     source_row_count = 0
     malformed_source_row_count = 0
     ambiguous_provenance_exclusion_count = 0
+    groundlie_inherited_test_unit_id_accepted_count = 0
+    groundlie_inherited_test_unit_id_case_count = 0
     heldout_exclusion_count = 0
     duplicate_underlying_case_count = 0
     frozen_exposure_failure_count = 0
@@ -1030,9 +1106,17 @@ def build_calibration_dataset(
             heldout_exclusion_count += 1
             heldout_excluded_ids.add(canonical)
             continue
-        if row_has_ambiguous_provenance(source_case.candidates):
+        provenance = assess_source_case_provenance(
+            source_case, train_lock.source_sha256
+        )
+        if provenance.ambiguous:
             ambiguous_provenance_exclusion_count += 1
             continue
+        if provenance.accepted_inherited_test_unit_id_count:
+            groundlie_inherited_test_unit_id_accepted_count += (
+                provenance.accepted_inherited_test_unit_id_count
+            )
+            groundlie_inherited_test_unit_id_case_count += 1
         frozen_exposure_attempt_count += 1
         try:
             exposed = exposure_adapter.normalize(source_case.request)
@@ -1207,6 +1291,12 @@ def build_calibration_dataset(
         "heldout_case_ids": sorted(heldout),
         "heldout_source_case_exclusion_count": heldout_exclusion_count,
         "ambiguous_provenance_exclusion_count": ambiguous_provenance_exclusion_count,
+        "groundlie_inherited_test_unit_id_accepted_count": (
+            groundlie_inherited_test_unit_id_accepted_count
+        ),
+        "groundlie_inherited_test_unit_id_case_count": (
+            groundlie_inherited_test_unit_id_case_count
+        ),
         "malformed_source_row_count": malformed_source_row_count,
         "duplicate_underlying_case_count": duplicate_underlying_case_count,
         "frozen_exposure_failure_count": frozen_exposure_failure_count,

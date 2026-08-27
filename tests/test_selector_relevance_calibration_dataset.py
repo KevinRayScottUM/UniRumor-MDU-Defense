@@ -252,6 +252,39 @@ class BuilderFixture:
         )
 
 
+def _groundlie_row(
+    case_id: str,
+    *,
+    split: str = "train",
+    unit_case_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    unit_case_id = unit_case_id or case_id
+    candidates = _balanced_candidates(f"groundlie-{case_id}")
+    candidates[0]["unit_id"] = (
+        f"GroundLie360:test:{unit_case_id}:transcript:0"
+    )
+    candidates[2]["unit_id"] = f"GroundLie360:test:{unit_case_id}:ocr:0"
+    return _row(
+        "GroundLie360",
+        f"GroundLie360:train:{case_id}",
+        candidates,
+        split=split,
+    )
+
+
+def _build_with_authoritative_train_lock(
+    fixture: BuilderFixture,
+    output: Path,
+    adapter=None,
+):
+    train_lock = builder.TrainLock(
+        source_path=fixture.source.resolve(),
+        source_sha256=builder.AUTHORITATIVE_TRAIN_SHA256,
+    )
+    with patch.object(builder, "verify_train_lock", return_value=train_lock):
+        return fixture.build(output, adapter)
+
+
 class SelectorRelevanceCalibrationDatasetTests(unittest.TestCase):
     def test_cli_contract_exposes_required_paths_and_repeatable_heldout_cases(self):
         args = build_parser().parse_args(
@@ -452,6 +485,185 @@ class SelectorRelevanceCalibrationDatasetTests(unittest.TestCase):
         self.assertEqual(1, len(adapter.calls))
         self.assertEqual(1, result.build_report["ambiguous_provenance_exclusion_count"])
         self.assertFalse(result.build_report["formal_test_accessed"])
+
+    def test_locked_groundlie_train_same_case_transcript_and_ocr_ids_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = BuilderFixture(root, [_groundlie_row("123")])
+            adapter = ControlledExposureAdapter()
+            result = _build_with_authoritative_train_lock(
+                fixture, root / "output", adapter
+            )
+            card = (result.output_dir / "dataset_card.md").read_text(encoding="utf-8")
+        self.assertEqual(1, len(adapter.calls))
+        self.assertEqual(1, result.build_report["eligible_case_count"])
+        self.assertEqual(
+            0, result.build_report["ambiguous_provenance_exclusion_count"]
+        )
+        self.assertEqual(
+            2,
+            result.build_report[
+                "groundlie_inherited_test_unit_id_accepted_count"
+            ],
+        )
+        self.assertEqual(
+            1,
+            result.build_report["groundlie_inherited_test_unit_id_case_count"],
+        )
+        self.assertIn(
+            "retain a historical `:test:` identifier token",
+            card,
+        )
+        self.assertIn("exact same-case unit-ID pattern", card)
+        self.assertFalse(result.build_report["formal_test_accessed"])
+
+    def test_groundlie_inherited_unit_id_requires_same_underlying_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = BuilderFixture(
+                root, [_groundlie_row("123", unit_case_id="999")]
+            )
+            adapter = ControlledExposureAdapter()
+            result = _build_with_authoritative_train_lock(
+                fixture, root / "output", adapter
+            )
+        self.assertEqual([], adapter.calls)
+        self.assertEqual(
+            1, result.build_report["ambiguous_provenance_exclusion_count"]
+        )
+        self.assertEqual(
+            0,
+            result.build_report[
+                "groundlie_inherited_test_unit_id_accepted_count"
+            ],
+        )
+
+    def test_groundlie_inherited_unit_id_requires_top_level_train_split(self):
+        for split in ("test", "validation"):
+            with self.subTest(split=split):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    fixture = BuilderFixture(
+                        root, [_groundlie_row("123", split=split)]
+                    )
+                    adapter = ControlledExposureAdapter()
+                    result = _build_with_authoritative_train_lock(
+                        fixture, root / "output", adapter
+                    )
+                self.assertEqual([], adapter.calls)
+                self.assertEqual(
+                    1,
+                    result.build_report["ambiguous_provenance_exclusion_count"],
+                )
+                self.assertEqual(
+                    0,
+                    result.build_report[
+                        "groundlie_inherited_test_unit_id_accepted_count"
+                    ],
+                )
+
+    def test_groundlie_inherited_unit_id_requires_exact_authoritative_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = BuilderFixture(root, [_groundlie_row("123")])
+            self.assertNotEqual(
+                builder.AUTHORITATIVE_TRAIN_SHA256, fixture.source_sha
+            )
+            adapter = ControlledExposureAdapter()
+            result = fixture.build(root / "output", adapter)
+        self.assertEqual([], adapter.calls)
+        self.assertEqual(
+            1, result.build_report["ambiguous_provenance_exclusion_count"]
+        )
+        self.assertEqual(
+            0,
+            result.build_report[
+                "groundlie_inherited_test_unit_id_accepted_count"
+            ],
+        )
+
+    def test_groundlie_exception_rejects_other_dataset_fields_and_markers(self):
+        cases = (
+            (
+                "other_dataset",
+                _row(
+                    "TRUE-3MFact",
+                    "TRUE-3MFact:train:123",
+                    [
+                        _candidate(
+                            "TRUE-3MFact:test:123:transcript:0",
+                            "transcript",
+                            "Experts discuss public safety during this interview.",
+                        ),
+                        *_balanced_candidates("true-other")[1:],
+                    ],
+                    split="train",
+                ),
+            ),
+            ("source_test", ("source", "artifact:test:segment")),
+            ("snippet_path_test", ("snippet_path", "artifact/test/segment")),
+            (
+                "grounding_source_test",
+                ("grounding", {"source": "artifact:test:segment"}),
+            ),
+            ("source_validation", ("source", "artifact:validation:segment")),
+            (
+                "snippet_path_validation",
+                ("snippet_path", "artifact/validation/segment"),
+            ),
+        )
+        for name, mutation in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    if name == "other_dataset":
+                        row = mutation
+                    else:
+                        row = _groundlie_row("123")
+                        field, value = mutation
+                        row["candidate_units"][1][field] = value
+                    fixture = BuilderFixture(root, [row])
+                    adapter = ControlledExposureAdapter()
+                    result = _build_with_authoritative_train_lock(
+                        fixture, root / "output", adapter
+                    )
+                self.assertEqual([], adapter.calls)
+                self.assertEqual(
+                    1,
+                    result.build_report["ambiguous_provenance_exclusion_count"],
+                )
+                self.assertEqual(
+                    0,
+                    result.build_report[
+                        "groundlie_inherited_test_unit_id_accepted_count"
+                    ],
+                )
+
+    def test_heldout_groundlie_precedes_inherited_unit_id_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = BuilderFixture(root, [_groundlie_row("13025004")])
+            adapter = ControlledExposureAdapter()
+            result = _build_with_authoritative_train_lock(
+                fixture, root / "output", adapter
+            )
+        self.assertEqual([], adapter.calls)
+        self.assertEqual(
+            1, result.build_report["heldout_source_case_exclusion_count"]
+        )
+        self.assertEqual(
+            0, result.build_report["ambiguous_provenance_exclusion_count"]
+        )
+        self.assertEqual(
+            0,
+            result.build_report[
+                "groundlie_inherited_test_unit_id_accepted_count"
+            ],
+        )
+        self.assertEqual(
+            0,
+            result.build_report["groundlie_inherited_test_unit_id_case_count"],
+        )
 
     def test_all_required_ambiguous_provenance_markers_are_detected(self):
         for marker in (":test:", ":validation:", "/test/", "/validation/"):
