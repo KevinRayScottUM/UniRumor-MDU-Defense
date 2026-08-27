@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-IMPLEMENTATION_REVISION = "step2.6r-1c-v1"
+IMPLEMENTATION_REVISION = "step2.6r-1c-r-v1"
 CALIBRATION_REVISION = "step2.6r-1a-v2"
 OCR = "OCR"
 TRANSCRIPT = "TRANSCRIPT"
@@ -539,8 +539,12 @@ def _contains_role(source: str, role: str) -> bool:
                 "unit.text",
                 "unit['text']",
                 'unit["text"]',
+                "unit.get('text')",
+                'unit.get("text")',
                 "candidate['text']",
                 'candidate["text"]',
+                "candidate.get('text')",
+                'candidate.get("text")',
             )
         )
     return role.casefold() in compact
@@ -559,6 +563,8 @@ class _SourceAnalyzer(ast.NodeVisitor):
         self.relative_path = relative_path
         self.scope: List[str] = []
         self.assignments: List[Dict[str, ast.AST]] = []
+        self.collection_appends: List[Dict[str, List[Tuple[str, ...]]]] = []
+        self.unsupported_collection_appends: List[set[str]] = []
         self.tokenizer_calls: List[Mapping[str, Any]] = []
         self.tokenizer_preparation: List[Mapping[str, Any]] = []
         self.model_calls: List[Mapping[str, Any]] = []
@@ -573,7 +579,11 @@ class _SourceAnalyzer(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.scope.append(node.name)
         self.assignments.append({})
+        self.collection_appends.append({})
+        self.unsupported_collection_appends.append(set())
         self.generic_visit(node)
+        self.unsupported_collection_appends.pop()
+        self.collection_appends.pop()
         self.assignments.pop()
         self.scope.pop()
 
@@ -586,14 +596,95 @@ class _SourceAnalyzer(ast.NodeVisitor):
                     self.assignments[-1][target.id] = node.value
         self.generic_visit(node)
 
+    def _collection_projection(self, node: ast.AST) -> Optional[str]:
+        if (
+            not isinstance(node, ast.ListComp)
+            or len(node.generators) != 1
+            or not self.collection_appends
+        ):
+            return None
+        generator = node.generators[0]
+        if (
+            not isinstance(generator.target, ast.Name)
+            or not isinstance(generator.iter, ast.Name)
+            or generator.ifs
+            or generator.is_async
+        ):
+            return None
+        collection_name = generator.iter.id
+        if collection_name in self.unsupported_collection_appends[-1]:
+            return None
+        element = node.elt
+        if (
+            not isinstance(element, ast.Subscript)
+            or not isinstance(element.value, ast.Name)
+            or element.value.id != generator.target.id
+            or not isinstance(element.slice, ast.Constant)
+            or type(element.slice.value) is not int
+            or element.slice.value not in {0, 1}
+        ):
+            return None
+        appended = self.collection_appends[-1].get(collection_name, [])
+        if not appended or any(len(item) != 2 for item in appended):
+            return None
+        index = element.slice.value
+        projections = [item[index] for item in appended]
+        expected_role = "claim" if index == 0 else "unit_text"
+        if not all(_contains_role(item, expected_role) for item in projections):
+            return None
+        return (
+            f"{ast.unparse(node)} -> "
+            + " || ".join(f"append_tuple[{index}]=({item})" for item in projections)
+        )
+
     def _expanded(self, node: ast.AST, depth: int = 0) -> str:
+        projection = self._collection_projection(node)
+        if projection is not None:
+            return projection
         if depth < 4 and isinstance(node, ast.Name) and self.assignments:
             assigned = self.assignments[-1].get(node.id)
             if assigned is not None:
                 return f"{node.id}=({self._expanded(assigned, depth + 1)})"
-        return ast.unparse(node)
+        rendered = ast.unparse(node)
+        if depth >= 4 or not self.assignments:
+            return rendered
+        resolved_names: List[str] = []
+        seen = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Name) or child.id in seen:
+                continue
+            assigned = self.assignments[-1].get(child.id)
+            if assigned is None or assigned is node:
+                continue
+            seen.add(child.id)
+            resolved_names.append(
+                f"{child.id}=({self._expanded(assigned, depth + 1)})"
+            )
+        if not resolved_names:
+            return rendered
+        return f"{rendered} [resolved: {'; '.join(resolved_names)}]"
+
+    def _record_collection_append(self, node: ast.Call) -> None:
+        if (
+            not self.collection_appends
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "append"
+            or not isinstance(node.func.value, ast.Name)
+        ):
+            return
+        collection_name = node.func.value.id
+        if len(node.args) != 1 or node.keywords:
+            self.unsupported_collection_appends[-1].add(collection_name)
+            return
+        value = node.args[0]
+        if not isinstance(value, ast.Tuple) or len(value.elts) != 2:
+            self.unsupported_collection_appends[-1].add(collection_name)
+            return
+        components = tuple(self._expanded(item) for item in value.elts)
+        self.collection_appends[-1].setdefault(collection_name, []).append(components)
 
     def visit_Call(self, node: ast.Call) -> None:
+        self._record_collection_append(node)
         name = _call_name(node.func)
         lowered = name.casefold()
         record = {
@@ -726,13 +817,13 @@ def inspect_encoding_contract(project_root: Path) -> Mapping[str, Any]:
             keyword_expressions.get("text_pair", args[1] if len(args) >= 2 else "")
         )
         if second_expression:
-            style = "TOKENIZER_SEQUENCE_PAIR"
+            style = "SEQUENCE_PAIR"
         elif re.search(r"\bzip\s*\(", first_expression) or re.search(
             r"\([^()]*(?:claim)[^()]*,[^()]*(?:unit|candidate)[^()]*\)",
             first_expression,
             flags=re.IGNORECASE,
         ):
-            style = "TOKENIZER_SEQUENCE_PAIR_BATCH"
+            style = "SEQUENCE_PAIR"
         else:
             style = "MANUAL_CONCATENATION_SINGLE_SEQUENCE"
         claim_serialized = _contains_role(first_expression, "claim")
@@ -769,7 +860,7 @@ def inspect_encoding_contract(project_root: Path) -> Mapping[str, Any]:
     config_truncation = _recursive_config_value(config, "truncation")
     if isinstance(truncation, str) and config_truncation is not None:
         truncation = config_truncation
-    if style == "TOKENIZER_SEQUENCE_PAIR" and truncation is True:
+    if style == "SEQUENCE_PAIR" and truncation is True:
         truncation_strategy = "longest_first"
         truncatable_side = "both sequences as needed"
     elif truncation == "only_first":
@@ -849,6 +940,7 @@ def inspect_encoding_contract(project_root: Path) -> Mapping[str, Any]:
         "maximum_sequence_length_expression": max_length_expression,
         "maximum_sequence_length": max_length,
         "truncation_expression": truncation_expression,
+        "truncation": truncation if truncation is not None else UNKNOWN,
         "truncation_strategy": truncation_strategy,
         "truncatable_side": truncatable_side,
         "padding_expression": padding_expression,

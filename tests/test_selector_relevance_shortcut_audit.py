@@ -215,6 +215,91 @@ def _write_encoding_fixture(root: Path, *, explicit: bool = False) -> Path:
     return root
 
 
+def _write_resolved_encoding_fixture(root: Path) -> Path:
+    project = _write_encoding_fixture(root)
+    phase3_common = project / "MDU/scripts/clip12_phase3_common/clip12p3_model.py"
+    phase3_common.write_text(
+        "class MDUSelectorVerifier:\n"
+        "    pass\n\n"
+        "class Batch:\n"
+        "    def __init__(self, encoded, unit_ids):\n"
+        "        self.encoded = encoded\n"
+        "        self.unit_ids = unit_ids\n\n"
+        "class MDUDataset:\n"
+        "    def __getitem__(self, index):\n"
+        "        row = self.rows[index]\n"
+        "        return {\n"
+        "            'claim': row['claim'],\n"
+        "            'dataset': row['dataset'],\n"
+        "            'units': ordered_units(row['candidate_units']),\n"
+        "        }\n\n"
+        "def collator(tokenizer, max_length):\n"
+        "    def collate(items):\n"
+        "        pair_texts = []\n"
+        "        unit_ids = []\n"
+        "        datasets = []\n"
+        "        for item in items:\n"
+        "            datasets.append(item['dataset'])\n"
+        "            for unit in item['units']:\n"
+        "                prefix = (\n"
+        "                    f\"[UNIT_TYPE={unit.get('unit_type')}] \"\n"
+        "                    f\"[MODALITY={unit.get('modality')}]\"\n"
+        "                )\n"
+        "                pair_texts.append((\n"
+        "                    item['claim'],\n"
+        "                    prefix + ' ' + normalize_text(unit.get('text')),\n"
+        "                ))\n"
+        "                unit_ids.append(unit.get('unit_id'))\n"
+        "        encoded = tokenizer(\n"
+        "            [pair[0] for pair in pair_texts],\n"
+        "            [pair[1] for pair in pair_texts],\n"
+        "            padding=True,\n"
+        "            truncation=True,\n"
+        "            max_length=max_length,\n"
+        "            return_tensors='pt',\n"
+        "        )\n"
+        "        return Batch(encoded, unit_ids)\n"
+        "    return collate\n",
+        encoding="utf-8",
+    )
+    phase3_final = (
+        project / "MDU/scripts/clip12_phase3a_final_fit/clip12p3a_final_fit.py"
+    )
+    phase3_final.write_text(
+        "from clip12p3_model import MDUSelectorVerifier, collator\n\n"
+        "def final_fit(tokenizer, max_length):\n"
+        "    model = MDUSelectorVerifier()\n"
+        "    return model, collator(tokenizer, max_length)\n",
+        encoding="utf-8",
+    )
+    phase4a = (
+        project
+        / "MDU/scripts/clip12_phase4a_inference_handoff/clip12p4a_engine.py"
+    )
+    phase4a.write_text(
+        "class Phase4AEngine:\n"
+        "    def encode(self, normalized, units, max_length):\n"
+        "        source_dataset = normalized.get('dataset')\n"
+        "        batch_unit_ids = [unit.get('unit_id') for unit in units]\n"
+        "        encoded = self.tokenizer(\n"
+        "            [normalized['claim']] * len(units),\n"
+        "            [\n"
+        "                f\"[UNIT_TYPE={unit.get('unit_type')}] \"\n"
+        "                f\"[MODALITY={unit.get('modality')}] \"\n"
+        "                f\"{normalize_text(unit.get('text'))}\"\n"
+        "                for unit in units\n"
+        "            ],\n"
+        "            padding=True,\n"
+        "            truncation=True,\n"
+        "            max_length=max_length,\n"
+        "            return_tensors='pt',\n"
+        "        )\n"
+        "        return encoded, source_dataset, batch_unit_ids\n",
+        encoding="utf-8",
+    )
+    return project
+
+
 class TemplateAndControlTests(unittest.TestCase):
     def test_original_templates_and_claim_only_predictor(self) -> None:
         ocr = parse_original_template('The on-screen text reads "NOTICE".')
@@ -379,7 +464,7 @@ class EncodingContractTests(unittest.TestCase):
         self.assertTrue(contract["encoding_contract_verified"])
         self.assertFalse(contract["runtime_trace_available"])
         self.assertEqual("MDUSelectorVerifier", contract["model_class_used"])
-        self.assertEqual("TOKENIZER_SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
+        self.assertEqual("SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
         self.assertTrue(contract["claim_text_serialized"])
         self.assertTrue(contract["unit_text_serialized"])
         self.assertFalse(contract["unit_type_serialized"])
@@ -416,7 +501,7 @@ class EncodingContractTests(unittest.TestCase):
             )
             contract = inspect_encoding_contract(project)
         self.assertTrue(contract["encoding_contract_verified"])
-        self.assertEqual("TOKENIZER_SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
+        self.assertEqual("SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
         self.assertEqual("only_second", contract["truncation_strategy"])
         self.assertEqual("unit sequence only", contract["truncatable_side"])
 
@@ -445,6 +530,117 @@ class EncodingContractTests(unittest.TestCase):
         )
         self.assertEqual(2, contract["encoding_contract_candidate_count"])
         self.assertEqual("EXPLICIT", contract["unit_modality_encoding"])
+
+    def test_real_phase3a_collator_indirect_pair_flow_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _write_resolved_encoding_fixture(Path(temporary))
+            contract = inspect_encoding_contract(project)
+        self.assertTrue(contract["encoding_contract_verified"])
+        self.assertEqual("SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
+        self.assertTrue(contract["claim_text_serialized"])
+        self.assertTrue(contract["unit_text_serialized"])
+        self.assertTrue(contract["unit_type_serialized"])
+        self.assertTrue(contract["modality_serialized"])
+        self.assertFalse(contract["dataset_serialized"])
+        self.assertFalse(contract["unit_id_serialized"])
+        self.assertEqual("EXPLICIT", contract["unit_modality_encoding"])
+        self.assertIs(True, contract["padding"])
+        self.assertIs(True, contract["truncation"])
+        self.assertIs(True, contract["truncation_expression"])
+        self.assertEqual(256, contract["maximum_sequence_length"])
+        self.assertEqual("max_length", contract["maximum_sequence_length_expression"])
+        evidence = contract["encoding_contract_evidence"][0]
+        self.assertEqual(
+            "MDU/scripts/clip12_phase3_common/clip12p3_model.py",
+            evidence["file"],
+        )
+        expression = contract["unit_serialization_expression"]
+        self.assertIn("append_tuple[1]", expression)
+        self.assertIn("UNIT_TYPE", expression)
+        self.assertIn("MODALITY", expression)
+        self.assertIn("unit.get('text')", expression)
+        risk = classify_shortcut_risk(1.0, contract["unit_modality_encoding"])
+        self.assertEqual("HIGH_TEMPLATE_MODALITY_SHORTCUT_RISK", risk)
+        self.assertEqual(
+            "REQUIRE_TEMPLATE_NEUTRAL_CALIBRATION_BEFORE_TRAINING",
+            recommend_training_action(risk),
+        )
+
+    def test_real_phase4a_comprehension_pair_is_independently_recognized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _write_resolved_encoding_fixture(Path(temporary))
+            common = project / "MDU/scripts/clip12_phase3_common/clip12p3_model.py"
+            common.write_text(
+                "class MDUSelectorVerifier:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            contract = inspect_encoding_contract(project)
+        self.assertTrue(contract["encoding_contract_verified"])
+        self.assertEqual("SEQUENCE_PAIR", contract["claim_unit_encoding_style"])
+        self.assertTrue(contract["claim_text_serialized"])
+        self.assertTrue(contract["unit_text_serialized"])
+        self.assertTrue(contract["unit_type_serialized"])
+        self.assertTrue(contract["modality_serialized"])
+        self.assertFalse(contract["dataset_serialized"])
+        self.assertFalse(contract["unit_id_serialized"])
+        self.assertEqual("EXPLICIT", contract["unit_modality_encoding"])
+        self.assertIs(True, contract["padding"])
+        self.assertIs(True, contract["truncation"])
+        self.assertIs(True, contract["truncation_expression"])
+        self.assertEqual(256, contract["maximum_sequence_length"])
+        self.assertEqual(
+            "MDU/scripts/clip12_phase4a_inference_handoff/clip12p4a_engine.py",
+            contract["encoding_contract_evidence"][0]["file"],
+        )
+
+    def test_genuinely_unknown_encoding_remains_unknown_and_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _write_encoding_fixture(Path(temporary))
+            common = project / "MDU/scripts/clip12_phase3_common/clip12p3_model.py"
+            common.write_text(
+                "class MDUSelectorVerifier:\n"
+                "    pass\n\n"
+                "def opaque_batch(tokenizer, opaque_features):\n"
+                "    return tokenizer(opaque_features, padding=True)\n",
+                encoding="utf-8",
+            )
+            contract = inspect_encoding_contract(project)
+        self.assertFalse(contract["encoding_contract_verified"])
+        self.assertEqual(audit.UNKNOWN, contract["claim_unit_encoding_style"])
+        self.assertEqual(audit.UNKNOWN, contract["unit_modality_encoding"])
+        self.assertEqual(
+            "INCONCLUSIVE",
+            classify_shortcut_risk(
+                1.0,
+                contract["unit_modality_encoding"],
+                encoding_contract_verified=contract["encoding_contract_verified"],
+            ),
+        )
+
+    def test_mixed_pair_append_roles_do_not_create_a_broad_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = _write_resolved_encoding_fixture(Path(temporary))
+            common = project / "MDU/scripts/clip12_phase3_common/clip12p3_model.py"
+            source = common.read_text(encoding="utf-8")
+            source = source.replace(
+                "                unit_ids.append(unit.get('unit_id'))\n",
+                "                pair_texts.append((item['dataset'], unit.get('unit_id')))\n"
+                "                unit_ids.append(unit.get('unit_id'))\n",
+            )
+            common.write_text(source, encoding="utf-8")
+            phase4a = (
+                project
+                / "MDU/scripts/clip12_phase4a_inference_handoff/clip12p4a_engine.py"
+            )
+            phase4a.write_text(
+                "def opaque_inference(tokenizer, opaque_features):\n"
+                "    return tokenizer(opaque_features)\n",
+                encoding="utf-8",
+            )
+            contract = inspect_encoding_contract(project)
+        self.assertFalse(contract["encoding_contract_verified"])
+        self.assertEqual(audit.UNKNOWN, contract["unit_modality_encoding"])
 
     def test_missing_authoritative_source_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
