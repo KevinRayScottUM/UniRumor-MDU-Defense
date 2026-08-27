@@ -20,5 +20,11 @@ The original Frozen G1 checkpoint is never overwritten. Persisted `.pt`
 artifacts contain only the selection-head state plus registered provenance and
 training metadata; encoder and veracity-head tensors are excluded.
 
+The authoritative collator requires structural `case_id` and `label` fields.
+At the DICC integration boundary, `case_id` is the calibration example ID and
+`label` is the fixed dummy integer `0`. No real veracity label is read, and the
+dummy value is never used by the loss, ranking metrics, class weighting, or
+checkpoint selection.
+
 Run `python -m scripts.selector_relevance_training.run_train --help` for the
 explicit DICC paths and execution mode.

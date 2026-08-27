@@ -155,44 +155,31 @@ def _construct_engine(
     engine_type: Any,
     *,
     config: Mapping[str, Any],
-    config_path: Path,
     project_root: Path,
-    device: str,
 ) -> Any:
     try:
         signature = inspect.signature(engine_type)
     except (TypeError, ValueError) as exc:
-        raise SelectorTrainingError("Phase4A engine signature cannot be inspected") from exc
-    candidates = (
-        ((), {"config": config, "project_root": project_root, "device": device}),
-        ((), {"config_path": config_path, "project_root": project_root, "device": device}),
-        ((), {"config": config, "project_root": project_root}),
-        ((), {"config_path": config_path, "project_root": project_root}),
-        ((config, project_root, device), {}),
-        ((config_path, project_root, device), {}),
-    )
-    selected = None
-    for args, kwargs in candidates:
-        try:
-            signature.bind(*args, **kwargs)
-        except TypeError:
-            continue
-        selected = (args, kwargs)
-        break
-    if selected is None:
-        raise SelectorTrainingError("Phase4A engine constructor is incompatible")
-    args, kwargs = selected
+        raise SelectorTrainingError("FrozenG1Engine signature cannot be inspected") from exc
+    args = (config, project_root)
+    kwargs = {"device_name": "cpu"}
+    try:
+        signature.bind(*args, **kwargs)
+    except TypeError as exc:
+        raise SelectorTrainingError(
+            "FrozenG1Engine constructor must accept "
+            "(config, project_root, *, device_name)"
+        ) from exc
     try:
         return engine_type(*args, **kwargs)
     except Exception as exc:
-        raise SelectorTrainingError("Phase4A engine initialization failed") from exc
+        raise SelectorTrainingError("FrozenG1Engine initialization failed") from exc
 
 
 def _load_authoritative_runtime(
     project_root: Path,
     config_path: Path,
     config: Mapping[str, Any],
-    device: str,
 ) -> Tuple[Any, Any, Any]:
     phase3_dir = project_root / "MDU" / "scripts" / "clip12_phase3_common"
     phase4a_dir = project_root / "MDU" / "scripts" / "clip12_phase4a_inference_handoff"
@@ -235,15 +222,13 @@ def _load_authoritative_runtime(
         engine_module = importlib.util.module_from_spec(engine_spec)
         sys.modules["_selector_training_phase4a_engine"] = engine_module
         engine_spec.loader.exec_module(engine_module)
-        engine_type = getattr(engine_module, "Phase4AEngine", None)
+        engine_type = getattr(engine_module, "FrozenG1Engine", None)
         if engine_type is None:
-            raise SelectorTrainingError("authoritative Phase4AEngine is unavailable")
+            raise SelectorTrainingError("authoritative FrozenG1Engine is unavailable")
         engine = _construct_engine(
             engine_type,
             config=config,
-            config_path=config_path,
             project_root=project_root,
-            device=device,
         )
         model = getattr(engine, "model", getattr(engine, "_model", None))
         tokenizer = getattr(engine, "tokenizer", getattr(engine, "_tokenizer", None))
@@ -287,6 +272,42 @@ def _module_parameter_hash(module: Any, torch: Any) -> str:
 class _CachedExample:
     example: CalibrationExample
     representations: Any
+
+
+def _authoritative_collator_item(
+    example: CalibrationExample,
+) -> Mapping[str, Any]:
+    item = dict(example.collator_item())
+    item["case_id"] = example.calibration_example_id
+    item["label"] = 0
+    return item
+
+
+def _authoritative_batch_inputs(
+    batch: Any,
+    *,
+    example: CalibrationExample,
+    device: str,
+) -> Mapping[str, Any]:
+    input_ids = getattr(batch, "input_ids", None)
+    attention_mask = getattr(batch, "attention_mask", None)
+    if input_ids is None:
+        raise SelectorTrainingError("authoritative collator Batch.input_ids is missing")
+    if attention_mask is None:
+        raise SelectorTrainingError(
+            "authoritative collator Batch.attention_mask is missing"
+        )
+    unit_ids = tuple(getattr(batch, "unit_ids", ()))
+    if unit_ids != example.candidate_unit_ids:
+        raise SelectorTrainingError("authoritative collator changed candidate order")
+    return {
+        "input_ids": input_ids.to(device),
+        "attention_mask": attention_mask.to(device),
+    }
+
+
+def _move_model_to_training_device(model: Any, device: str) -> None:
+    model.to(device)
 
 
 class DICCTorchBackend:
@@ -333,13 +354,12 @@ class DICCTorchBackend:
             self.project_root,
             self.phase4a_config_path,
             self.config,
-            self.device,
         )
         self.model = getattr(model, "module", model)
         for attribute in ("encoder", "veracity_head", "selection_head"):
             if not hasattr(self.model, attribute):
                 raise SelectorTrainingError(f"Frozen G1 model is missing {attribute}")
-        self.model.to(self.device)
+        _move_model_to_training_device(self.model, self.device)
         configure_parameter_boundary(self.model)
         self._initial_selection_state = {
             name: tensor.detach().cpu().clone()
@@ -363,16 +383,12 @@ class DICCTorchBackend:
             for example in examples:
                 cached = self._cache.get(example.calibration_example_id)
                 if cached is None:
-                    batch = self.collate([example.collator_item()])
-                    encoded = getattr(batch, "encoded", None)
-                    unit_ids = tuple(getattr(batch, "unit_ids", ()))
-                    if not isinstance(encoded, Mapping):
-                        raise SelectorTrainingError("authoritative collator Batch.encoded is invalid")
-                    if unit_ids != example.candidate_unit_ids:
-                        raise SelectorTrainingError("authoritative collator changed candidate order")
-                    device_inputs = {
-                        key: value.to(self.device) for key, value in encoded.items()
-                    }
+                    batch = self.collate([_authoritative_collator_item(example)])
+                    device_inputs = _authoritative_batch_inputs(
+                        batch,
+                        example=example,
+                        device=self.device,
+                    )
                     output = self.model.encoder(**device_inputs)
                     hidden = getattr(output, "last_hidden_state", None)
                     if hidden is None or hidden.shape[0] != len(example.candidate_units):

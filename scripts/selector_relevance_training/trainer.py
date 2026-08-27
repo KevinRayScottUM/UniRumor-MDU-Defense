@@ -26,7 +26,7 @@ from .metrics import (
 )
 
 
-IMPLEMENTATION_REVISION = "step2.6r-2-v1"
+IMPLEMENTATION_REVISION = "step2.6r-2-r1-v1"
 SELECTOR_ID = "G1-RelevanceSelector-Cal-v1"
 AUTHORITATIVE_CHECKPOINT_SHA256 = (
     "b694f2d4bb5ba6f72dd8a001bd984d46853546f2a85858a812f2496af1f1a0b9"
@@ -666,6 +666,8 @@ def run_selector_calibration(
         "encoder_representation_mode": "eval_no_grad_cached",
         "encoder_precompute_batching": "one calibration example at a time",
         "selection_head_batch_size_examples": protocol.batch_size_examples,
+        "collator_dummy_label_used": True,
+        "collator_dummy_label_value": 0,
     }
     baseline_rankings = tuple(backend.baseline_rankings(dev_examples))
     baseline_metrics = grouped_ranking_metrics(baseline_rankings)
@@ -787,6 +789,8 @@ def run_selector_calibration(
             "selection_scores_finite": True,
             "ranking_metrics_finite": True,
             "neutral_train_dev_only": True,
+            "collator_dummy_label_used": True,
+            "collator_dummy_label_value": 0,
             "veracity_labels_inspected": False,
             "formal_validation_accessed": False,
             "formal_test_accessed": False,

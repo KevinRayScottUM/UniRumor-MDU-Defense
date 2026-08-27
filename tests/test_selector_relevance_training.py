@@ -12,6 +12,9 @@ from typing import Any, Mapping, Sequence
 
 from scripts.selector_relevance_training import metrics
 from scripts.selector_relevance_training.dicc_backend import (
+    DICCTorchBackend,
+    _authoritative_batch_inputs,
+    _move_model_to_training_device,
     _load_authoritative_runtime,
     configure_parameter_boundary,
     validate_optimizer_boundary,
@@ -24,7 +27,9 @@ from scripts.selector_relevance_training.metrics import (
 from scripts.selector_relevance_training.run_train import build_parser, main
 from scripts.selector_relevance_training.trainer import (
     AUTHORITATIVE_CHECKPOINT_SHA256,
+    CalibrationExample,
     ExpectedDataCounts,
+    IMPLEMENTATION_REVISION,
     SeedBackendResult,
     SelectorTrainingError,
     TRAINABLE_PARAMETER_NAMES,
@@ -461,8 +466,10 @@ class ParameterBoundaryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (phase4 / "clip12p4a_engine.py").write_text(
-                "class Phase4AEngine:\n"
-                "    def __init__(self, config, project_root, device):\n"
+                "class FrozenG1Engine:\n"
+                "    def __init__(self, config, project_root, *, device_name='auto'):\n"
+                "        if device_name != 'cpu':\n"
+                "            raise AssertionError('engine must initialize on CPU')\n"
                 "        self.model = object()\n"
                 "        self.tokenizer = 'authoritative-tokenizer'\n",
                 encoding="utf-8",
@@ -473,12 +480,168 @@ class ParameterBoundaryTests(unittest.TestCase):
                 project,
                 config_path,
                 {},
-                "cuda:0",
             )
             self.assertIsNotNone(model)
             self.assertEqual("authoritative-tokenizer", tokenizer)
             self.assertEqual(
                 ("authoritative-tokenizer", 256, ["item"]), collate(["item"])
+            )
+
+    def test_legacy_phase4a_engine_name_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            phase3 = project / "MDU/scripts/clip12_phase3_common"
+            phase4 = project / "MDU/scripts/clip12_phase4a_inference_handoff"
+            phase3.mkdir(parents=True)
+            phase4.mkdir(parents=True)
+            (phase3 / "clip12p3_model.py").write_text(
+                "def collator(tokenizer, max_length):\n"
+                "    return lambda items: items\n",
+                encoding="utf-8",
+            )
+            (phase4 / "clip12p4a_engine.py").write_text(
+                "class Phase4AEngine:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            config_path = project / "phase4a.json"
+            config_path.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                SelectorTrainingError, "FrozenG1Engine is unavailable"
+            ):
+                _load_authoritative_runtime(project, config_path, {})
+
+    def test_requested_indexed_cuda_device_is_preserved_after_cpu_engine_load(self) -> None:
+        class DeviceModel:
+            def __init__(self) -> None:
+                self.devices = []
+
+            def to(self, device: str) -> None:
+                self.devices.append(device)
+
+        model = DeviceModel()
+        _move_model_to_training_device(model, "cuda:1")
+        self.assertEqual(["cuda:1"], model.devices)
+
+
+class AuthoritativeBatchTests(unittest.TestCase):
+    class Tensor:
+        def __init__(self) -> None:
+            self.devices = []
+
+        def to(self, device: str) -> "AuthoritativeBatchTests.Tensor":
+            self.devices.append(device)
+            return self
+
+        def __getitem__(self, key: Any) -> "AuthoritativeBatchTests.Tensor":
+            return self
+
+        def detach(self) -> "AuthoritativeBatchTests.Tensor":
+            return self
+
+        def cpu(self) -> "AuthoritativeBatchTests.Tensor":
+            return self
+
+    class NoGrad:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *args: Any) -> None:
+            return None
+
+    def setUp(self) -> None:
+        self.example = CalibrationExample(
+            calibration_example_id="cal-example",
+            source_dataset="GroundLie360",
+            source_case_id="source-case",
+            canonical_underlying_case_id="GroundLie360:source-case",
+            calibration_split="train",
+            expected_modality="OCR",
+            claim='The relevant content states "content".',
+            candidate_units=(
+                {
+                    "unit_id": "unit-a",
+                    "unit_type": "ocr",
+                    "modality": "ocr",
+                    "text": "content",
+                    "relevance_target": 1,
+                },
+                {
+                    "unit_id": "unit-b",
+                    "unit_type": "transcript",
+                    "modality": "text",
+                    "text": "other",
+                    "relevance_target": 0,
+                },
+            ),
+            relevance_targets=(1, 0),
+        )
+
+    def _batch(self, **overrides: Any) -> Any:
+        values = {
+            "input_ids": self.Tensor(),
+            "attention_mask": self.Tensor(),
+            "sample_index": [0, 0],
+            "labels": [0],
+            "case_ids": ["cal-example"],
+            "unit_ids": ["unit-a", "unit-b"],
+        }
+        values.update(overrides)
+        return type("Batch", (), values)()
+
+    def test_authoritative_batch_without_encoded_prepares_representations(self) -> None:
+        captured_items = []
+        batch = self._batch()
+
+        class Encoder:
+            def __init__(self, tensor: Any) -> None:
+                self.tensor = tensor
+                self.calls = []
+
+            def eval(self) -> None:
+                return None
+
+            def __call__(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                hidden = self.tensor
+                hidden.shape = (2, 4, 8)
+                return type("Output", (), {"last_hidden_state": hidden})()
+
+        tensor = self.Tensor()
+        encoder = Encoder(tensor)
+        backend = object.__new__(DICCTorchBackend)
+        backend.device = "cuda:1"
+        backend.collate = lambda items: captured_items.extend(items) or batch
+        backend.model = type("Model", (), {"encoder": encoder})()
+        backend.torch = type("Torch", (), {"no_grad": lambda self: AuthoritativeBatchTests.NoGrad()})()
+        backend._cache = {}
+        prepared = backend._prepare((self.example,))
+        self.assertEqual(1, len(prepared))
+        self.assertFalse(hasattr(batch, "encoded"))
+        self.assertNotIn("case_id", self.example.collator_item())
+        self.assertNotIn("label", self.example.collator_item())
+        self.assertEqual("cal-example", captured_items[0]["case_id"])
+        self.assertEqual(0, captured_items[0]["label"])
+        self.assertEqual({"input_ids", "attention_mask"}, set(encoder.calls[0]))
+        self.assertEqual(["cuda:1"], batch.input_ids.devices)
+        self.assertEqual(["cuda:1"], batch.attention_mask.devices)
+
+    def test_missing_authoritative_tensors_fail_closed(self) -> None:
+        for field in ("input_ids", "attention_mask"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(SelectorTrainingError, field):
+                    _authoritative_batch_inputs(
+                        self._batch(**{field: None}),
+                        example=self.example,
+                        device="cuda:0",
+                    )
+
+    def test_candidate_order_mismatch_fails_closed(self) -> None:
+        with self.assertRaisesRegex(SelectorTrainingError, "candidate order"):
+            _authoritative_batch_inputs(
+                self._batch(unit_ids=["unit-b", "unit-a"]),
+                example=self.example,
+                device="cuda:0",
             )
 
 
@@ -506,6 +669,8 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(source_before, source_after)
             self.assertEqual("PASS", report["status"])
             self.assertEqual("smoke", report["run_mode"])
+            self.assertEqual("step2.6r-2-r1-v1", IMPLEMENTATION_REVISION)
+            self.assertEqual(IMPLEMENTATION_REVISION, report["implementation_revision"])
             self.assertEqual(8, report["run_train_example_count"])
             self.assertEqual(4, report["run_dev_example_count"])
             self.assertEqual(
@@ -515,6 +680,9 @@ class OrchestrationTests(unittest.TestCase):
                 1, report["training_protocol"]["effective_maximum_epochs"]
             )
             self.assertFalse(report["full_training_automatically_triggered"])
+            self.assertTrue(report["collator_dummy_label_used"])
+            self.assertEqual(0, report["collator_dummy_label_value"])
+            self.assertFalse(report["veracity_labels_inspected"])
             self.assertTrue((output / "smoke_report.json").is_file())
             self.assertEqual(1, len(backend.saved_payloads))
             self.assertEqual(
@@ -639,6 +807,8 @@ class CLIBoundaryTests(unittest.TestCase):
         backend_source = (package / "dicc_backend.py").read_text(encoding="utf-8")
         self.assertIn("collator_factory(tokenizer, MAX_LENGTH)", backend_source)
         self.assertIn("BCEWithLogitsLoss", backend_source)
+        self.assertIn("for target in item.example.relevance_targets", backend_source)
+        self.assertNotIn("batch.labels", backend_source)
         self.assertNotIn("model.veracity_head(", backend_source)
 
 
