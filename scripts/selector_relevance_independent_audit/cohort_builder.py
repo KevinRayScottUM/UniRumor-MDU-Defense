@@ -56,6 +56,7 @@ from .schemas import (
 
 
 EXPECTED_CALIBRATION_COUNTS = {"GroundLie360": 570, "TRUE-3MFact": 736}
+EXPECTED_SEALED_CHALLENGE_COUNT = 6
 EXPECTED_STAGE_A_COUNT = 7
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESTRICTED_PATH_PARTS = {
@@ -599,6 +600,130 @@ def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _counts_by_dataset(case_ids: Iterable[str]) -> Mapping[str, int]:
+    counts: Counter[str] = Counter()
+    for canonical in case_ids:
+        dataset = canonical.split(":", 1)[0]
+        if dataset not in SUPPORTED_DATASETS or ":" not in canonical:
+            raise IndependentAuditBuildError("exclusion identity is invalid")
+        counts[dataset] += 1
+    return {dataset: counts[dataset] for dataset in SUPPORTED_DATASETS}
+
+
+def _summarize_exclusion_accounting(
+    *,
+    source_ids: frozenset[str],
+    calibration_ids: frozenset[str],
+    sealed_ids: frozenset[str],
+    stage_a_ids: frozenset[str],
+    additional_ids: frozenset[str],
+    effective_ids: Mapping[str, frozenset[str]],
+) -> Mapping[str, Any]:
+    """Separate frozen set membership from first-match exclusion accounting."""
+
+    membership_sets = {
+        "sealed": sealed_ids,
+        "stage_a": stage_a_ids,
+        "calibration": calibration_ids,
+        "additional": additional_ids,
+    }
+    membership_union = frozenset().union(*membership_sets.values())
+    if not membership_union <= source_ids:
+        raise IndependentAuditBuildError(
+            "exclusion membership contains an identity outside authoritative Train"
+        )
+
+    # Validate the effective IDs observed during the authoritative traversal
+    # against the frozen sealed -> Stage A -> calibration -> additional order.
+    consumed: set[str] = set()
+    expected_effective: Dict[str, frozenset[str]] = {}
+    for category in ("sealed", "stage_a", "calibration", "additional"):
+        expected_effective[category] = frozenset(
+            membership_sets[category] - consumed
+        )
+        consumed.update(membership_sets[category])
+        observed = effective_ids.get(category)
+        if observed != expected_effective[category]:
+            raise IndependentAuditBuildError(
+                f"{category} effective exclusion accounting mismatch"
+            )
+    effective_union = frozenset().union(*effective_ids.values())
+    if effective_union != membership_union:
+        raise IndependentAuditBuildError("effective exclusions do not equal exclusion union")
+
+    calibration_stage_a = calibration_ids & stage_a_ids
+    calibration_sealed = calibration_ids & sealed_ids
+    stage_a_sealed = stage_a_ids & sealed_ids
+    additional_higher_priority = additional_ids & (
+        calibration_ids | sealed_ids | stage_a_ids
+    )
+    remaining_count = len(source_ids) - len(membership_union)
+
+    result: Dict[str, Any] = {
+        # Backward-compatible fields denote membership-set sizes, not first-match
+        # traversal counts. Explicit effective fields carry operational counts.
+        "calibration_exclusion_count": len(calibration_ids),
+        "sealed_challenge_exclusion_count": len(sealed_ids),
+        "stage_a_exclusion_count": len(stage_a_ids),
+        "additional_prior_audit_exclusion_count": len(additional_ids),
+        "calibration_exclusion_membership_count": len(calibration_ids),
+        "sealed_challenge_exclusion_membership_count": len(sealed_ids),
+        "stage_a_exclusion_membership_count": len(stage_a_ids),
+        "additional_prior_audit_exclusion_membership_count": len(additional_ids),
+        "calibration_exclusion_effective_count": len(effective_ids["calibration"]),
+        "sealed_challenge_exclusion_effective_count": len(effective_ids["sealed"]),
+        "stage_a_exclusion_effective_count": len(effective_ids["stage_a"]),
+        "additional_prior_audit_exclusion_effective_count": len(
+            effective_ids["additional"]
+        ),
+        "calibration_exclusion_membership_count_by_dataset": _counts_by_dataset(
+            calibration_ids
+        ),
+        "sealed_challenge_exclusion_membership_count_by_dataset": _counts_by_dataset(
+            sealed_ids
+        ),
+        "stage_a_exclusion_membership_count_by_dataset": _counts_by_dataset(
+            stage_a_ids
+        ),
+        "additional_prior_audit_exclusion_membership_count_by_dataset": _counts_by_dataset(
+            additional_ids
+        ),
+        "calibration_exclusion_effective_count_by_dataset": _counts_by_dataset(
+            effective_ids["calibration"]
+        ),
+        "sealed_challenge_exclusion_effective_count_by_dataset": _counts_by_dataset(
+            effective_ids["sealed"]
+        ),
+        "stage_a_exclusion_effective_count_by_dataset": _counts_by_dataset(
+            effective_ids["stage_a"]
+        ),
+        "additional_prior_audit_exclusion_effective_count_by_dataset": _counts_by_dataset(
+            effective_ids["additional"]
+        ),
+        "calibration_stage_a_overlap_count": len(calibration_stage_a),
+        "calibration_sealed_overlap_count": len(calibration_sealed),
+        "stage_a_sealed_overlap_count": len(stage_a_sealed),
+        "calibration_stage_a_overlap_count_by_dataset": _counts_by_dataset(
+            calibration_stage_a
+        ),
+        "calibration_sealed_overlap_count_by_dataset": _counts_by_dataset(
+            calibration_sealed
+        ),
+        "stage_a_sealed_overlap_count_by_dataset": _counts_by_dataset(stage_a_sealed),
+        "additional_prior_audit_higher_priority_overlap_count": len(
+            additional_higher_priority
+        ),
+        "total_unique_excluded_case_count": len(membership_union),
+        "remaining_after_identity_exclusions": remaining_count,
+        "remaining_after_exclusions": remaining_count,
+        # Identity-only private provenance; never copied into reviewer packets.
+        "calibration_stage_a_overlap_case_ids": sorted(calibration_stage_a),
+        "calibration_sealed_overlap_case_ids": sorted(calibration_sealed),
+        "stage_a_sealed_overlap_case_ids": sorted(stage_a_sealed),
+    }
+    return result
+
+
 def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
@@ -741,6 +866,14 @@ def build_cohort(
     additional_ids, additional_locks = _load_additional_exclusions(
         additional_exclusion_manifests
     )
+    if len(calibration_ids) != sum(expected_calibration_counts.values()):
+        raise IndependentAuditBuildError("calibration exclusion membership count mismatch")
+    if len(SEALED_CHALLENGE_IDS) != EXPECTED_SEALED_CHALLENGE_COUNT:
+        raise IndependentAuditBuildError(
+            "sealed challenge exclusion membership count mismatch"
+        )
+    if len(stage_a_ids) != EXPECTED_STAGE_A_COUNT:
+        raise IndependentAuditBuildError("Stage-A exclusion membership count mismatch")
     if exposure_adapter is None:
         try:
             adapter: ExposureAdapter = Phase4ANormalizationExposureAdapter.from_project_root(
@@ -755,7 +888,12 @@ def build_cohort(
 
     raw_counts: Counter[str] = Counter()
     seen_ids = set()
-    exclusion_counts: Counter[str] = Counter()
+    effective_exclusion_ids: Dict[str, set[str]] = {
+        "sealed": set(),
+        "stage_a": set(),
+        "calibration": set(),
+        "additional": set(),
+    }
     remaining_records = []
     for index, row in iter_jsonl_rows(train_lock.source_path):
         dataset, _, canonical = _identity(row, f"Train row {index}")
@@ -765,28 +903,35 @@ def build_cohort(
         seen_ids.add(canonical)
         # The sealed set is checked first; claim/candidate fields are never inspected.
         if canonical in SEALED_CHALLENGE_IDS:
-            exclusion_counts["sealed"] += 1
+            effective_exclusion_ids["sealed"].add(canonical)
             continue
         if canonical in stage_a_ids:
-            exclusion_counts["stage_a"] += 1
+            effective_exclusion_ids["stage_a"].add(canonical)
             continue
         if canonical in calibration_ids:
-            exclusion_counts["calibration"] += 1
+            effective_exclusion_ids["calibration"].add(canonical)
             continue
         if canonical in additional_ids:
-            exclusion_counts["additional"] += 1
+            effective_exclusion_ids["additional"].add(canonical)
             continue
         remaining_records.append(_source_record(row, index))
     if len(seen_ids) != sum(expected_source_counts.values()):
         raise IndependentAuditBuildError("authoritative source case count mismatch")
     if dict(raw_counts) != dict(expected_source_counts):
         raise IndependentAuditBuildError("authoritative source dataset counts mismatch")
-    if exclusion_counts["calibration"] != sum(expected_calibration_counts.values()):
-        raise IndependentAuditBuildError("calibration exclusion count mismatch")
-    if exclusion_counts["sealed"] != len(SEALED_CHALLENGE_IDS):
-        raise IndependentAuditBuildError("sealed challenge exclusion count mismatch")
-    if exclusion_counts["stage_a"] != len(STAGE_A_IDS):
-        raise IndependentAuditBuildError("Stage-A exclusion count mismatch")
+    exclusion_accounting = _summarize_exclusion_accounting(
+        source_ids=frozenset(seen_ids),
+        calibration_ids=calibration_ids,
+        sealed_ids=SEALED_CHALLENGE_IDS,
+        stage_a_ids=stage_a_ids,
+        additional_ids=additional_ids,
+        effective_ids={
+            category: frozenset(values)
+            for category, values in effective_exclusion_ids.items()
+        },
+    )
+    if len(remaining_records) != exclusion_accounting["remaining_after_exclusions"]:
+        raise IndependentAuditBuildError("remaining identity-pool accounting mismatch")
 
     exposure_success = 0
     exposure_failure = 0
@@ -853,11 +998,7 @@ def build_cohort(
         "authoritative_source_case_count": len(seen_ids),
         "authoritative_groundlie_case_count": raw_counts["GroundLie360"],
         "authoritative_true3m_case_count": raw_counts["TRUE-3MFact"],
-        "calibration_exclusion_count": exclusion_counts["calibration"],
-        "sealed_challenge_exclusion_count": exclusion_counts["sealed"],
-        "stage_a_exclusion_count": exclusion_counts["stage_a"],
-        "additional_prior_audit_exclusion_count": exclusion_counts["additional"],
-        "remaining_after_exclusions": len(remaining_records),
+        **exclusion_accounting,
         "phase4a_exposure_success_count": exposure_success,
         "phase4a_exposure_failure_count": exposure_failure,
         "candidate_count_below_6_count": below_six,
@@ -922,10 +1063,7 @@ def build_cohort(
             "authoritative_g1_case_count": len(seen_ids),
             "groundlie_source_case_count": raw_counts["GroundLie360"],
             "true3m_source_case_count": raw_counts["TRUE-3MFact"],
-            "calibration_exclusion_count": exclusion_counts["calibration"],
-            "sealed_challenge_exclusion_count": exclusion_counts["sealed"],
-            "stage_a_exclusion_count": exclusion_counts["stage_a"],
-            "additional_prior_audit_exclusion_count": exclusion_counts["additional"],
+            **exclusion_accounting,
             "eligible_groundlie_count": len(eligible_pairs["GroundLie360"]),
             "eligible_true3m_count": len(eligible_pairs["TRUE-3MFact"]),
             "selected_groundlie_count": selected_counts["GroundLie360"],

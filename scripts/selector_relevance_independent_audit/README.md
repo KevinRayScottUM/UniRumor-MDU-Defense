@@ -11,6 +11,16 @@ verified R3A0-R1 manifest mapping. Historical `smoke::...` replay IDs are not
 reparsed with the generic cross-case canonicalizer. No sampling, review, or
 scientific evaluation protocol changed.
 
+Step 2.6R-3B1-R2 separates exclusion-set membership from effective first-match
+accounting. Exclusion categories may validly overlap: the final exclusion is
+their set union, while operational effective counts follow the frozen
+`sealed -> Stage A -> calibration -> additional` precedence. The real DICC
+identity-only audit found two calibration/Stage-A overlaps; they are valid and
+do not indicate leakage. Legacy `*_exclusion_count` fields continue to report
+membership-set sizes, and new `*_effective_count` fields report first-match
+counts. No exclusion, sampling, reviewer-blinding, or scientific protocol
+changed.
+
 The original six-case historical challenge remains sealed because explicit
 access authorization was not established. Only those six canonical identities
 are used as exclusion keys; their claims, candidate pools, annotations, and

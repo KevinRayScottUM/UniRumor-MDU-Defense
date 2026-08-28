@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.selector_relevance_calibration.dataset_builder import ExposureResult
 from scripts.selector_fidelity_audit.cross_case import (
@@ -23,6 +24,7 @@ from scripts.selector_relevance_independent_audit.blinding import (
 from scripts.selector_relevance_independent_audit.cohort_builder import (
     IndependentAuditBuildError,
     _safe_path,
+    _summarize_exclusion_accounting,
     build_cohort,
 )
 from scripts.selector_relevance_independent_audit.schemas import (
@@ -175,7 +177,17 @@ class IndependentAuditFixture:
                     "source_dataset": "GroundLie360",
                     "source_case_id": "cal-g",
                     "canonical_underlying_case_id": "GroundLie360:cal-g",
-                }
+                },
+                {
+                    "source_dataset": "GroundLie360",
+                    "source_case_id": "13296704",
+                    "canonical_underlying_case_id": "GroundLie360:13296704",
+                },
+                {
+                    "source_dataset": "GroundLie360",
+                    "source_case_id": "13025004",
+                    "canonical_underlying_case_id": "GroundLie360:13025004",
+                },
             ],
             "neutral_calibration_dev.jsonl": [
                 {
@@ -351,7 +363,14 @@ class IndependentAuditFixture:
             report["phase4a_replay_manifest_sha256"] = self.stage_manifest_sha
             self.rewrite_stage_report(report)
 
-    def build(self, *, output: Path | None = None, adapter=_DEFAULT_ADAPTER):
+    def build(
+        self,
+        *,
+        output: Path | None = None,
+        adapter=_DEFAULT_ADAPTER,
+        additional_exclusion_manifests=(),
+        expected_calibration_counts=None,
+    ):
         selected_adapter = FixtureExposure() if adapter is _DEFAULT_ADAPTER else adapter
         return build_cohort(
             project_root=self.project,
@@ -367,11 +386,13 @@ class IndependentAuditFixture:
             stage_a_replay_manifest_path=self.stage_manifest,
             stage_a_replay_manifest_sha256=self.stage_manifest_sha,
             output_dir=output or self.output,
+            additional_exclusion_manifests=additional_exclusion_manifests,
             exposure_adapter=selected_adapter,
             expected_train_sha256=self.train_sha,
             expected_source_counts=self.expected_source_counts,
             expected_neutral_hashes=self.neutral_hashes,
-            expected_calibration_counts={"GroundLie360": 1, "TRUE-3MFact": 1},
+            expected_calibration_counts=expected_calibration_counts
+            or {"GroundLie360": 3, "TRUE-3MFact": 1},
         )
 
 
@@ -718,10 +739,38 @@ class IndependentAuditTests(unittest.TestCase):
     def test_all_exclusion_categories_are_applied_and_sealed_content_never_emitted(self) -> None:
         result = self.fixture.build()
         report = result.build_report
-        self.assertEqual(report["calibration_exclusion_count"], 2)
+        self.assertEqual(report["calibration_exclusion_count"], 4)
         self.assertEqual(report["sealed_challenge_exclusion_count"], 6)
         self.assertEqual(report["stage_a_exclusion_count"], 7)
         self.assertEqual(report["additional_prior_audit_exclusion_count"], 0)
+        self.assertEqual(report["calibration_exclusion_membership_count"], 4)
+        self.assertEqual(report["calibration_exclusion_effective_count"], 2)
+        self.assertEqual(report["sealed_challenge_exclusion_effective_count"], 6)
+        self.assertEqual(report["stage_a_exclusion_effective_count"], 7)
+        self.assertEqual(report["calibration_stage_a_overlap_count"], 1)
+        self.assertEqual(report["calibration_sealed_overlap_count"], 1)
+        self.assertEqual(report["stage_a_sealed_overlap_count"], 0)
+        self.assertEqual(
+            report["calibration_stage_a_overlap_case_ids"],
+            ["GroundLie360:13296704"],
+        )
+        self.assertEqual(
+            report["calibration_sealed_overlap_case_ids"],
+            ["GroundLie360:13025004"],
+        )
+        self.assertEqual(report["total_unique_excluded_case_count"], 15)
+        self.assertEqual(
+            report["remaining_after_identity_exclusions"],
+            len(self.fixture.rows) - 15,
+        )
+        self.assertEqual(
+            report["calibration_exclusion_membership_count_by_dataset"],
+            {"GroundLie360": 3, "TRUE-3MFact": 1},
+        )
+        self.assertEqual(
+            report["calibration_exclusion_effective_count_by_dataset"],
+            {"GroundLie360": 1, "TRUE-3MFact": 1},
+        )
         private_bytes = b"".join(
             path.read_bytes() for path in result.output_dir.rglob("*") if path.is_file()
         )
@@ -733,6 +782,228 @@ class IndependentAuditTests(unittest.TestCase):
         self.assertFalse(ids & STAGE_A_IDS)
         self.assertNotIn("GroundLie360:cal-g", ids)
         self.assertNotIn("TRUE-3MFact:cal-t", ids)
+
+        inventory = json.loads(
+            (result.output_dir / "eligibility_inventory.json").read_text()
+        )
+        for field in (
+            "calibration_exclusion_membership_count",
+            "calibration_exclusion_effective_count",
+            "sealed_challenge_exclusion_membership_count",
+            "sealed_challenge_exclusion_effective_count",
+            "stage_a_exclusion_membership_count",
+            "stage_a_exclusion_effective_count",
+            "calibration_stage_a_overlap_count",
+            "calibration_sealed_overlap_count",
+            "stage_a_sealed_overlap_count",
+            "total_unique_excluded_case_count",
+            "remaining_after_identity_exclusions",
+        ):
+            self.assertEqual(inventory[field], report[field])
+        self.assertEqual(
+            sum(
+                report[field]
+                for field in (
+                    "sealed_challenge_exclusion_effective_count",
+                    "stage_a_exclusion_effective_count",
+                    "calibration_exclusion_effective_count",
+                    "additional_prior_audit_exclusion_effective_count",
+                )
+            ),
+            report["total_unique_excluded_case_count"],
+        )
+        self.assertGreater(
+            sum(
+                report[field]
+                for field in (
+                    "sealed_challenge_exclusion_membership_count",
+                    "stage_a_exclusion_membership_count",
+                    "calibration_exclusion_membership_count",
+                    "additional_prior_audit_exclusion_membership_count",
+                )
+            ),
+            report["total_unique_excluded_case_count"],
+        )
+
+    def test_pairwise_overlap_precedence_and_union_are_accounted_once(self) -> None:
+        source_ids = frozenset(
+            {
+                "GroundLie360:sealed-stage",
+                "GroundLie360:stage-calibration",
+                "GroundLie360:calibration-additional",
+                "GroundLie360:additional-only",
+            }
+        )
+        sealed_ids = frozenset({"GroundLie360:sealed-stage"})
+        stage_a_ids = frozenset(
+            {"GroundLie360:sealed-stage", "GroundLie360:stage-calibration"}
+        )
+        calibration_ids = frozenset(
+            {
+                "GroundLie360:stage-calibration",
+                "GroundLie360:calibration-additional",
+            }
+        )
+        additional_ids = frozenset(
+            {
+                "GroundLie360:calibration-additional",
+                "GroundLie360:additional-only",
+            }
+        )
+        report = _summarize_exclusion_accounting(
+            source_ids=source_ids,
+            calibration_ids=calibration_ids,
+            sealed_ids=sealed_ids,
+            stage_a_ids=stage_a_ids,
+            additional_ids=additional_ids,
+            effective_ids={
+                "sealed": sealed_ids,
+                "stage_a": frozenset({"GroundLie360:stage-calibration"}),
+                "calibration": frozenset(
+                    {"GroundLie360:calibration-additional"}
+                ),
+                "additional": frozenset({"GroundLie360:additional-only"}),
+            },
+        )
+        self.assertEqual(report["stage_a_sealed_overlap_count"], 1)
+        self.assertEqual(report["calibration_stage_a_overlap_count"], 1)
+        self.assertEqual(report["sealed_challenge_exclusion_effective_count"], 1)
+        self.assertEqual(report["stage_a_exclusion_effective_count"], 1)
+        self.assertEqual(report["calibration_exclusion_effective_count"], 1)
+        self.assertEqual(report["additional_prior_audit_exclusion_effective_count"], 1)
+        self.assertEqual(report["additional_prior_audit_higher_priority_overlap_count"], 1)
+        self.assertEqual(report["total_unique_excluded_case_count"], 4)
+        self.assertEqual(report["remaining_after_exclusions"], 0)
+
+    def test_additional_exclusions_may_overlap_higher_priority_sets(self) -> None:
+        manifest = self.root / "additional_overlap.json"
+        digest = _write_json(
+            manifest,
+            {
+                "canonical_case_ids": [
+                    "GroundLie360:cal-g",
+                    "GroundLie360:13296704",
+                    "GroundLie360:g-000",
+                ]
+            },
+        )
+        manifest.with_suffix(".sha256").write_text(digest + "\n", encoding="utf-8")
+        result = self.fixture.build(
+            additional_exclusion_manifests=(manifest,)
+        )
+        report = result.build_report
+        self.assertEqual(report["additional_prior_audit_exclusion_membership_count"], 3)
+        self.assertEqual(report["additional_prior_audit_exclusion_effective_count"], 1)
+        self.assertEqual(report["additional_prior_audit_higher_priority_overlap_count"], 2)
+        self.assertEqual(report["total_unique_excluded_case_count"], 16)
+        self.assertEqual(report["remaining_after_exclusions"], len(self.fixture.rows) - 16)
+        self.assertEqual(
+            sum(
+                report[field]
+                for field in (
+                    "sealed_challenge_exclusion_effective_count",
+                    "stage_a_exclusion_effective_count",
+                    "calibration_exclusion_effective_count",
+                    "additional_prior_audit_exclusion_effective_count",
+                )
+            ),
+            report["total_unique_excluded_case_count"],
+        )
+
+    def test_authoritative_identity_accounting_contract_numbers(self) -> None:
+        calibration_groundlie = {
+            "GroundLie360:13296704",
+            "GroundLie360:13310803",
+            *{f"GroundLie360:cal-{index:04d}" for index in range(568)},
+        }
+        calibration_true3m = {
+            f"TRUE-3MFact:cal-{index:04d}" for index in range(736)
+        }
+        calibration_ids = frozenset(calibration_groundlie | calibration_true3m)
+        sealed_ids = SEALED_CHALLENGE_IDS
+        stage_a_ids = STAGE_A_IDS
+        union = calibration_ids | sealed_ids | stage_a_ids
+        source_ids = frozenset(
+            union
+            | {
+                f"GroundLie360:source-{index:04d}"
+                for index in range(3878 - len(union))
+            }
+        )
+        report = _summarize_exclusion_accounting(
+            source_ids=source_ids,
+            calibration_ids=calibration_ids,
+            sealed_ids=sealed_ids,
+            stage_a_ids=stage_a_ids,
+            additional_ids=frozenset(),
+            effective_ids={
+                "sealed": sealed_ids,
+                "stage_a": stage_a_ids - sealed_ids,
+                "calibration": calibration_ids - sealed_ids - stage_a_ids,
+                "additional": frozenset(),
+            },
+        )
+        self.assertEqual(report["calibration_exclusion_membership_count"], 1306)
+        self.assertEqual(report["sealed_challenge_exclusion_membership_count"], 6)
+        self.assertEqual(report["stage_a_exclusion_membership_count"], 7)
+        self.assertEqual(report["calibration_stage_a_overlap_count"], 2)
+        self.assertEqual(
+            report["calibration_stage_a_overlap_case_ids"],
+            ["GroundLie360:13296704", "GroundLie360:13310803"],
+        )
+        self.assertEqual(report["calibration_sealed_overlap_count"], 0)
+        self.assertEqual(report["stage_a_sealed_overlap_count"], 0)
+        self.assertEqual(report["calibration_exclusion_effective_count"], 1304)
+        self.assertEqual(report["sealed_challenge_exclusion_effective_count"], 6)
+        self.assertEqual(report["stage_a_exclusion_effective_count"], 7)
+        self.assertEqual(report["total_unique_excluded_case_count"], 1317)
+        self.assertEqual(report["remaining_after_identity_exclusions"], 2561)
+        self.assertEqual(
+            report["calibration_exclusion_membership_count_by_dataset"],
+            {"GroundLie360": 570, "TRUE-3MFact": 736},
+        )
+        self.assertEqual(
+            report["calibration_exclusion_effective_count_by_dataset"],
+            {"GroundLie360": 568, "TRUE-3MFact": 736},
+        )
+        self.assertEqual(
+            report["sealed_challenge_exclusion_membership_count_by_dataset"],
+            {"GroundLie360": 1, "TRUE-3MFact": 5},
+        )
+        self.assertEqual(
+            report["sealed_challenge_exclusion_effective_count_by_dataset"],
+            {"GroundLie360": 1, "TRUE-3MFact": 5},
+        )
+        self.assertEqual(
+            report["stage_a_exclusion_membership_count_by_dataset"],
+            {"GroundLie360": 7, "TRUE-3MFact": 0},
+        )
+        self.assertEqual(
+            report["stage_a_exclusion_effective_count_by_dataset"],
+            {"GroundLie360": 7, "TRUE-3MFact": 0},
+        )
+
+    def test_membership_contracts_still_fail_closed(self) -> None:
+        with self.assertRaisesRegex(
+            IndependentAuditBuildError, "neutral calibration identity counts mismatch"
+        ):
+            self.fixture.build(
+                output=self.root / "wrong-calibration-membership",
+                expected_calibration_counts={
+                    "GroundLie360": 2,
+                    "TRUE-3MFact": 1,
+                },
+            )
+        reduced_sealed = frozenset(sorted(SEALED_CHALLENGE_IDS)[:-1])
+        with patch(
+            "scripts.selector_relevance_independent_audit.cohort_builder.SEALED_CHALLENGE_IDS",
+            reduced_sealed,
+        ):
+            with self.assertRaisesRegex(
+                IndependentAuditBuildError,
+                "sealed challenge exclusion membership count mismatch",
+            ):
+                self.fixture.build(output=self.root / "wrong-sealed-membership")
 
     def test_formal_validation_and_test_paths_are_rejected(self) -> None:
         for name in ("Validation", "Test"):
@@ -860,6 +1131,11 @@ class IndependentAuditTests(unittest.TestCase):
             for reviewer in ("A", "B")
             for name in PUBLIC_PACKET_FILES
         )
+        for overlap_identity in (
+            "GroundLie360:13296704",
+            "GroundLie360:13025004",
+        ):
+            self.assertNotIn(overlap_identity.encode(), public_payload)
         for item in mapping["reviewer_A"]:
             self.assertNotIn(item["canonical_case_id"].encode(), public_payload)
             self.assertNotIn(item["original_case_id"].encode(), public_payload)

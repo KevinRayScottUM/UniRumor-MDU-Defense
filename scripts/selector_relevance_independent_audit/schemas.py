@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 
-IMPLEMENTATION_REVISION = "step2.6r-3b1-r1-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3b1-r2-v1"
 SCHEMA_VERSION = 1
 SAMPLING_SALT = "step2.6r-3b1-independent-audit-v1"
 REVIEWER_A_SALT = "step2.6r-3b1-reviewer-a-v1"
