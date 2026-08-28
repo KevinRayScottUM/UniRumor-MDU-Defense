@@ -7,15 +7,17 @@ import json
 import re
 import shutil
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence, Tuple
 
 
-IMPLEMENTATION_REVISION = "step2.6r-3a0-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3a0-r1-v1"
 AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256 = (
     "356ee750c7b95de37e5d14b481e2f5f8fb5ae1e3805ee922d016fcb0a3ab2178"
 )
 EXPECTED_HISTORICAL_PHASE4A_COUNT = 8
+EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT = 73
 EXPECTED_STAGE_A_REQUEST_COUNT = 7
 EXPECTED_STAGE_A_EXCLUDED_HELDOUT_COUNT = 1
 EXCLUSION_REASON = "PREEXISTING_HELDOUT_RELEVANCE_CHALLENGE"
@@ -44,6 +46,7 @@ SOURCE_SCHEMA_FIELDS = (
     "claim",
     "candidate_units",
     "source_case_id",
+    "ground_truth_label_deliberately_omitted",
 )
 NORMALIZED_SCHEMA_FIELDS = (
     "case_id",
@@ -51,7 +54,38 @@ NORMALIZED_SCHEMA_FIELDS = (
     "claim",
     "candidate_units",
 )
-_UNIT_FIELDS = ("unit_id", "unit_type", "modality", "text")
+AUTHORITATIVE_HISTORICAL_UNIT_FIELDS = (
+    "claim_atom",
+    "evidence_refs",
+    "evidence_text",
+    "frame_ids",
+    "grounding",
+    "modality",
+    "phase1_source",
+    "relation",
+    "snippet_id",
+    "snippet_path",
+    "snippet_text",
+    "snippet_type",
+    "source_snippet_type",
+    "supervision",
+    "text",
+    "unit_id",
+    "unit_type",
+)
+NORMALIZED_UNIT_FIELDS = ("unit_id", "unit_type", "modality", "text")
+AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS = {
+    "ocr|ocr": 28,
+    "title_span|text": 10,
+    "transcript|text": 35,
+}
+_ALLOWED_HISTORICAL_UNIT_TYPE_MODALITY_PAIRS = frozenset(
+    {
+        ("ocr", "ocr"),
+        ("title_span", "text"),
+        ("transcript", "text"),
+    }
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _FORBIDDEN_FIELDS = frozenset(
     {
@@ -161,7 +195,19 @@ def canonical_underlying_case_id(
     return canonical
 
 
-def _validated_candidates(value: Any, row_index: int) -> list[Mapping[str, str]]:
+def validate_ground_truth_omission_sentinel(value: Any, row_index: int) -> None:
+    if type(value) is not bool or value is not True:
+        raise Phase4ANormalizationError(
+            "historical row "
+            f"{row_index} ground_truth_label_deliberately_omitted must be boolean true"
+        )
+
+
+def project_historical_candidates(
+    value: Any, row_index: int
+) -> list[Mapping[str, str]]:
+    """Validate the exact rich schema and project only Frozen-G1 input fields."""
+
     if not isinstance(value, list) or not 1 <= len(value) <= 24:
         raise Phase4ANormalizationError(
             f"row {row_index} candidate_units must contain between 1 and 24 units"
@@ -169,7 +215,9 @@ def _validated_candidates(value: Any, row_index: int) -> list[Mapping[str, str]]
     candidates = []
     unit_ids = []
     for unit_index, item in enumerate(value):
-        if not isinstance(item, Mapping) or set(item) != set(_UNIT_FIELDS):
+        if not isinstance(item, Mapping) or set(item) != set(
+            AUTHORITATIVE_HISTORICAL_UNIT_FIELDS
+        ):
             raise Phase4ANormalizationError(
                 f"row {row_index} candidate {unit_index} has an invalid schema"
             )
@@ -177,14 +225,12 @@ def _validated_candidates(value: Any, row_index: int) -> list[Mapping[str, str]]
             field: _nonblank(
                 item.get(field), f"row {row_index} candidate {unit_index} {field}"
             )
-            for field in _UNIT_FIELDS
+            for field in NORMALIZED_UNIT_FIELDS
         }
-        if candidate["unit_type"] not in {"text", "transcript", "ocr"}:
-            raise Phase4ANormalizationError("historical candidate unit_type is invalid")
-        expected_modality = "ocr" if candidate["unit_type"] == "ocr" else "text"
-        if candidate["modality"] != expected_modality:
+        pair = (candidate["unit_type"], candidate["modality"])
+        if pair not in _ALLOWED_HISTORICAL_UNIT_TYPE_MODALITY_PAIRS:
             raise Phase4ANormalizationError(
-                "historical candidate unit_type/modality are inconsistent"
+                "historical candidate unit_type/modality pair is not authoritative"
             )
         candidates.append(candidate)
         unit_ids.append(candidate["unit_id"])
@@ -277,11 +323,14 @@ def prepare_invariance_requests(
     change_counts = {
         "claims_changed_count": 0,
         "candidate_content_changed_count": 0,
+        "candidate_text_changed_count": 0,
         "candidate_id_changed_count": 0,
         "candidate_order_changed_count": 0,
         "unit_type_changed_count": 0,
         "modality_changed_count": 0,
     }
+    source_candidate_unit_count = 0
+    historical_unit_type_modality_counts: Counter[str] = Counter()
     for row_index, row in enumerate(rows):
         if set(row) != set(SOURCE_SCHEMA_FIELDS):
             raise Phase4ANormalizationError(
@@ -291,11 +340,19 @@ def prepare_invariance_requests(
         source_case_id = _nonblank(
             row.get("source_case_id"), f"row {row_index} source_case_id"
         )
+        validate_ground_truth_omission_sentinel(
+            row.get("ground_truth_label_deliberately_omitted"), row_index
+        )
         dataset = _nonblank(row.get("dataset"), f"row {row_index} dataset")
         if dataset.casefold() in _RESTRICTED_PATH_PARTS:
             raise Phase4ANormalizationError("historical dataset is Validation/Test")
         claim = _nonblank(row.get("claim"), f"row {row_index} claim")
-        candidates = _validated_candidates(row.get("candidate_units"), row_index)
+        source_candidates = row["candidate_units"]
+        candidates = project_historical_candidates(source_candidates, row_index)
+        source_candidate_unit_count += len(source_candidates)
+        historical_unit_type_modality_counts.update(
+            f'{item["unit_type"]}|{item["modality"]}' for item in candidates
+        )
         canonical = canonical_underlying_case_id(historical_case_id, source_case_id)
         if canonical.rsplit(":", 1)[0] != dataset:
             raise Phase4ANormalizationError(
@@ -308,11 +365,20 @@ def prepare_invariance_requests(
             "claim": claim,
             "candidate_units": candidates,
         }
-        source_candidates = row["candidate_units"]
         change_counts["claims_changed_count"] += int(
             claim.encode("utf-8") != normalized["claim"].encode("utf-8")
         )
         change_counts["candidate_content_changed_count"] += int(
+            tuple(
+                tuple(item[field] for field in NORMALIZED_UNIT_FIELDS)
+                for item in source_candidates
+            )
+            != tuple(
+                tuple(item[field] for field in NORMALIZED_UNIT_FIELDS)
+                for item in candidates
+            )
+        )
+        change_counts["candidate_text_changed_count"] += int(
             tuple(item["text"] for item in source_candidates)
             != tuple(item["text"] for item in candidates)
         )
@@ -360,6 +426,16 @@ def prepare_invariance_requests(
         raise Phase4ANormalizationError(
             "historical Phase4A underlying case set is not authoritative"
         )
+    if source_candidate_unit_count != EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT:
+        raise Phase4ANormalizationError(
+            "historical Phase4A source must contain exactly 73 candidate units"
+        )
+    if dict(historical_unit_type_modality_counts) != (
+        AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS
+    ):
+        raise Phase4ANormalizationError(
+            "historical unit_type/modality counts are not authoritative"
+        )
     if len(normalized_rows) != EXPECTED_STAGE_A_REQUEST_COUNT:
         raise Phase4ANormalizationError(
             "normalized Stage-A request set must contain exactly 7 rows"
@@ -384,6 +460,21 @@ def prepare_invariance_requests(
             "normalized_artifact_sha256": normalized_sha,
             "source_request_count": len(rows),
             "historical_labels_included": False,
+            "historical_top_level_schema_verified": True,
+            "historical_candidate_schema_verified": True,
+            "historical_ground_truth_omission_sentinel_present": True,
+            "historical_ground_truth_omission_sentinel_all_true": True,
+            "historical_ground_truth_omission_sentinel_count": len(rows),
+            "source_candidate_unit_count": source_candidate_unit_count,
+            "historical_unit_type_modality_counts": dict(
+                historical_unit_type_modality_counts
+            ),
+            "historical_unit_type_modality_pairs_verified": True,
+            "historical_unit_metadata_projected_out": True,
+            "historical_unit_field_count": len(
+                AUTHORITATIVE_HISTORICAL_UNIT_FIELDS
+            ),
+            "normalized_unit_field_count": len(NORMALIZED_UNIT_FIELDS),
             "historical_validation_rows_loaded": 0,
             "historical_test_rows_loaded": 0,
             "protected_heldout_case_ids": list(PROTECTED_HELDOUT_CASE_IDS),
@@ -394,7 +485,12 @@ def prepare_invariance_requests(
             "retained_requests": retained_records,
             "source_schema_fields": list(SOURCE_SCHEMA_FIELDS),
             "normalized_schema_fields": list(NORMALIZED_SCHEMA_FIELDS),
+            "historical_candidate_schema_fields": list(
+                AUTHORITATIVE_HISTORICAL_UNIT_FIELDS
+            ),
+            "normalized_candidate_schema_fields": list(NORMALIZED_UNIT_FIELDS),
             "source_case_id_removed": True,
+            "ground_truth_omission_sentinel_removed": True,
             **change_counts,
             "formal_validation_accessed": False,
             "formal_test_accessed": False,

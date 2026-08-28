@@ -11,9 +11,11 @@ Execution is deliberately split and never chained automatically:
 
 1. `--prepare-invariance-requests` performs a standard-library-only field
    projection of the immutable historical Phase4A request artifact. It removes
-   the provenance-only `source_case_id` field and deterministically excludes
-   the later-protected CPAC held-out case. It does not load Torch, a model, a
-   checkpoint, or a selector.
+   the provenance-only `source_case_id` and
+   `ground_truth_label_deliberately_omitted` fields, projects each exact rich
+   17-field candidate to the four Frozen-G1 input fields, and deterministically
+   excludes the later-protected CPAC held-out case. It does not load Torch, a
+   model, a checkpoint, or a selector.
 2. `--invariance-smoke` evaluates the deterministic seven-request nonheldout
    subset of the immutable historical eight-request Phase4A label-free smoke
    artifact and writes a prediction-invariance report.
@@ -39,10 +41,21 @@ The immutable historical source is:
 Its required SHA-256 is
 `356ee750c7b95de37e5d14b481e2f5f8fb5ae1e3805ee922d016fcb0a3ab2178`.
 It contains exactly eight label-free rows with
-`{case_id, dataset, claim, candidate_units, source_case_id}`. Normalization
-projects the seven retained rows to exactly
+`{case_id, dataset, claim, candidate_units, source_case_id,
+ground_truth_label_deliberately_omitted}`. The omission sentinel must be the
+boolean `true` in all eight rows; it records that labels were omitted and is not
+a label. The source contains exactly 73 candidates with the exact rich fields
+`{claim_atom, evidence_refs, evidence_text, frame_ids, grounding, modality,
+phase1_source, relation, snippet_id, snippet_path, snippet_text, snippet_type,
+source_snippet_type, supervision, text, unit_id, unit_type}`. Their exact
+unit-type/modality accounting is 28 `ocr|ocr`, 10 `title_span|text`, and 35
+`transcript|text`.
+
+Normalization projects the seven retained rows to exactly
 `{case_id, dataset, claim, candidate_units}` without changing any string,
-candidate ID, candidate order, unit type, or modality. It writes:
+candidate ID, candidate order, unit type, or modality. Each normalized candidate
+contains only `{unit_id, unit_type, modality, text}`; rich upstream metadata is
+never passed to Frozen G1. It writes:
 
 - `phase4a_invariance_requests.jsonl`
 - `phase4a_invariance_requests.sha256`
@@ -51,13 +64,15 @@ candidate ID, candidate order, unit type, or modality. It writes:
 
 The Stage-A loader requires independent SHA-256 values for both the normalized
 JSONL and its manifest. The manifest must prove the authoritative historical
-SHA, source count 8, exactly one CPAC exclusion, retained count 7, and zero
-scientific-content changes. An arbitrary seven-request artifact is rejected.
+SHA, exact source schemas, all-true omission sentinels, 73-unit accounting,
+exact unit-type/modality counts, source count 8, exactly one CPAC exclusion,
+retained count 7, and zero scientific-content changes. An arbitrary
+seven-request artifact is rejected.
 
 The normalized JSONL schema is:
 
 ```json
-{"case_id":"...","dataset":"...","claim":"...","candidate_units":[{"unit_id":"...","unit_type":"text","modality":"text","text":"..."}]}
+{"case_id":"...","dataset":"...","claim":"...","candidate_units":[{"unit_id":"...","unit_type":"title_span","modality":"text","text":"..."}]}
 ```
 
 It must contain exactly seven manifest-approved requests and no labels or

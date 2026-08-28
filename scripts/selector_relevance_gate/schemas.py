@@ -17,8 +17,10 @@ class EvaluationUnit:
     def __post_init__(self) -> None:
         if not isinstance(self.unit_id, str) or not self.unit_id.strip():
             raise ValueError("unit_id must be nonblank")
-        if self.unit_type not in {"text", "transcript", "ocr"}:
-            raise ValueError("unit_type must be text, transcript, or ocr")
+        if self.unit_type not in {"text", "title_span", "transcript", "ocr"}:
+            raise ValueError(
+                "unit_type must be text, title_span, transcript, or ocr"
+            )
         expected_modality = "ocr" if self.unit_type == "ocr" else "text"
         if self.modality != expected_modality:
             raise ValueError("unit_type and modality are inconsistent")

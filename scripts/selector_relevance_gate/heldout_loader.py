@@ -5,23 +5,30 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, Tuple
 
 from .phase4a_normalizer import (
+    AUTHORITATIVE_HISTORICAL_UNIT_FIELDS,
+    AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS,
     AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
     CPAC_CANONICAL_CASE_ID,
     EXCLUSION_REASON,
+    EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT,
     EXPECTED_HISTORICAL_PHASE4A_COUNT,
     EXPECTED_STAGE_A_EXCLUDED_HELDOUT_COUNT,
     EXPECTED_STAGE_A_REQUEST_COUNT,
     IMPLEMENTATION_REVISION as NORMALIZATION_IMPLEMENTATION_REVISION,
     NORMALIZED_SCHEMA_FIELDS,
+    NORMALIZED_UNIT_FIELDS,
     Phase4ANormalizationError,
     PROTECTED_HELDOUT_CASE_IDS,
     SOURCE_SCHEMA_FIELDS,
     canonical_underlying_case_id,
+    project_historical_candidates,
     request_content_sha256,
+    validate_ground_truth_omission_sentinel,
 )
 from .schemas import EvaluationRequest, EvaluationUnit
 
@@ -51,6 +58,7 @@ _FORBIDDEN_LABEL_KEYS = {
     "sample_logits",
     "probabilities",
     "selection_score",
+    "selection_scores",
 }
 
 
@@ -181,6 +189,8 @@ def _derive_expected_normalized_protocol(
     normalized_rows = []
     excluded_records = []
     retained_records = []
+    source_candidate_unit_count = 0
+    historical_unit_type_modality_counts: Counter[str] = Counter()
     for row_index, row in enumerate(source_rows):
         if not isinstance(row, Mapping) or set(row) != set(SOURCE_SCHEMA_FIELDS):
             raise ReferenceInputError(
@@ -192,10 +202,23 @@ def _derive_expected_normalized_protocol(
         source_case_id = _nonblank(
             row.get("source_case_id"), f"historical[{row_index}].source_case_id"
         )
+        try:
+            validate_ground_truth_omission_sentinel(
+                row.get("ground_truth_label_deliberately_omitted"), row_index
+            )
+        except Phase4ANormalizationError as exc:
+            raise ReferenceInputError(str(exc)) from exc
         dataset = _dataset(row.get("dataset"), f"historical[{row_index}].dataset")
         claim = _nonblank(row.get("claim"), f"historical[{row_index}].claim")
-        _parse_units(
-            row.get("candidate_units"), f"historical[{row_index}].candidate_units"
+        try:
+            candidates = project_historical_candidates(
+                row.get("candidate_units"), row_index
+            )
+        except Phase4ANormalizationError as exc:
+            raise ReferenceInputError(str(exc)) from exc
+        source_candidate_unit_count += len(candidates)
+        historical_unit_type_modality_counts.update(
+            f'{item["unit_type"]}|{item["modality"]}' for item in candidates
         )
         try:
             canonical = canonical_underlying_case_id(
@@ -211,7 +234,7 @@ def _derive_expected_normalized_protocol(
             "case_id": historical_case_id,
             "dataset": dataset,
             "claim": claim,
-            "candidate_units": row["candidate_units"],
+            "candidate_units": candidates,
         }
         record = {
             "historical_case_id": historical_case_id,
@@ -233,6 +256,16 @@ def _derive_expected_normalized_protocol(
     ):
         raise ReferenceInputError(
             "historical Phase4A source does not produce the approved 8-to-7 projection"
+        )
+    if source_candidate_unit_count != EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT:
+        raise ReferenceInputError(
+            "historical Phase4A source must contain exactly 73 candidate units"
+        )
+    if dict(historical_unit_type_modality_counts) != (
+        AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS
+    ):
+        raise ReferenceInputError(
+            "historical unit_type/modality counts are not authoritative"
         )
     return normalized_rows, excluded_records, retained_records
 
@@ -284,6 +317,21 @@ def load_phase4a_replay_requests(
         "normalized_artifact_sha256": actual_sha,
         "source_request_count": EXPECTED_HISTORICAL_PHASE4A_COUNT,
         "historical_labels_included": False,
+        "historical_top_level_schema_verified": True,
+        "historical_candidate_schema_verified": True,
+        "historical_ground_truth_omission_sentinel_present": True,
+        "historical_ground_truth_omission_sentinel_all_true": True,
+        "historical_ground_truth_omission_sentinel_count": (
+            EXPECTED_HISTORICAL_PHASE4A_COUNT
+        ),
+        "source_candidate_unit_count": EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT,
+        "historical_unit_type_modality_counts": (
+            AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS
+        ),
+        "historical_unit_type_modality_pairs_verified": True,
+        "historical_unit_metadata_projected_out": True,
+        "historical_unit_field_count": len(AUTHORITATIVE_HISTORICAL_UNIT_FIELDS),
+        "normalized_unit_field_count": len(NORMALIZED_UNIT_FIELDS),
         "historical_validation_rows_loaded": 0,
         "historical_test_rows_loaded": 0,
         "protected_heldout_case_ids": list(PROTECTED_HELDOUT_CASE_IDS),
@@ -292,9 +340,15 @@ def load_phase4a_replay_requests(
         "retained_request_count": EXPECTED_STAGE_A_REQUEST_COUNT,
         "source_schema_fields": list(SOURCE_SCHEMA_FIELDS),
         "normalized_schema_fields": list(NORMALIZED_SCHEMA_FIELDS),
+        "historical_candidate_schema_fields": list(
+            AUTHORITATIVE_HISTORICAL_UNIT_FIELDS
+        ),
+        "normalized_candidate_schema_fields": list(NORMALIZED_UNIT_FIELDS),
         "source_case_id_removed": True,
+        "ground_truth_omission_sentinel_removed": True,
         "claims_changed_count": 0,
         "candidate_content_changed_count": 0,
+        "candidate_text_changed_count": 0,
         "candidate_id_changed_count": 0,
         "candidate_order_changed_count": 0,
         "unit_type_changed_count": 0,
@@ -321,6 +375,10 @@ def load_phase4a_replay_requests(
         raise ReferenceInputError("Phase4A normalization manifest schema is invalid")
     for field in (
         "source_request_count",
+        "historical_ground_truth_omission_sentinel_count",
+        "source_candidate_unit_count",
+        "historical_unit_field_count",
+        "normalized_unit_field_count",
         "historical_validation_rows_loaded",
         "historical_test_rows_loaded",
         "overlap_count",
@@ -328,6 +386,7 @@ def load_phase4a_replay_requests(
         "retained_request_count",
         "claims_changed_count",
         "candidate_content_changed_count",
+        "candidate_text_changed_count",
         "candidate_id_changed_count",
         "candidate_order_changed_count",
         "unit_type_changed_count",

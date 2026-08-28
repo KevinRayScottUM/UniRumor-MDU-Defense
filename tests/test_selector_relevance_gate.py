@@ -30,13 +30,19 @@ from scripts.selector_relevance_gate.metrics import (
     reference_metrics,
 )
 from scripts.selector_relevance_gate.phase4a_normalizer import (
+    AUTHORITATIVE_HISTORICAL_UNIT_FIELDS,
+    AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS,
     AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
     CPAC_CANONICAL_CASE_ID,
+    EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT,
     EXPECTED_HISTORICAL_CASE_IDS,
     EXPECTED_STAGE_A_REQUEST_COUNT,
+    IMPLEMENTATION_REVISION as NORMALIZATION_REVISION,
+    NORMALIZED_UNIT_FIELDS,
     Phase4ANormalizationError,
     canonical_underlying_case_id,
     prepare_invariance_requests,
+    project_historical_candidates,
     request_content_sha256,
 )
 from scripts.selector_relevance_gate.runtime import (
@@ -96,22 +102,56 @@ def _request(prefix: str, *, case_id: str = "Engineering:case") -> EvaluationReq
     )
 
 
+def _historical_candidate(index: int, unit_type: str, modality: str):
+    return {
+        "claim_atom": f"historical claim atom {index}",
+        "evidence_refs": [f"evidence-{index}"],
+        "evidence_text": f"historical evidence text {index}",
+        "frame_ids": [f"frame-{index}"],
+        "grounding": {"method": "authoritative-schema-fixture"},
+        "modality": modality,
+        "phase1_source": "historical-phase1",
+        "relation": "supports",
+        "snippet_id": f"snippet-{index}",
+        "snippet_path": f"Train/snippets/{index}.json",
+        "snippet_text": f"historical snippet text {index}",
+        "snippet_type": unit_type,
+        "source_snippet_type": unit_type,
+        "supervision": {"status": "deliberately-omitted"},
+        "text": f"audited historical evidence {index}",
+        "unit_id": f"historical-unit-{index}",
+        "unit_type": unit_type,
+    }
+
+
 def _historical_phase4a_rows():
+    pairs = (
+        [("ocr", "ocr")] * 28
+        + [("title_span", "text")] * 10
+        + [("transcript", "text")] * 35
+    )
+    row_sizes = (10, 9, 9, 9, 9, 9, 9, 9)
     rows = []
+    unit_offset = 0
     for index, canonical in enumerate(EXPECTED_HISTORICAL_CASE_IDS):
         dataset, numeric_id = canonical.rsplit(":", 1)
+        row_pairs = pairs[unit_offset : unit_offset + row_sizes[index]]
         rows.append(
             {
                 "case_id": f"smoke::{dataset}:train:{numeric_id}",
                 "dataset": dataset,
                 "claim": f"Historical claim {index}",
                 "candidate_units": [
-                    dict(_unit(f"historical-{index}", unit_index).to_dict())
-                    for unit_index in range(3)
+                    _historical_candidate(unit_offset + unit_index, *pair)
+                    for unit_index, pair in enumerate(row_pairs)
                 ],
                 "source_case_id": f"{dataset}:train:{numeric_id}",
+                "ground_truth_label_deliberately_omitted": True,
             }
         )
+        unit_offset += row_sizes[index]
+    if unit_offset != EXPECTED_HISTORICAL_CANDIDATE_UNIT_COUNT:
+        raise AssertionError("authoritative fixture unit accounting is invalid")
     return rows
 
 
@@ -291,6 +331,7 @@ class Phase4ANormalizerTests(unittest.TestCase):
             "356ee750c7b95de37e5d14b481e2f5f8fb5ae1e3805ee922d016fcb0a3ab2178",
             AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
         )
+        self.assertEqual("step2.6r-3a0-r1-v1", NORMALIZATION_REVISION)
 
     def test_correct_source_projects_exactly_seven_without_content_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -311,16 +352,59 @@ class Phase4ANormalizerTests(unittest.TestCase):
                 json.loads(line)
                 for line in normalized_path.read_text(encoding="utf-8").splitlines()
             ]
-            expected_rows = [
-                {key: value for key, value in row.items() if key != "source_case_id"}
-                for row in rows[1:]
-            ]
+            expected_rows = []
+            for row in rows[1:]:
+                expected_rows.append(
+                    {
+                        "case_id": row["case_id"],
+                        "dataset": row["dataset"],
+                        "claim": row["claim"],
+                        "candidate_units": [
+                            {
+                                field: candidate[field]
+                                for field in NORMALIZED_UNIT_FIELDS
+                            }
+                            for candidate in row["candidate_units"]
+                        ],
+                    }
+                )
             self.assertEqual(expected_rows, normalized_rows)
             self.assertEqual(EXPECTED_STAGE_A_REQUEST_COUNT, len(normalized_rows))
             self.assertTrue(all("source_case_id" not in row for row in normalized_rows))
             self.assertTrue(
+                all(
+                    "ground_truth_label_deliberately_omitted" not in row
+                    for row in normalized_rows
+                )
+            )
+            self.assertTrue(
+                all(
+                    set(candidate) == set(NORMALIZED_UNIT_FIELDS)
+                    for row in normalized_rows
+                    for candidate in row["candidate_units"]
+                )
+            )
+            self.assertTrue(
                 all(value == 0 for key, value in manifest.items() if key.endswith("_changed_count"))
             )
+            self.assertEqual(
+                AUTHORITATIVE_HISTORICAL_UNIT_TYPE_MODALITY_COUNTS,
+                manifest["historical_unit_type_modality_counts"],
+            )
+            self.assertEqual(73, manifest["source_candidate_unit_count"])
+            for field in (
+                "historical_top_level_schema_verified",
+                "historical_candidate_schema_verified",
+                "historical_ground_truth_omission_sentinel_present",
+                "historical_ground_truth_omission_sentinel_all_true",
+                "historical_unit_type_modality_pairs_verified",
+                "historical_unit_metadata_projected_out",
+                "ground_truth_omission_sentinel_removed",
+            ):
+                self.assertIs(True, manifest[field])
+            self.assertEqual(8, manifest["historical_ground_truth_omission_sentinel_count"])
+            self.assertEqual(17, manifest["historical_unit_field_count"])
+            self.assertEqual(4, manifest["normalized_unit_field_count"])
             self.assertEqual(
                 {
                     "phase4a_invariance_requests.jsonl",
@@ -352,7 +436,8 @@ class Phase4ANormalizerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             rows = _historical_phase4a_rows()
-            rows[0] = dict(rows[1])
+            rows[0]["case_id"] = rows[1]["case_id"]
+            rows[0]["source_case_id"] = rows[1]["source_case_id"]
             with self.assertRaisesRegex(Phase4ANormalizationError, "missing the CPAC"):
                 self._run(root, rows)
 
@@ -392,13 +477,86 @@ class Phase4ANormalizerTests(unittest.TestCase):
                     )
 
     def test_forbidden_label_and_prediction_fields_rejected_recursively(self):
-        for field in ("label", "prediction"):
+        for field in ("label", "ground_truth_label", "prediction"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 rows = _historical_phase4a_rows()
                 rows[0]["candidate_units"][0][field] = 0
                 with self.assertRaisesRegex(Phase4ANormalizationError, "forbidden"):
                     self._run(root, rows)
+
+    def test_omission_sentinel_is_required_and_must_be_exact_boolean_true(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = _historical_phase4a_rows()
+            del rows[0]["ground_truth_label_deliberately_omitted"]
+            with self.assertRaisesRegex(Phase4ANormalizationError, "source schema"):
+                self._run(Path(temporary), rows, output_name="missing-sentinel")
+        for index, value in enumerate((False, None, "True")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                rows = _historical_phase4a_rows()
+                rows[0]["ground_truth_label_deliberately_omitted"] = value
+                with self.assertRaisesRegex(
+                    Phase4ANormalizationError, "must be boolean true"
+                ):
+                    self._run(
+                        Path(temporary), rows, output_name=f"invalid-sentinel-{index}"
+                    )
+
+    def test_exact_rich_candidate_schema_is_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = _historical_phase4a_rows()
+            del rows[0]["candidate_units"][0]["claim_atom"]
+            with self.assertRaisesRegex(Phase4ANormalizationError, "invalid schema"):
+                self._run(Path(temporary), rows, output_name="missing-rich-field")
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = _historical_phase4a_rows()
+            rows[0]["candidate_units"][0]["unexpected"] = "not-authoritative"
+            with self.assertRaisesRegex(Phase4ANormalizationError, "invalid schema"):
+                self._run(Path(temporary), rows, output_name="unexpected-rich-field")
+
+    def test_exact_historical_unit_type_modality_pairs(self):
+        for unit_type, modality in (
+            ("ocr", "ocr"),
+            ("title_span", "text"),
+            ("transcript", "text"),
+        ):
+            with self.subTest(unit_type=unit_type, modality=modality):
+                candidate = _historical_candidate(0, unit_type, modality)
+                self.assertEqual(
+                    [{field: candidate[field] for field in NORMALIZED_UNIT_FIELDS}],
+                    project_historical_candidates([candidate], 0),
+                )
+        for unit_type, modality in (
+            ("title_span", "ocr"),
+            ("transcript", "ocr"),
+            ("ocr", "text"),
+            ("unknown", "text"),
+        ):
+            with self.subTest(unit_type=unit_type, modality=modality):
+                candidate = _historical_candidate(0, unit_type, modality)
+                with self.assertRaisesRegex(
+                    Phase4ANormalizationError, "not authoritative"
+                ):
+                    project_historical_candidates([candidate], 0)
+
+    def test_historical_source_requires_exactly_73_units(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = _historical_phase4a_rows()
+            rows[-1]["candidate_units"].pop()
+            with self.assertRaisesRegex(Phase4ANormalizationError, "exactly 73"):
+                self._run(Path(temporary), rows)
+
+    def test_rich_metadata_is_projected_out_without_runtime_field_changes(self):
+        candidate = _historical_candidate(7, "title_span", "text")
+        projected = project_historical_candidates([candidate], 0)[0]
+        self.assertEqual(set(NORMALIZED_UNIT_FIELDS), set(projected))
+        self.assertEqual(
+            tuple(candidate[field] for field in NORMALIZED_UNIT_FIELDS),
+            tuple(projected[field] for field in NORMALIZED_UNIT_FIELDS),
+        )
+        self.assertTrue(
+            set(AUTHORITATIVE_HISTORICAL_UNIT_FIELDS) - set(projected)
+        )
 
     def test_source_case_id_is_narrow_provenance_only(self):
         self.assertEqual(
@@ -540,6 +698,33 @@ class InputLoaderTests(unittest.TestCase):
             payload["source_artifact_sha256"] = "0" * 64
             fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
             with self.assertRaisesRegex(ReferenceInputError, "source_artifact_sha256"):
+                self._load_normalized(fixture)
+
+    def test_stage_a_requires_r1_schema_and_sentinel_manifest_proof(self):
+        for field in (
+            "historical_top_level_schema_verified",
+            "historical_candidate_schema_verified",
+            "historical_ground_truth_omission_sentinel_present",
+            "historical_ground_truth_omission_sentinel_all_true",
+            "historical_unit_type_modality_pairs_verified",
+            "historical_unit_metadata_projected_out",
+            "ground_truth_omission_sentinel_removed",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                fixture = _prepare_normalized_fixture(Path(temporary))
+                payload = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+                payload[field] = False
+                fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
+                with self.assertRaisesRegex(ReferenceInputError, field):
+                    self._load_normalized(fixture)
+
+    def test_stage_a_requires_r1_unit_count_manifest_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _prepare_normalized_fixture(Path(temporary))
+            payload = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+            payload["source_candidate_unit_count"] = 72
+            fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
+            with self.assertRaisesRegex(ReferenceInputError, "source_candidate_unit_count"):
                 self._load_normalized(fixture)
 
     def test_phase4a_labels_and_predictions_fail_closed(self):
