@@ -31,6 +31,12 @@ from scripts.selector_relevance_calibration.dataset_builder import (
     verify_train_lock,
 )
 from scripts.selector_relevance_training.trainer import AUTHORITATIVE_SOURCE_HASHES
+from scripts.selector_relevance_gate.phase4a_normalizer import (
+    CPAC_CANONICAL_CASE_ID,
+    EXCLUSION_REASON as STAGE_A_EXCLUSION_REASON,
+    IMPLEMENTATION_REVISION as STAGE_A_NORMALIZATION_REVISION,
+    request_content_sha256,
+)
 
 from .blinding import build_review_packet, write_review_packet
 from .schemas import (
@@ -273,7 +279,10 @@ def _load_stage_a_exclusions(
     if report.get("status") != "PREDICTION_INVARIANCE_SMOKE_PASS":
         raise IndependentAuditBuildError("Stage-A report status is not PASS")
     required_exact = {
+        "request_count": EXPECTED_STAGE_A_COUNT,
         "exact_phase4a_replay_request_count": EXPECTED_STAGE_A_COUNT,
+        "historical_phase4a_source_request_count": 8,
+        "historical_phase4a_excluded_heldout_count": 1,
         "candidate_id_mismatch_count": 0,
         "candidate_order_mismatch_count": 0,
         "maximum_unit_veracity_logit_difference": 0.0,
@@ -282,11 +291,19 @@ def _load_stage_a_exclusions(
         "prediction_mismatch_count": 0,
         "encoder_hash_unchanged": True,
         "veracity_head_hash_unchanged": True,
+        "selection_head_hash_changed": True,
+        "selection_scores_changed": True,
+        "frozen_g1_checkpoint_unchanged": True,
+        "prediction_invariance_gate": True,
+        "deterministic_nonheldout_historical_subset_used": True,
         "heldout_relevance_cases_accessed": False,
+        "veracity_labels_inspected": False,
         "formal_validation_accessed": False,
         "formal_test_accessed": False,
         "training_started": False,
         "optimizer_created": False,
+        "production_or_model_code_changed": False,
+        "public_demo_changed": False,
     }
     for field, expected in required_exact.items():
         if report.get(field) != expected:
@@ -298,16 +315,150 @@ def _load_stage_a_exclusions(
     manifest = _read_json(manifest_path, "Stage-A normalized replay manifest")
     if manifest.get("status") != "PHASE4A_INVARIANCE_REQUEST_NORMALIZATION_PASS":
         raise IndependentAuditBuildError("Stage-A replay manifest status is not PASS")
+    if manifest.get("implementation_revision") != STAGE_A_NORMALIZATION_REVISION:
+        raise IndependentAuditBuildError("Stage-A replay manifest revision mismatch")
     if manifest.get("normalized_artifact_sha256") != replay_actual:
         raise IndependentAuditBuildError("Stage-A replay manifest SHA mismatch")
+    required_manifest_exact = {
+        "historical_top_level_schema_verified": True,
+        "historical_candidate_schema_verified": True,
+        "historical_ground_truth_omission_sentinel_all_true": True,
+        "historical_unit_type_modality_pairs_verified": True,
+        "historical_unit_metadata_projected_out": True,
+        "source_request_count": 8,
+        "source_candidate_unit_count": 73,
+        "overlap_count": 1,
+        "excluded_request_count": 1,
+        "retained_request_count": EXPECTED_STAGE_A_COUNT,
+        "claims_changed_count": 0,
+        "candidate_content_changed_count": 0,
+        "candidate_text_changed_count": 0,
+        "candidate_id_changed_count": 0,
+        "candidate_order_changed_count": 0,
+        "unit_type_changed_count": 0,
+        "modality_changed_count": 0,
+        "formal_validation_accessed": False,
+        "formal_test_accessed": False,
+        "model_loaded": False,
+        "checkpoint_loaded": False,
+        "selector_loaded": False,
+        "training_started": False,
+        "optimizer_created": False,
+    }
+    for field, expected in required_manifest_exact.items():
+        if manifest.get(field) != expected:
+            raise IndependentAuditBuildError(
+                f"Stage-A replay manifest gate failed: {field}"
+            )
+    excluded = manifest.get("excluded_requests")
+    if not isinstance(excluded, list) or len(excluded) != 1:
+        raise IndependentAuditBuildError(
+            "Stage-A replay manifest must exclude exactly one request"
+        )
+    excluded_record = excluded[0]
+    if not isinstance(excluded_record, Mapping):
+        raise IndependentAuditBuildError("Stage-A excluded request is invalid")
+    if excluded_record.get("canonical_underlying_case_id") != CPAC_CANONICAL_CASE_ID:
+        raise IndependentAuditBuildError("Stage-A excluded identity is not CPAC")
+    if excluded_record.get("exclusion_reason") != STAGE_A_EXCLUSION_REASON:
+        raise IndependentAuditBuildError("Stage-A exclusion reason mismatch")
+
+    retained = manifest.get("retained_requests")
+    if not isinstance(retained, list) or len(retained) != EXPECTED_STAGE_A_COUNT:
+        raise IndependentAuditBuildError(
+            "Stage-A retained manifest record count mismatch"
+        )
+    replay_rows = tuple(
+        row for _, row in _read_jsonl(replay_path, "Stage-A normalized replay")
+    )
+    if len(replay_rows) != EXPECTED_STAGE_A_COUNT:
+        raise IndependentAuditBuildError("Stage-A replay row count mismatch")
+
     identities = set()
-    for index, row in _read_jsonl(replay_path, "Stage-A normalized replay"):
-        dataset, _, canonical = _identity(row, f"Stage-A replay row {index}")
-        if dataset != "GroundLie360":
+    historical_ids = set()
+    row_indices = []
+    normalized_fields = {"case_id", "dataset", "claim", "candidate_units"}
+    for index, (row, record) in enumerate(zip(replay_rows, retained)):
+        if not isinstance(record, Mapping):
+            raise IndependentAuditBuildError(
+                f"Stage-A retained manifest record {index} is invalid"
+            )
+        historical_id = record.get("historical_case_id")
+        source_case_id = record.get("source_case_id")
+        canonical = record.get("canonical_underlying_case_id")
+        content_sha = record.get("request_content_sha256")
+        row_index = record.get("row_index")
+        for value, field in (
+            (historical_id, "historical_case_id"),
+            (source_case_id, "source_case_id"),
+            (canonical, "canonical_underlying_case_id"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise IndependentAuditBuildError(
+                    f"Stage-A retained manifest {field} is missing"
+                )
+        if set(row) != normalized_fields:
+            raise IndependentAuditBuildError(
+                f"Stage-A replay row {index} schema mismatch"
+            )
+        if row.get("case_id") != historical_id:
+            raise IndependentAuditBuildError(
+                "Stage-A replay case_id does not match manifest historical_case_id"
+            )
+        if row.get("dataset") != "GroundLie360":
             raise IndependentAuditBuildError("Stage-A dataset is unexpected")
+        source_prefix = "GroundLie360:train:"
+        if not source_case_id.startswith(source_prefix):
+            raise IndependentAuditBuildError(
+                "Stage-A manifest source_case_id is inconsistent"
+            )
+        source_numeric_id = source_case_id[len(source_prefix) :]
+        if (
+            not source_numeric_id
+            or historical_id != f"smoke::{source_case_id}"
+            or canonical != f"GroundLie360:{source_numeric_id}"
+        ):
+            raise IndependentAuditBuildError(
+                "Stage-A historical/source/canonical identity mapping is inconsistent"
+            )
+        if canonical in SEALED_CHALLENGE_IDS:
+            raise IndependentAuditBuildError(
+                "sealed challenge identity entered Stage-A retained requests"
+            )
+        if not isinstance(content_sha, str) or not _SHA256_RE.fullmatch(
+            content_sha.casefold()
+        ):
+            raise IndependentAuditBuildError(
+                "Stage-A retained request content SHA is invalid"
+            )
+        if request_content_sha256(row) != content_sha.casefold():
+            raise IndependentAuditBuildError(
+                "Stage-A replay request content SHA mismatch"
+            )
+        if type(row_index) is not int or row_index < 0:
+            raise IndependentAuditBuildError(
+                "Stage-A retained manifest row_index is invalid"
+            )
+        if historical_id in historical_ids:
+            raise IndependentAuditBuildError(
+                "Stage-A retained historical identities are not unique"
+            )
+        if canonical in identities:
+            raise IndependentAuditBuildError(
+                "Stage-A retained canonical identities are not unique"
+            )
+        historical_ids.add(historical_id)
         identities.add(canonical)
+        row_indices.append(row_index)
+    if len(set(row_indices)) != len(row_indices) or any(
+        current >= following
+        for current, following in zip(row_indices, row_indices[1:])
+    ):
+        raise IndependentAuditBuildError(
+            "Stage-A retained row_index values must be unique and strictly increasing"
+        )
     if frozenset(identities) != expected_ids:
-        raise IndependentAuditBuildError("Stage-A replay identities mismatch")
+        raise IndependentAuditBuildError("Stage-A manifest canonical identities mismatch")
     locks = {
         "stage_a_prediction_invariance_report": {
             "path": str(report_path),

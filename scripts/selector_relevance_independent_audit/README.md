@@ -5,6 +5,12 @@ direct-relevance audit cohort**. It performs label-free deterministic Phase4A
 request normalization only. It does not load either selector, Frozen G1, a
 checkpoint, Torch, an optimizer, or any prediction output.
 
+Step 2.6R-3B1-R1 repairs authoritative historical Stage-A replay identity
+integration only. Stage-A canonical exclusion identities come from the already
+verified R3A0-R1 manifest mapping. Historical `smoke::...` replay IDs are not
+reparsed with the generic cross-case canonicalizer. No sampling, review, or
+scientific evaluation protocol changed.
+
 The original six-case historical challenge remains sealed because explicit
 access authorization was not established. Only those six canonical identities
 are used as exclusion keys; their claims, candidate pools, annotations, and

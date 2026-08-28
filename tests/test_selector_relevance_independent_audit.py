@@ -10,6 +10,12 @@ from dataclasses import fields
 from pathlib import Path
 
 from scripts.selector_relevance_calibration.dataset_builder import ExposureResult
+from scripts.selector_fidelity_audit.cross_case import (
+    canonicalize_underlying_case_id,
+)
+from scripts.selector_relevance_gate.phase4a_normalizer import (
+    request_content_sha256,
+)
 from scripts.selector_relevance_independent_audit.blinding import (
     PUBLIC_PACKET_FILES,
     build_review_packet,
@@ -79,6 +85,7 @@ _DEFAULT_ADAPTER = object()
 class IndependentAuditFixture:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
         self.project = root / "project"
         self.project.mkdir()
         self.neutral = root / "neutral"
@@ -199,14 +206,25 @@ class IndependentAuditFixture:
 
     def _write_stage_a(self) -> None:
         replay_rows = []
-        for canonical in sorted(STAGE_A_IDS):
+        retained_requests = []
+        retained_row_indices = (0, 1, 3, 4, 5, 6, 7)
+        for canonical, row_index in zip(sorted(STAGE_A_IDS), retained_row_indices):
             dataset, case_id = canonical.split(":", 1)
-            replay_rows.append(
+            historical_case_id = f"smoke::{dataset}:train:{case_id}"
+            row = {
+                "dataset": dataset,
+                "case_id": historical_case_id,
+                "claim": "Stage A claim",
+                "candidate_units": self._candidates(f"stage-{case_id}", 9),
+            }
+            replay_rows.append(row)
+            retained_requests.append(
                 {
-                    "dataset": dataset,
-                    "case_id": case_id,
-                    "claim": "Stage A claim",
-                    "candidate_units": self._candidates(f"stage-{case_id}"),
+                    "historical_case_id": historical_case_id,
+                    "source_case_id": f"{dataset}:train:{case_id}",
+                    "canonical_underlying_case_id": canonical,
+                    "row_index": row_index,
+                    "request_content_sha256": request_content_sha256(row),
                 }
             )
         self.stage_replay = self.root / "phase4a_invariance_requests.jsonl"
@@ -216,13 +234,52 @@ class IndependentAuditFixture:
             self.stage_manifest,
             {
                 "status": "PHASE4A_INVARIANCE_REQUEST_NORMALIZATION_PASS",
+                "implementation_revision": "step2.6r-3a0-r1-v1",
                 "normalized_artifact_sha256": self.stage_replay_sha,
+                "historical_top_level_schema_verified": True,
+                "historical_candidate_schema_verified": True,
+                "historical_ground_truth_omission_sentinel_all_true": True,
+                "historical_unit_type_modality_pairs_verified": True,
+                "historical_unit_metadata_projected_out": True,
+                "source_request_count": 8,
+                "source_candidate_unit_count": 73,
+                "overlap_count": 1,
+                "excluded_request_count": 1,
+                "excluded_requests": [
+                    {
+                        "historical_case_id": "smoke::GroundLie360:train:13025004",
+                        "source_case_id": "GroundLie360:train:13025004",
+                        "canonical_underlying_case_id": "GroundLie360:13025004",
+                        "row_index": 2,
+                        "request_content_sha256": "0" * 64,
+                        "exclusion_reason": "PREEXISTING_HELDOUT_RELEVANCE_CHALLENGE",
+                    }
+                ],
+                "retained_request_count": 7,
+                "retained_requests": retained_requests,
+                "claims_changed_count": 0,
+                "candidate_content_changed_count": 0,
+                "candidate_text_changed_count": 0,
+                "candidate_id_changed_count": 0,
+                "candidate_order_changed_count": 0,
+                "unit_type_changed_count": 0,
+                "modality_changed_count": 0,
+                "formal_validation_accessed": False,
+                "formal_test_accessed": False,
+                "model_loaded": False,
+                "checkpoint_loaded": False,
+                "selector_loaded": False,
+                "training_started": False,
+                "optimizer_created": False,
             },
         )
         self.stage_report = self.root / "prediction_invariance_smoke_report.json"
         report = {
             "status": "PREDICTION_INVARIANCE_SMOKE_PASS",
+            "request_count": 7,
             "exact_phase4a_replay_request_count": 7,
+            "historical_phase4a_source_request_count": 8,
+            "historical_phase4a_excluded_heldout_count": 1,
             "candidate_id_mismatch_count": 0,
             "candidate_order_mismatch_count": 0,
             "maximum_unit_veracity_logit_difference": 0.0,
@@ -233,15 +290,66 @@ class IndependentAuditFixture:
             "veracity_head_hash_unchanged": True,
             "selection_head_hash_changed": True,
             "selection_scores_changed": True,
+            "frozen_g1_checkpoint_unchanged": True,
+            "prediction_invariance_gate": True,
+            "deterministic_nonheldout_historical_subset_used": True,
             "heldout_relevance_cases_accessed": False,
+            "veracity_labels_inspected": False,
             "formal_validation_accessed": False,
             "formal_test_accessed": False,
             "training_started": False,
             "optimizer_created": False,
+            "production_or_model_code_changed": False,
+            "public_demo_changed": False,
             "phase4a_replay_artifact_sha256": self.stage_replay_sha,
             "phase4a_replay_manifest_sha256": self.stage_manifest_sha,
         }
         self.stage_report_sha = _write_json(self.stage_report, report)
+
+    def stage_replay_rows(self) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in self.stage_replay.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def stage_manifest_payload(self) -> dict:
+        return json.loads(self.stage_manifest.read_text(encoding="utf-8"))
+
+    def stage_report_payload(self) -> dict:
+        return json.loads(self.stage_report.read_text(encoding="utf-8"))
+
+    def rewrite_stage_report(self, report: dict) -> None:
+        self.stage_report_sha = _write_json(self.stage_report, report)
+
+    def rewrite_stage_manifest(self, manifest: dict, *, sync_report: bool = True) -> None:
+        self.stage_manifest_sha = _write_json(self.stage_manifest, manifest)
+        if sync_report:
+            report = self.stage_report_payload()
+            report["phase4a_replay_manifest_sha256"] = self.stage_manifest_sha
+            self.rewrite_stage_report(report)
+
+    def rewrite_stage_replay(
+        self,
+        rows: list[dict],
+        *,
+        sync_manifest: bool = True,
+        sync_report: bool = True,
+    ) -> None:
+        self.stage_replay_sha = _write_jsonl(self.stage_replay, rows)
+        if sync_manifest:
+            manifest = self.stage_manifest_payload()
+            manifest["normalized_artifact_sha256"] = self.stage_replay_sha
+            self.rewrite_stage_manifest(manifest, sync_report=sync_report)
+        elif sync_report:
+            report = self.stage_report_payload()
+            report["phase4a_replay_artifact_sha256"] = self.stage_replay_sha
+            self.rewrite_stage_report(report)
+        if sync_report and sync_manifest:
+            report = self.stage_report_payload()
+            report["phase4a_replay_artifact_sha256"] = self.stage_replay_sha
+            report["phase4a_replay_manifest_sha256"] = self.stage_manifest_sha
+            self.rewrite_stage_report(report)
 
     def build(self, *, output: Path | None = None, adapter=_DEFAULT_ADAPTER):
         selected_adapter = FixtureExposure() if adapter is _DEFAULT_ADAPTER else adapter
@@ -272,9 +380,16 @@ class IndependentAuditTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.fixture = IndependentAuditFixture(self.root)
+        self.fixture_counter = 0
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def fresh_fixture(self) -> IndependentAuditFixture:
+        self.fixture_counter += 1
+        return IndependentAuditFixture(
+            self.root / f"mutation-fixture-{self.fixture_counter:03d}"
+        )
 
     def test_build_accepts_locked_source_and_freezes_exact_balanced_cohort(self) -> None:
         result = self.fixture.build()
@@ -289,6 +404,304 @@ class IndependentAuditTests(unittest.TestCase):
         self.assertFalse(report["checkpoint_loaded"])
         self.assertFalse(report["optimizer_created"])
         self.assertFalse(report["training_started"])
+
+    def test_authoritative_historical_stage_a_identity_uses_manifest_mapping(self) -> None:
+        manifest = self.fixture.stage_manifest_payload()
+        replay = self.fixture.stage_replay_rows()
+        first = manifest["retained_requests"][0]
+        self.assertEqual(
+            replay[0]["case_id"],
+            "smoke::GroundLie360:train:13199900",
+        )
+        self.assertEqual(first["historical_case_id"], replay[0]["case_id"])
+        self.assertEqual(first["source_case_id"], "GroundLie360:train:13199900")
+        self.assertEqual(
+            first["canonical_underlying_case_id"], "GroundLie360:13199900"
+        )
+        self.assertNotEqual(
+            canonicalize_underlying_case_id(
+                replay[0]["dataset"], replay[0]["case_id"]
+            ),
+            first["canonical_underlying_case_id"],
+        )
+        self.fixture.build()
+        self.assertEqual(
+            {
+                record["canonical_underlying_case_id"]
+                for record in manifest["retained_requests"]
+            },
+            set(STAGE_A_IDS),
+        )
+
+    def test_stage_a_replay_manifest_pairing_and_uniqueness_fail_closed(self) -> None:
+        mutations = (
+            (
+                "case-id-mismatch",
+                lambda fixture: self._mutate_replay_case_id(fixture),
+            ),
+            (
+                "simplified-local-case-id",
+                lambda fixture: self._simplify_replay_case_id(fixture),
+            ),
+            (
+                "reordered-replay",
+                lambda fixture: self._reorder_replay(fixture),
+            ),
+            (
+                "duplicate-replay",
+                lambda fixture: self._duplicate_replay(fixture),
+            ),
+            (
+                "duplicate-retained",
+                lambda fixture: self._duplicate_retained(fixture),
+            ),
+            (
+                "six-retained",
+                lambda fixture: self._truncate_retained(fixture),
+            ),
+            (
+                "six-replay",
+                lambda fixture: self._truncate_replay(fixture),
+            ),
+            (
+                "duplicate-row-index",
+                lambda fixture: self._mutate_row_indices(fixture, duplicate=True),
+            ),
+            (
+                "decreasing-row-index",
+                lambda fixture: self._mutate_row_indices(fixture, duplicate=False),
+            ),
+        )
+        for name, mutation in mutations:
+            with self.subTest(name=name):
+                fixture = self.fresh_fixture()
+                mutation(fixture)
+                with self.assertRaises(IndependentAuditBuildError):
+                    fixture.build()
+
+    @staticmethod
+    def _mutate_replay_case_id(fixture: IndependentAuditFixture) -> None:
+        rows = fixture.stage_replay_rows()
+        rows[0]["case_id"] = "smoke::GroundLie360:train:99999999"
+        fixture.rewrite_stage_replay(rows)
+
+    @staticmethod
+    def _simplify_replay_case_id(fixture: IndependentAuditFixture) -> None:
+        rows = fixture.stage_replay_rows()
+        rows[0]["case_id"] = "13199900"
+        fixture.rewrite_stage_replay(rows)
+
+    @staticmethod
+    def _reorder_replay(fixture: IndependentAuditFixture) -> None:
+        rows = fixture.stage_replay_rows()
+        rows[0], rows[1] = rows[1], rows[0]
+        fixture.rewrite_stage_replay(rows)
+
+    @staticmethod
+    def _duplicate_replay(fixture: IndependentAuditFixture) -> None:
+        rows = fixture.stage_replay_rows()
+        rows[1] = dict(rows[0])
+        fixture.rewrite_stage_replay(rows)
+
+    @staticmethod
+    def _duplicate_retained(fixture: IndependentAuditFixture) -> None:
+        manifest = fixture.stage_manifest_payload()
+        manifest["retained_requests"][1] = dict(manifest["retained_requests"][0])
+        fixture.rewrite_stage_manifest(manifest)
+
+    @staticmethod
+    def _truncate_retained(fixture: IndependentAuditFixture) -> None:
+        manifest = fixture.stage_manifest_payload()
+        manifest["retained_requests"] = manifest["retained_requests"][:-1]
+        fixture.rewrite_stage_manifest(manifest)
+
+    @staticmethod
+    def _truncate_replay(fixture: IndependentAuditFixture) -> None:
+        fixture.rewrite_stage_replay(fixture.stage_replay_rows()[:-1])
+
+    @staticmethod
+    def _mutate_row_indices(
+        fixture: IndependentAuditFixture, *, duplicate: bool
+    ) -> None:
+        manifest = fixture.stage_manifest_payload()
+        if duplicate:
+            manifest["retained_requests"][1]["row_index"] = manifest[
+                "retained_requests"
+            ][0]["row_index"]
+        else:
+            manifest["retained_requests"][1]["row_index"] = 9
+        fixture.rewrite_stage_manifest(manifest)
+
+    def test_stage_a_manifest_identity_and_exclusion_contract_fail_closed(self) -> None:
+        def canonical(fixture, value):
+            manifest = fixture.stage_manifest_payload()
+            manifest["retained_requests"][0][
+                "canonical_underlying_case_id"
+            ] = value
+            fixture.rewrite_stage_manifest(manifest)
+
+        def excluded(fixture, *, canonical_id=None, reason=None, count=None):
+            manifest = fixture.stage_manifest_payload()
+            if canonical_id is not None:
+                manifest["excluded_requests"][0][
+                    "canonical_underlying_case_id"
+                ] = canonical_id
+            if reason is not None:
+                manifest["excluded_requests"][0]["exclusion_reason"] = reason
+            if count is not None:
+                manifest["excluded_request_count"] = count
+            fixture.rewrite_stage_manifest(manifest)
+
+        mutations = (
+            ("unknown-canonical", lambda f: canonical(f, "GroundLie360:99999999")),
+            ("sealed-retained", lambda f: canonical(f, "GroundLie360:13025004")),
+            (
+                "wrong-excluded-canonical",
+                lambda f: excluded(f, canonical_id="GroundLie360:13199900"),
+            ),
+            ("wrong-exclusion-reason", lambda f: excluded(f, reason="OTHER")),
+            ("wrong-exclusion-count", lambda f: excluded(f, count=2)),
+            (
+                "blank-source-case-id",
+                lambda f: self._mutate_retained_identity(
+                    f, "source_case_id", ""
+                ),
+            ),
+            (
+                "inconsistent-source-case-id",
+                lambda f: self._mutate_retained_identity(
+                    f, "source_case_id", "GroundLie360:train:99999999"
+                ),
+            ),
+            (
+                "blank-historical-case-id",
+                lambda f: self._mutate_retained_identity(
+                    f, "historical_case_id", ""
+                ),
+            ),
+        )
+        for name, mutation in mutations:
+            with self.subTest(name=name):
+                fixture = self.fresh_fixture()
+                mutation(fixture)
+                with self.assertRaises(IndependentAuditBuildError):
+                    fixture.build()
+
+    @staticmethod
+    def _mutate_retained_identity(
+        fixture: IndependentAuditFixture, field: str, value: str
+    ) -> None:
+        manifest = fixture.stage_manifest_payload()
+        manifest["retained_requests"][0][field] = value
+        fixture.rewrite_stage_manifest(manifest)
+
+    def test_stage_a_manifest_scientific_contract_failures(self) -> None:
+        fields_and_values = (
+            ("implementation_revision", "wrong-revision"),
+            ("source_request_count", 7),
+            ("source_candidate_unit_count", 72),
+            ("claims_changed_count", 1),
+            ("candidate_content_changed_count", 1),
+            ("candidate_id_changed_count", 1),
+            ("candidate_order_changed_count", 1),
+            ("unit_type_changed_count", 1),
+            ("modality_changed_count", 1),
+            ("formal_validation_accessed", True),
+            ("formal_test_accessed", True),
+            ("model_loaded", True),
+            ("checkpoint_loaded", True),
+            ("selector_loaded", True),
+            ("training_started", True),
+            ("optimizer_created", True),
+        )
+        for field, value in fields_and_values:
+            with self.subTest(field=field):
+                fixture = self.fresh_fixture()
+                manifest = fixture.stage_manifest_payload()
+                manifest[field] = value
+                fixture.rewrite_stage_manifest(manifest)
+                with self.assertRaises(IndependentAuditBuildError):
+                    fixture.build()
+
+    def test_stage_a_report_contract_and_sha_failures(self) -> None:
+        for field, value in (
+            ("request_count", 6),
+            ("prediction_mismatch_count", 1),
+            ("heldout_relevance_cases_accessed", True),
+            ("prediction_invariance_gate", False),
+            ("frozen_g1_checkpoint_unchanged", False),
+        ):
+            with self.subTest(field=field):
+                fixture = self.fresh_fixture()
+                report = fixture.stage_report_payload()
+                report[field] = value
+                fixture.rewrite_stage_report(report)
+                with self.assertRaises(IndependentAuditBuildError):
+                    fixture.build()
+
+        for name, mutation in (
+            (
+                "replay-argument-sha",
+                lambda fixture: setattr(fixture, "stage_replay_sha", "0" * 64),
+            ),
+            (
+                "manifest-argument-sha",
+                lambda fixture: setattr(fixture, "stage_manifest_sha", "0" * 64),
+            ),
+            (
+                "report-replay-sha",
+                lambda fixture: self._mutate_report_sha(
+                    fixture, "phase4a_replay_artifact_sha256"
+                ),
+            ),
+            (
+                "report-manifest-sha",
+                lambda fixture: self._mutate_report_sha(
+                    fixture, "phase4a_replay_manifest_sha256"
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                fixture = self.fresh_fixture()
+                mutation(fixture)
+                with self.assertRaises(IndependentAuditBuildError):
+                    fixture.build()
+
+    @staticmethod
+    def _mutate_report_sha(
+        fixture: IndependentAuditFixture, field: str
+    ) -> None:
+        report = fixture.stage_report_payload()
+        report[field] = "0" * 64
+        fixture.rewrite_stage_report(report)
+
+    def test_stage_a_request_content_hash_detects_claim_text_and_order_mutation(self) -> None:
+        def mutate_claim(rows):
+            rows[0]["claim"] = "Mutated claim"
+
+        def mutate_text(rows):
+            rows[0]["candidate_units"][0]["text"] = "Mutated candidate text"
+
+        def mutate_order(rows):
+            rows[0]["candidate_units"][0], rows[0]["candidate_units"][1] = (
+                rows[0]["candidate_units"][1],
+                rows[0]["candidate_units"][0],
+            )
+
+        for name, mutation in (
+            ("claim", mutate_claim),
+            ("candidate-text", mutate_text),
+            ("candidate-order", mutate_order),
+        ):
+            with self.subTest(name=name):
+                fixture = self.fresh_fixture()
+                rows = fixture.stage_replay_rows()
+                mutation(rows)
+                fixture.rewrite_stage_replay(rows)
+                with self.assertRaisesRegex(
+                    IndependentAuditBuildError, "content SHA mismatch"
+                ):
+                    fixture.build()
 
     def test_wrong_source_sha_and_source_count_mismatches_fail_closed(self) -> None:
         original = self.fixture.train_sha
