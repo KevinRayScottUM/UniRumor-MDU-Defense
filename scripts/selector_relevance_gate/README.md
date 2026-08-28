@@ -7,12 +7,24 @@ Frozen G1 encoder, veracity head, tokenizer, collator, candidate order, and
 class-wise maximum sample pooling. Only `selection_head.weight` and
 `selection_head.bias` may differ.
 
-Execution is deliberately split:
+Execution is deliberately split and never chained automatically:
 
-1. `--invariance-smoke` evaluates exactly eight pre-existing, label-free
-   Phase4A replay requests and writes a prediction-invariance report.
-2. `--heldout-gate` requires a manually inspected Stage-A PASS report before
+1. `--prepare-invariance-requests` performs a standard-library-only field
+   projection of the immutable historical Phase4A request artifact. It removes
+   the provenance-only `source_case_id` field and deterministically excludes
+   the later-protected CPAC held-out case. It does not load Torch, a model, a
+   checkpoint, or a selector.
+2. `--invariance-smoke` evaluates the deterministic seven-request nonheldout
+   subset of the immutable historical eight-request Phase4A label-free smoke
+   artifact and writes a prediction-invariance report.
+3. `--heldout-gate` requires a manually inspected Stage-A PASS report before
    opening the held-out relevance reference artifact.
+
+One historical Phase4A smoke request later became the preregistered CPAC
+held-out relevance challenge. It is deterministically excluded from Stage A
+before any calibrated Stage-A evaluation so that the Stage-B challenge ranking
+remains unrevealed. This result-blind protocol correction was made before any
+real Step 2.6R-3 evaluation.
 
 Neither stage may access Formal Validation or Formal Test. Stage B is only
 repair-verification on six pre-existing held-out relevance challenge cases; it
@@ -20,31 +32,36 @@ is not an untouched final test or a population-level generalization benchmark.
 
 ## Required authoritative input schemas
 
-The Phase4A replay artifact is supplied with an independent SHA-256. The
-preferred input is the authoritative native JSONL containing exactly eight
-records with `{case_id, dataset, claim, candidate_units}`. The evaluator also
-accepts the following explicit JSON wrapper for controlled contract fixtures:
+The immutable historical source is:
+
+`MDU/outputs/clip12_phase4a_frozen_g1_end_to_end_mdu_inference_handoff/01_smoke_requests/clip12p4a_smoke_requests.jsonl`
+
+Its required SHA-256 is
+`356ee750c7b95de37e5d14b481e2f5f8fb5ae1e3805ee922d016fcb0a3ab2178`.
+It contains exactly eight label-free rows with
+`{case_id, dataset, claim, candidate_units, source_case_id}`. Normalization
+projects the seven retained rows to exactly
+`{case_id, dataset, claim, candidate_units}` without changing any string,
+candidate ID, candidate order, unit type, or modality. It writes:
+
+- `phase4a_invariance_requests.jsonl`
+- `phase4a_invariance_requests.sha256`
+- `phase4a_invariance_request_manifest.json`
+- `phase4a_invariance_request_manifest.sha256`
+
+The Stage-A loader requires independent SHA-256 values for both the normalized
+JSONL and its manifest. The manifest must prove the authoritative historical
+SHA, source count 8, exactly one CPAC exclusion, retained count 7, and zero
+scientific-content changes. An arbitrary seven-request artifact is rejected.
+
+The normalized JSONL schema is:
 
 ```json
-{
-  "schema_version": 1,
-  "artifact_type": "phase4a_label_free_replay_requests",
-  "requests": [
-    {
-      "request_id": "...",
-      "case_id": "...",
-      "dataset": "...",
-      "claim": "...",
-      "candidate_units": [
-        {"unit_id": "...", "unit_type": "text", "modality": "text", "text": "..."}
-      ]
-    }
-  ]
-}
+{"case_id":"...","dataset":"...","claim":"...","candidate_units":[{"unit_id":"...","unit_type":"text","modality":"text","text":"..."}]}
 ```
 
-It must contain exactly eight authoritative requests and no labels or stored
-model outputs.
+It must contain exactly seven manifest-approved requests and no labels or
+stored model outputs.
 
 The held-out reference JSON is also supplied with an independent SHA-256. Its
 `artifact_type` is
@@ -61,8 +78,8 @@ immutable source audit artifact. It must cover exactly:
 - `TRUE-3MFact:10865013`
 
 The evaluator does not generate this artifact or recreate annotations. The
-exact existing DICC source paths and hashes must be discovered and reviewed
-before either real stage is run.
+exact existing Stage-B source paths and hashes must still be discovered and
+reviewed before the real held-out stage is run.
 
 Useful read-only discovery commands:
 
@@ -75,5 +92,4 @@ find /scr/user/kevin2002/TensorCat/uni-rumor/MDU/Defense_Engineering/outputs \
   -o -iname '*reproduction*.json' \) -print
 ```
 
-Full training remains outside this package and is never triggered by either
-mode.
+Full training remains outside this package and is never triggered by any mode.

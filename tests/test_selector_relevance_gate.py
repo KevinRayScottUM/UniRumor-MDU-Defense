@@ -29,6 +29,16 @@ from scripts.selector_relevance_gate.metrics import (
     ranked_unit_ids,
     reference_metrics,
 )
+from scripts.selector_relevance_gate.phase4a_normalizer import (
+    AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
+    CPAC_CANONICAL_CASE_ID,
+    EXPECTED_HISTORICAL_CASE_IDS,
+    EXPECTED_STAGE_A_REQUEST_COUNT,
+    Phase4ANormalizationError,
+    canonical_underlying_case_id,
+    prepare_invariance_requests,
+    request_content_sha256,
+)
 from scripts.selector_relevance_gate.runtime import (
     EXPECTED_SELECTOR_SHA256,
     RuntimeIntegrationError,
@@ -56,6 +66,17 @@ def _write_json(path: Path, payload: object) -> str:
     return sha256_file(path)
 
 
+def _write_jsonl(path: Path, rows) -> str:
+    path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+    return sha256_file(path)
+
+
 def _unit(prefix: str, index: int) -> EvaluationUnit:
     return EvaluationUnit(
         unit_id=f"{prefix}-u{index}",
@@ -73,6 +94,55 @@ def _request(prefix: str, *, case_id: str = "Engineering:case") -> EvaluationReq
         claim=f"Original challenge claim for {prefix}",
         candidate_units=tuple(_unit(prefix, index) for index in range(6)),
     )
+
+
+def _historical_phase4a_rows():
+    rows = []
+    for index, canonical in enumerate(EXPECTED_HISTORICAL_CASE_IDS):
+        dataset, numeric_id = canonical.rsplit(":", 1)
+        rows.append(
+            {
+                "case_id": f"smoke::{dataset}:train:{numeric_id}",
+                "dataset": dataset,
+                "claim": f"Historical claim {index}",
+                "candidate_units": [
+                    dict(_unit(f"historical-{index}", unit_index).to_dict())
+                    for unit_index in range(3)
+                ],
+                "source_case_id": f"{dataset}:train:{numeric_id}",
+            }
+        )
+    return rows
+
+
+def _prepare_normalized_fixture(root: Path):
+    from scripts.selector_relevance_gate import phase4a_normalizer
+
+    source = root / "historical_requests.jsonl"
+    source_sha = _write_jsonl(source, _historical_phase4a_rows())
+    output = root / "normalized"
+    with mock.patch.object(
+        phase4a_normalizer,
+        "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+        source_sha,
+    ):
+        manifest = prepare_invariance_requests(
+            source_artifact=source,
+            source_sha256=source_sha,
+            output_dir=output,
+        )
+    replay = output / "phase4a_invariance_requests.jsonl"
+    manifest_path = output / "phase4a_invariance_request_manifest.json"
+    return {
+        "source": source,
+        "source_sha": source_sha,
+        "output": output,
+        "replay": replay,
+        "replay_sha": sha256_file(replay),
+        "manifest": manifest_path,
+        "manifest_sha": sha256_file(manifest_path),
+        "manifest_payload": manifest,
+    }
 
 
 def _snapshot(
@@ -197,26 +267,184 @@ class RankingMetricTests(unittest.TestCase):
         self.assertEqual(2, len(metrics["by_underlying_case"]))
 
 
-class InputLoaderTests(unittest.TestCase):
-    def _phase4a_payload(self):
-        return {
-            "schema_version": 1,
-            "artifact_type": "phase4a_label_free_replay_requests",
-            "requests": [
-                {
-                    "request_id": f"replay-{index}",
-                    "case_id": f"Replay:{index}",
-                    "dataset": "EngineeringReplay",
-                    "claim": f"Existing replay claim {index}",
-                    "candidate_units": [
-                        dict(_unit(f"replay-{index}", unit_index).to_dict())
-                        for unit_index in range(2)
-                    ],
-                }
-                for index in range(8)
-            ],
-        }
+class Phase4ANormalizerTests(unittest.TestCase):
+    def _run(self, root: Path, rows, *, output_name="normalized"):
+        from scripts.selector_relevance_gate import phase4a_normalizer
 
+        source = root / f"{output_name}-source.jsonl"
+        source_sha = _write_jsonl(source, rows)
+        output = root / output_name
+        with mock.patch.object(
+            phase4a_normalizer,
+            "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+            source_sha,
+        ):
+            manifest = prepare_invariance_requests(
+                source_artifact=source,
+                source_sha256=source_sha,
+                output_dir=output,
+            )
+        return source, source_sha, output, manifest
+
+    def test_authoritative_historical_sha_is_exact(self):
+        self.assertEqual(
+            "356ee750c7b95de37e5d14b481e2f5f8fb5ae1e3805ee922d016fcb0a3ab2178",
+            AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
+        )
+
+    def test_correct_source_projects_exactly_seven_without_content_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows = _historical_phase4a_rows()
+            source, source_sha, output, manifest = self._run(root, rows)
+            self.assertEqual(source_sha, sha256_file(source))
+            self.assertEqual(8, manifest["source_request_count"])
+            self.assertEqual(1, manifest["overlap_count"])
+            self.assertEqual(1, manifest["excluded_request_count"])
+            self.assertEqual(7, manifest["retained_request_count"])
+            self.assertEqual(
+                CPAC_CANONICAL_CASE_ID,
+                manifest["excluded_requests"][0]["canonical_underlying_case_id"],
+            )
+            normalized_path = output / "phase4a_invariance_requests.jsonl"
+            normalized_rows = [
+                json.loads(line)
+                for line in normalized_path.read_text(encoding="utf-8").splitlines()
+            ]
+            expected_rows = [
+                {key: value for key, value in row.items() if key != "source_case_id"}
+                for row in rows[1:]
+            ]
+            self.assertEqual(expected_rows, normalized_rows)
+            self.assertEqual(EXPECTED_STAGE_A_REQUEST_COUNT, len(normalized_rows))
+            self.assertTrue(all("source_case_id" not in row for row in normalized_rows))
+            self.assertTrue(
+                all(value == 0 for key, value in manifest.items() if key.endswith("_changed_count"))
+            )
+            self.assertEqual(
+                {
+                    "phase4a_invariance_requests.jsonl",
+                    "phase4a_invariance_requests.sha256",
+                    "phase4a_invariance_request_manifest.json",
+                    "phase4a_invariance_request_manifest.sha256",
+                },
+                {path.name for path in output.iterdir()},
+            )
+
+    def test_wrong_historical_sha_rejected_before_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.jsonl"
+            _write_jsonl(source, _historical_phase4a_rows())
+            with self.assertRaisesRegex(Phase4ANormalizationError, "authoritative"):
+                prepare_invariance_requests(
+                    source_artifact=source,
+                    source_sha256="0" * 64,
+                    output_dir=Path(temporary) / "out",
+                )
+
+    def test_source_count_not_eight_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(Phase4ANormalizationError, "exactly 8"):
+                self._run(root, _historical_phase4a_rows()[:-1])
+
+    def test_missing_cpac_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows = _historical_phase4a_rows()
+            rows[0] = dict(rows[1])
+            with self.assertRaisesRegex(Phase4ANormalizationError, "missing the CPAC"):
+                self._run(root, rows)
+
+    def test_multiple_overlap_and_true3mfact_overlap_are_rejected(self):
+        for suffix in ("multiple", "true3mfact"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                rows = _historical_phase4a_rows()
+                rows[-1] = {
+                    **rows[-1],
+                    "case_id": "smoke::TRUE-3MFact:train:10145403",
+                    "dataset": "TRUE-3MFact",
+                    "source_case_id": "TRUE-3MFact:train:10145403",
+                }
+                with self.assertRaisesRegex(Phase4ANormalizationError, "TRUE-3MFact"):
+                    self._run(root, rows, output_name=suffix)
+
+    def test_retained_count_not_seven_rejected(self):
+        from scripts.selector_relevance_gate import phase4a_normalizer
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.jsonl"
+            source_sha = _write_jsonl(source, _historical_phase4a_rows())
+            with mock.patch.object(
+                phase4a_normalizer,
+                "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+                source_sha,
+            ), mock.patch.object(
+                phase4a_normalizer, "EXPECTED_STAGE_A_REQUEST_COUNT", 6
+            ):
+                with self.assertRaisesRegex(Phase4ANormalizationError, "exactly 7"):
+                    prepare_invariance_requests(
+                        source_artifact=source,
+                        source_sha256=source_sha,
+                        output_dir=root / "out",
+                    )
+
+    def test_forbidden_label_and_prediction_fields_rejected_recursively(self):
+        for field in ("label", "prediction"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                rows = _historical_phase4a_rows()
+                rows[0]["candidate_units"][0][field] = 0
+                with self.assertRaisesRegex(Phase4ANormalizationError, "forbidden"):
+                    self._run(root, rows)
+
+    def test_source_case_id_is_narrow_provenance_only(self):
+        self.assertEqual(
+            CPAC_CANONICAL_CASE_ID,
+            canonical_underlying_case_id(
+                "smoke::GroundLie360:train:13025004",
+                "GroundLie360:train:13025004",
+            ),
+        )
+        with self.assertRaisesRegex(Phase4ANormalizationError, "unsupported"):
+            canonical_underlying_case_id(
+                "smoke::GroundLie360:dev:13025004",
+                "GroundLie360:dev:13025004",
+            )
+
+    def test_formal_validation_and_test_inputs_fail_closed(self):
+        from scripts.selector_relevance_gate import phase4a_normalizer
+
+        for name in ("Validation", "Test"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                restricted = root / name
+                restricted.mkdir()
+                source = restricted / "source.jsonl"
+                source_sha = _write_jsonl(source, _historical_phase4a_rows())
+                with mock.patch.object(
+                    phase4a_normalizer,
+                    "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+                    source_sha,
+                ):
+                    with self.assertRaisesRegex(Phase4ANormalizationError, "Formal"):
+                        prepare_invariance_requests(
+                            source_artifact=source,
+                            source_sha256=source_sha,
+                            output_dir=root / "out",
+                        )
+
+    def test_formal_dataset_field_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = _historical_phase4a_rows()
+            rows[0]["dataset"] = "Test"
+            with self.assertRaisesRegex(Phase4ANormalizationError, "Validation/Test"):
+                self._run(Path(temporary), rows)
+
+
+class InputLoaderTests(unittest.TestCase):
     def _heldout_payload(self, source: Path):
         source_sha = sha256_file(source)
         references = []
@@ -246,73 +474,98 @@ class InputLoaderTests(unittest.TestCase):
             "references": references,
         }
 
-    def test_phase4a_loader_requires_exact_hash_and_eight_requests(self):
+    def _load_normalized(self, fixture, **overrides):
+        from scripts.selector_relevance_gate import heldout_loader
+
+        arguments = {
+            "expected_sha256": fixture["replay_sha"],
+            "manifest_path": fixture["manifest"],
+            "manifest_expected_sha256": fixture["manifest_sha"],
+            **overrides,
+        }
+        with mock.patch.object(
+            heldout_loader,
+            "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+            fixture["source_sha"],
+        ):
+            return load_phase4a_replay_requests(fixture["replay"], **arguments)
+
+    def test_normalized_phase4a_loader_requires_exact_hash_manifest_and_seven_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "replay.json"
-            digest = _write_json(path, self._phase4a_payload())
-            actual, requests = load_phase4a_replay_requests(
-                path, expected_sha256=digest
+            fixture = _prepare_normalized_fixture(Path(temporary))
+            actual, manifest_sha, source, requests = self._load_normalized(fixture)
+            self.assertEqual(fixture["replay_sha"], actual)
+            self.assertEqual(fixture["manifest_sha"], manifest_sha)
+            self.assertEqual(fixture["source"].resolve(), source)
+            self.assertEqual(EXPECTED_STAGE_A_REQUEST_COUNT, len(requests))
+            self.assertEqual(
+                tuple(row["case_id"] for row in _historical_phase4a_rows()[1:]),
+                tuple(request.request_id for request in requests),
             )
-            self.assertEqual(digest, actual)
-            self.assertEqual(8, len(requests))
             with self.assertRaisesRegex(ReferenceInputError, "SHA-256 mismatch"):
-                load_phase4a_replay_requests(path, expected_sha256="0" * 64)
+                self._load_normalized(fixture, expected_sha256="0" * 64)
 
-    def test_native_phase4a_jsonl_contract_is_accepted_without_reencoding(self):
+    def test_stage_a_rejects_arbitrary_seven_rows_without_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "requests.jsonl"
-            rows = []
-            for row in self._phase4a_payload()["requests"]:
-                rows.append({key: value for key, value in row.items() if key != "request_id"})
-            path.write_text(
-                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
-                encoding="utf-8",
+            fixture = _prepare_normalized_fixture(Path(temporary))
+            with self.assertRaisesRegex(ReferenceInputError, "manifest.*missing"):
+                self._load_normalized(
+                    fixture,
+                    manifest_path=Path(temporary) / "missing.json",
+                    manifest_expected_sha256="0" * 64,
+                )
+
+    def test_stage_a_rejects_forged_rows_and_matching_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = _prepare_normalized_fixture(Path(temporary))
+            rows = [
+                json.loads(line)
+                for line in fixture["replay"].read_text(encoding="utf-8").splitlines()
+            ]
+            rows[0]["claim"] = "Arbitrary replacement claim"
+            fixture["replay_sha"] = _write_jsonl(fixture["replay"], rows)
+            payload = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+            payload["normalized_artifact_sha256"] = fixture["replay_sha"]
+            payload["retained_requests"][0]["request_content_sha256"] = (
+                request_content_sha256(rows[0])
             )
-            digest = sha256_file(path)
-            _, requests = load_phase4a_replay_requests(
-                path, expected_sha256=digest
-            )
-            self.assertEqual(tuple(row["case_id"] for row in rows), tuple(
-                request.request_id for request in requests
-            ))
+            fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
+            with self.assertRaisesRegex(ReferenceInputError, "historical source projection"):
+                self._load_normalized(fixture)
 
-    def test_phase4a_labels_or_model_outputs_fail_closed(self):
+    def test_stage_a_rejects_manifest_source_sha_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "replay.json"
-            payload = self._phase4a_payload()
-            payload["requests"][0]["label"] = 0
-            digest = _write_json(path, payload)
-            with self.assertRaisesRegex(ReferenceInputError, "forbidden labels"):
-                load_phase4a_replay_requests(path, expected_sha256=digest)
+            fixture = _prepare_normalized_fixture(Path(temporary))
+            payload = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+            payload["source_artifact_sha256"] = "0" * 64
+            fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
+            with self.assertRaisesRegex(ReferenceInputError, "source_artifact_sha256"):
+                self._load_normalized(fixture)
 
-    def test_stage_a_heldout_case_access_fails_closed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "replay.json"
-            payload = self._phase4a_payload()
-            payload["requests"][0]["case_id"] = EXPECTED_HELDOUT_CASE_IDS[0]
-            digest = _write_json(path, payload)
-            with self.assertRaisesRegex(ReferenceInputError, "held-out"):
-                load_phase4a_replay_requests(path, expected_sha256=digest)
+    def test_phase4a_labels_and_predictions_fail_closed(self):
+        for field in ("label", "prediction"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                fixture = _prepare_normalized_fixture(Path(temporary))
+                rows = [
+                    json.loads(line)
+                    for line in fixture["replay"].read_text(encoding="utf-8").splitlines()
+                ]
+                rows[0][field] = 0
+                fixture["replay_sha"] = _write_jsonl(fixture["replay"], rows)
+                with self.assertRaisesRegex(ReferenceInputError, "forbidden labels"):
+                    self._load_normalized(fixture)
 
-    def test_formal_dataset_labels_fail_closed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            for dataset in ("Validation", "Test"):
-                payload = self._phase4a_payload()
-                payload["requests"][0]["dataset"] = dataset
-                path = Path(temporary) / f"{dataset}.json"
-                digest = _write_json(path, payload)
-                with self.assertRaisesRegex(ReferenceInputError, "dataset labels"):
-                    load_phase4a_replay_requests(path, expected_sha256=digest)
-
-    def test_formal_validation_and_test_paths_fail_before_read(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            for name in ("Validation", "Test"):
-                directory = Path(temporary) / name
-                directory.mkdir()
-                path = directory / "artifact.json"
-                digest = _write_json(path, self._phase4a_payload())
-                with self.assertRaisesRegex(ReferenceInputError, "Formal"):
-                    load_phase4a_replay_requests(path, expected_sha256=digest)
+    def test_stage_a_manifest_rejects_all_six_heldout_identities(self):
+        for protected in EXPECTED_HELDOUT_CASE_IDS:
+            with self.subTest(protected=protected), tempfile.TemporaryDirectory() as temporary:
+                fixture = _prepare_normalized_fixture(Path(temporary))
+                payload = json.loads(fixture["manifest"].read_text(encoding="utf-8"))
+                payload["retained_requests"][0][
+                    "canonical_underlying_case_id"
+                ] = protected
+                fixture["manifest_sha"] = _write_json(fixture["manifest"], payload)
+                with self.assertRaisesRegex(ReferenceInputError, "protected held-out"):
+                    self._load_normalized(fixture)
 
     def test_heldout_loader_preserves_original_claims_and_exact_identities(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -454,7 +707,10 @@ class InvarianceTests(unittest.TestCase):
     def test_stage_a_writes_exact_outputs_and_does_not_touch_heldout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            requests = tuple(_request(f"replay-{index}") for index in range(8))
+            requests = tuple(
+                _request(f"replay-{index}")
+                for index in range(EXPECTED_STAGE_A_REQUEST_COUNT)
+            )
             originals = {
                 item.request_id: _snapshot(
                     item.candidate_unit_ids, (6, 5, 4, 3, 2, 1)
@@ -471,6 +727,7 @@ class InvarianceTests(unittest.TestCase):
             report = run_invariance_smoke(
                 requests=requests,
                 phase4a_replay_sha256="d" * 64,
+                phase4a_replay_manifest_sha256="e" * 64,
                 training_artifacts=_training_artifacts(root),
                 runtime=runtime,
                 output_dir=root / "stage-a",
@@ -484,17 +741,38 @@ class InvarianceTests(unittest.TestCase):
                 (root / "stage-a/prediction_invariance_smoke_report.sha256").is_file()
             )
 
-    def test_stage_a_rejects_heldout_or_wrong_request_count(self):
+    def test_stage_a_rejects_wrong_request_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            request = _request("heldout", case_id=EXPECTED_HELDOUT_CASE_IDS[0])
             runtime = FakeRuntime({}, {})
             with self.assertRaises(EvaluationError):
                 run_invariance_smoke(
-                    requests=(request,),
+                    requests=(_request("only-one"),),
                     phase4a_replay_sha256="d" * 64,
+                    phase4a_replay_manifest_sha256="e" * 64,
                     training_artifacts=_training_artifacts(root),
                     runtime=runtime,
+                    output_dir=root / "out",
+                )
+
+    def test_stage_a_rejects_prefixed_historical_heldout_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            requests = [
+                _request(f"safe-{index}")
+                for index in range(EXPECTED_STAGE_A_REQUEST_COUNT)
+            ]
+            requests[0] = _request(
+                "protected",
+                case_id="smoke::GroundLie360:train:13025004",
+            )
+            with self.assertRaisesRegex(EvaluationError, "held-out"):
+                run_invariance_smoke(
+                    requests=tuple(requests),
+                    phase4a_replay_sha256="d" * 64,
+                    phase4a_replay_manifest_sha256="e" * 64,
+                    training_artifacts=_training_artifacts(root),
+                    runtime=FakeRuntime({}, {}),
                     output_dir=root / "out",
                 )
 
@@ -739,6 +1017,15 @@ class HeldoutGateTests(unittest.TestCase):
             "deployment_candidate_seed": 42,
             "deployment_candidate_selector_sha256": artifacts.selector_sha256,
             "base_frozen_g1_checkpoint_sha256": AUTHORITATIVE_CHECKPOINT_SHA256,
+            "historical_phase4a_source_sha256": (
+                AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256
+            ),
+            "historical_phase4a_source_request_count": 8,
+            "historical_phase4a_excluded_heldout_count": 1,
+            "phase4a_replay_artifact_sha256": "d" * 64,
+            "phase4a_replay_manifest_sha256": "e" * 64,
+            "exact_phase4a_replay_request_count": 7,
+            "deterministic_nonheldout_historical_subset_used": True,
             "prediction_invariance_gate": True,
             "selection_scores_changed": True,
             "heldout_relevance_cases_accessed": False,
@@ -1028,10 +1315,11 @@ class StaticBoundaryTests(unittest.TestCase):
         self.assertNotIn("webapp", source)
         self.assertNotIn("frontend", source)
 
-    def test_cli_has_two_explicit_nonautomatic_modes(self):
+    def test_cli_has_normalization_and_two_explicit_nonautomatic_modes(self):
         from scripts.selector_relevance_gate.run_gate import build_parser
 
         help_text = build_parser().format_help()
+        self.assertIn("--prepare-invariance-requests", help_text)
         self.assertIn("--invariance-smoke", help_text)
         self.assertIn("--heldout-gate", help_text)
         self.assertIn("--approved-invariance-smoke-report", help_text)
@@ -1070,6 +1358,80 @@ class StaticBoundaryTests(unittest.TestCase):
             )
         self.assertEqual(2, code)
         heldout_loader.assert_not_called()
+
+    def test_normalization_cli_never_touches_training_or_model_runtime(self):
+        from scripts.selector_relevance_gate import phase4a_normalizer, run_gate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "historical.jsonl"
+            source_sha = _write_jsonl(source, _historical_phase4a_rows())
+            with mock.patch.object(
+                phase4a_normalizer,
+                "AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256",
+                source_sha,
+            ), mock.patch.object(
+                run_gate, "validate_training_artifacts"
+            ) as training_loader, mock.patch.object(
+                run_gate, "DICCEvaluationRuntime"
+            ) as runtime_type:
+                code = run_gate.main(
+                    [
+                        "--prepare-invariance-requests",
+                        "--historical-phase4a-artifact",
+                        str(source),
+                        "--historical-phase4a-sha256",
+                        source_sha,
+                        "--output-dir",
+                        str(root / "normalized"),
+                    ]
+                )
+            self.assertEqual(0, code)
+            training_loader.assert_not_called()
+            runtime_type.assert_not_called()
+
+    def test_stage_a_cli_requires_normalization_manifest(self):
+        from scripts.selector_relevance_gate import run_gate
+
+        with mock.patch.object(
+            run_gate, "validate_training_artifacts", return_value=SimpleNamespace()
+        ), mock.patch.object(run_gate, "load_phase4a_replay_requests") as loader:
+            code = run_gate.main(
+                [
+                    "--invariance-smoke",
+                    "--project-root",
+                    "/project",
+                    "--phase4a-config",
+                    "/config.json",
+                    "--neutral-dir",
+                    "/neutral",
+                    "--training-dir",
+                    "/training",
+                    "--output-dir",
+                    "/output",
+                    "--phase4a-replay-artifact",
+                    "/normalized.jsonl",
+                    "--phase4a-replay-sha256",
+                    "0" * 64,
+                ]
+            )
+        self.assertEqual(2, code)
+        loader.assert_not_called()
+
+    def test_normalizer_has_no_torch_model_checkpoint_optimizer_or_sampling_code(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "scripts/selector_relevance_gate/phase4a_normalizer.py"
+        ).read_text(encoding="utf-8")
+        for forbidden in (
+            "import torch",
+            "FrozenG1Engine",
+            "torch.load",
+            "optimizer.step",
+            ".backward(",
+            "random.",
+        ):
+            self.assertNotIn(forbidden, source)
 
 
 if __name__ == "__main__":

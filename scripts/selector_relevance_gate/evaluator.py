@@ -22,6 +22,12 @@ from .heldout_loader import (
     calibration_overlap_count,
 )
 from .metrics import HeldoutRanking, grouped_metrics, ranked_unit_ids, reference_metrics
+from .phase4a_normalizer import (
+    AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256,
+    EXPECTED_HISTORICAL_PHASE4A_COUNT,
+    EXPECTED_STAGE_A_EXCLUDED_HELDOUT_COUNT,
+    EXPECTED_STAGE_A_REQUEST_COUNT,
+)
 from .runtime import DEPLOYMENT_CANDIDATE_SEED, TrainingArtifacts
 from .schemas import EvaluationRequest, PredictionSnapshot
 
@@ -278,25 +284,43 @@ def _evaluate_pairs(
     return tuple(comparisons), originals, calibrated
 
 
+def _is_protected_stage_a_case(request: EvaluationRequest) -> bool:
+    for protected in EXPECTED_HELDOUT_CASE_IDS:
+        dataset, numeric_id = protected.rsplit(":", 1)
+        if request.case_id in {
+            protected,
+            f"{dataset}:train:{numeric_id}",
+            f"smoke::{protected}",
+            f"smoke::{dataset}:train:{numeric_id}",
+        }:
+            return True
+    return False
+
+
 def run_invariance_smoke(
     *,
     requests: Sequence[EvaluationRequest],
     phase4a_replay_sha256: str,
+    phase4a_replay_manifest_sha256: str,
     training_artifacts: TrainingArtifacts,
     runtime: EvaluationRuntime,
     output_dir: Path,
     immutable_input_hashes: Optional[Mapping[Path, str]] = None,
 ) -> Mapping[str, Any]:
-    if len(requests) != 8:
-        raise EvaluationError("Stage A requires exactly eight Phase4A replay requests")
-    if any(item.case_id in EXPECTED_HELDOUT_CASE_IDS for item in requests):
+    if len(requests) != EXPECTED_STAGE_A_REQUEST_COUNT:
+        raise EvaluationError(
+            "Stage A requires exactly seven normalized Phase4A replay requests"
+        )
+    if any(_is_protected_stage_a_case(item) for item in requests):
         raise EvaluationError("Stage A cannot access held-out relevance cases")
     boundary = _runtime_boundary(runtime)
     comparisons, _, _ = _evaluate_pairs(requests, runtime)
     _assert_files_unchanged(
         immutable_input_hashes or training_artifacts.immutable_file_hashes
     )
-    invariance = summarize_invariance(comparisons, expected_count=8)
+    invariance = summarize_invariance(
+        comparisons, expected_count=EXPECTED_STAGE_A_REQUEST_COUNT
+    )
     gate = bool(
         invariance["prediction_invariance_gate"]
         and invariance["selection_scores_changed"]
@@ -313,9 +337,19 @@ def run_invariance_smoke(
         "deployment_candidate_seed": DEPLOYMENT_CANDIDATE_SEED,
         "deployment_candidate_selector_sha256": training_artifacts.selector_sha256,
         "base_frozen_g1_checkpoint_sha256": AUTHORITATIVE_CHECKPOINT_SHA256,
+        "historical_phase4a_source_sha256": (
+            AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256
+        ),
+        "historical_phase4a_source_request_count": (
+            EXPECTED_HISTORICAL_PHASE4A_COUNT
+        ),
+        "historical_phase4a_excluded_heldout_count": (
+            EXPECTED_STAGE_A_EXCLUDED_HELDOUT_COUNT
+        ),
         "phase4a_replay_artifact_sha256": phase4a_replay_sha256,
+        "phase4a_replay_manifest_sha256": phase4a_replay_manifest_sha256,
         "exact_phase4a_replay_request_count": len(requests),
-        "exact_phase4a_replay_request_set_used": True,
+        "deterministic_nonheldout_historical_subset_used": True,
         **boundary,
         **invariance,
         "heldout_relevance_cases_accessed": False,
@@ -373,6 +407,17 @@ def verify_approved_invariance_report(
         "deployment_candidate_seed": DEPLOYMENT_CANDIDATE_SEED,
         "deployment_candidate_selector_sha256": training_artifacts.selector_sha256,
         "base_frozen_g1_checkpoint_sha256": AUTHORITATIVE_CHECKPOINT_SHA256,
+        "historical_phase4a_source_sha256": (
+            AUTHORITATIVE_HISTORICAL_PHASE4A_SHA256
+        ),
+        "historical_phase4a_source_request_count": (
+            EXPECTED_HISTORICAL_PHASE4A_COUNT
+        ),
+        "historical_phase4a_excluded_heldout_count": (
+            EXPECTED_STAGE_A_EXCLUDED_HELDOUT_COUNT
+        ),
+        "exact_phase4a_replay_request_count": EXPECTED_STAGE_A_REQUEST_COUNT,
+        "deterministic_nonheldout_historical_subset_used": True,
         "prediction_invariance_gate": True,
         "selection_scores_changed": True,
         "heldout_relevance_cases_accessed": False,
@@ -386,6 +431,17 @@ def verify_approved_invariance_report(
         raise EvaluationError("approved invariance-smoke report must be an object")
     for field, value in expected.items():
         if report.get(field) != value:
+            raise EvaluationError(f"approved invariance-smoke mismatch: {field}")
+    for field in (
+        "phase4a_replay_artifact_sha256",
+        "phase4a_replay_manifest_sha256",
+    ):
+        value = report.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
             raise EvaluationError(f"approved invariance-smoke mismatch: {field}")
     return actual_sha, report
 
