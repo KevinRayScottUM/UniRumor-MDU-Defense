@@ -7,8 +7,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from .schemas import CohortError, FORBIDDEN_ARTIFACTS
@@ -120,10 +122,15 @@ def assert_new_output(path):
     return output
 
 
-def rename_exclusive(source, destination):
-    """Use OS no-replace rename, including the concurrent empty-directory case."""
+UNSUPPORTED_NATIVE_ERRNOS = frozenset({
+    errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP,
+})
+
+
+def _native_rename_exclusive(source, destination):
+    """Prefer the native primitive; symbol availability is not FS support."""
     libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
         function = libc.renamex_np
         args = (os.fsencode(source), os.fsencode(destination), 0x00000004)
         function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
@@ -133,13 +140,89 @@ def rename_exclusive(source, destination):
         function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                              ctypes.c_char_p, ctypes.c_uint]
     else:
-        raise CohortError("atomic no-replace rename unavailable; no unsafe fallback")
+        raise OSError(errno.ENOSYS, "native no-replace rename unavailable")
     function.restype = ctypes.c_int
     if function(*args):
         error = ctypes.get_errno()
         if error in {errno.EEXIST, errno.ENOTEMPTY}:
             raise CohortError("output already exists; exclusive publication refused")
         raise OSError(error, "exclusive directory rename failed")
+
+
+@contextmanager
+def _publication_lock(destination):
+    """Never wait for, steal or clean another publisher's (possibly stale) lock."""
+    lock_path = destination.with_name("." + destination.name + ".publish.lock")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise CohortError("publication lock already exists; operator inspection required") from exc
+    owner = None
+    try:
+        owner = os.fstat(descriptor)
+        yield
+    finally:
+        try:
+            # Keep the descriptor open until after this comparison/unlink so
+            # its inode cannot be recycled. A replaced/foreign lock is left
+            # untouched. Cooperating publishers never replace existing locks.
+            if owner is not None:
+                try:
+                    current = lock_path.lstat()
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (current.st_dev, current.st_ino) == (owner.st_dev, owner.st_ino):
+                    lock_path.unlink()
+        finally:
+            os.close(descriptor)
+
+
+def _portable_rename_exclusive(source, destination, parent_descriptor):
+    """Caller MUST hold _publication_lock for this exact destination."""
+    # Recheck after the native attempt, while every official publisher is
+    # excluded. In particular, an existing empty directory must be preserved.
+    if destination.exists() or destination.is_symlink():
+        raise CohortError("output already exists; exclusive publication refused")
+    source_stat = source.lstat()
+    if not stat.S_ISDIR(source_stat.st_mode):
+        raise CohortError("publication staging source must be a real directory")
+    if source_stat.st_dev != os.fstat(parent_descriptor).st_dev:
+        raise OSError(errno.EXDEV, "publication requires a same-filesystem directory rename")
+    os.rename(source, destination)
+
+
+def _fsync_directory(descriptor):
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        if exc.errno not in UNSUPPORTED_NATIVE_ERRNOS:
+            raise
+
+
+def rename_exclusive(source, destination):
+    """Atomic publication for cooperating publishers, with native fast path.
+
+    Both paths take the same lock: a native publisher must not bypass a
+    fallback publisher's existence check, or a stale/foreign publication lock.
+    Only a capability error permits normal rename under the already-held lock.
+    """
+    source, destination = Path(source), Path(destination)
+    with _publication_lock(destination):
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        parent_descriptor = os.open(destination.parent, flags)
+        try:
+            try:
+                _native_rename_exclusive(source, destination)
+            except OSError as exc:
+                if exc.errno not in UNSUPPORTED_NATIVE_ERRNOS:
+                    raise
+                _portable_rename_exclusive(source, destination, parent_descriptor)
+            # A real sync error is propagated, preserving the complete output
+            # already renamed into place; never attempt destructive rollback.
+            _fsync_directory(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
 
 
 def freeze(output, artifacts, ledger):

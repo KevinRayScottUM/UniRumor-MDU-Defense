@@ -3,8 +3,12 @@
 import builtins
 import copy
 import csv
+import errno
 import io
 import json
+import multiprocessing
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -12,7 +16,8 @@ from collections import Counter
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from scripts.selector_relevance_calibration.dataset_builder import ExposureResult, verify_train_lock
 from scripts.selector_relevance_next_repair_protocol import protocol as frozen
@@ -60,6 +65,26 @@ class FixtureAdapter:
         candidates = request["candidate_units"]
         return ExposureResult(tuple(copy.deepcopy(candidates[:24])), len(candidates),
                               max(0, len(candidates) - 24), 0)
+
+
+def _publication_race_worker(source, destination, start, contender_failed, results):
+    """Independent processes exercise the OS lock on a synthetic filesystem."""
+    def unsupported(*args):
+        # Hold the winner's lock until the other process has actually tried
+        # and failed. This exercises contention without timing-based sleeps.
+        if not contender_failed.wait(10):
+            raise RuntimeError("other publisher did not fail closed on the lock")
+        raise OSError(errno.EINVAL, "synthetic unsupported filesystem")
+    try:
+        start.wait(timeout=10)
+        with patch.object(ar, "_native_rename_exclusive", side_effect=unsupported):
+            ar.rename_exclusive(Path(source), Path(destination))
+        results.put((Path(source).name, "PASS"))
+    except sc.CohortError:
+        contender_failed.set()
+        results.put((Path(source).name, "REJECTED"))
+    except Exception as exc:
+        results.put((Path(source).name, "ERROR:" + repr(exc)))
 
 
 class Fixture:
@@ -889,6 +914,311 @@ class ConstructionContracts(unittest.TestCase):
                 self.assertEqual(1, main(["--build-cohort", *args, "--output-dir", str(f.build_dir),
                                           "--approved-preflight-report", str(f.preflight / "cohort_source_preflight_report.json")]))
         self.assertEqual(cb.BLOCKED_STATUS, ar.read_json(f.build_dir / "development_cohort_build_report.json")["status"])
+
+
+class PublicationCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        SYNTHETIC_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="publication-", dir=SYNTHETIC_ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "staging"
+        self.source.mkdir()
+        self.payload = {"report.json": b'{"synthetic":true}\n', "units.jsonl": b'{"unit":"synthetic"}\n'}
+        for name, data in self.payload.items():
+            (self.source / name).write_bytes(data)
+        self.destination = self.root / "published"
+        self.lock = self.root / ".published.publish.lock"
+
+    def fallback(self):
+        return patch.object(ar, "_native_rename_exclusive",
+                            side_effect=OSError(errno.EINVAL, "synthetic unsupported filesystem"))
+
+    def assert_source_preserved(self):
+        self.assertEqual(self.payload, {p.name: p.read_bytes() for p in self.source.iterdir()})
+
+    def assert_complete(self):
+        self.assertEqual(self.payload, {p.name: p.read_bytes() for p in self.destination.iterdir()})
+        self.assertFalse(self.source.exists())
+        self.assertFalse(self.lock.exists())
+
+    def test_native_linux_success_never_falls_back(self):
+        def native(*args):
+            self.assertTrue(self.lock.is_file())
+            self.assertEqual((-100, os.fsencode(self.source), -100, os.fsencode(self.destination), 1), args)
+            os.rename(self.source, self.destination)
+            return 0
+        function = Mock(side_effect=native)
+        with patch.object(ar.sys, "platform", "linux"), patch.object(ar.ctypes, "CDLL", return_value=SimpleNamespace(renameat2=function)), patch.object(ar, "_portable_rename_exclusive", side_effect=AssertionError("native success must not fallback")):
+            ar.rename_exclusive(self.source, self.destination)
+        function.assert_called_once()
+        self.assert_complete()
+
+    def test_native_linux_einval_return_reaches_portable_fallback(self):
+        function = Mock(return_value=-1)
+        with patch.object(ar.sys, "platform", "linux"), patch.object(ar.ctypes, "CDLL", return_value=SimpleNamespace(renameat2=function)), patch.object(ar.ctypes, "get_errno", return_value=errno.EINVAL):
+            ar.rename_exclusive(self.source, self.destination)
+        function.assert_called_once()
+        self.assert_complete()
+
+    def test_enosys_falls_back(self):
+        with patch.object(ar, "_native_rename_exclusive", side_effect=OSError(errno.ENOSYS, "unsupported")):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assert_complete()
+
+    def test_eopnotsupp_and_enotsup_each_distinct_value_fall_back(self):
+        for error in sorted({errno.EOPNOTSUPP, errno.ENOTSUP}):
+            source = self.root / f"source-{error}"
+            source.mkdir()
+            (source / "complete").write_text(str(error))
+            destination = self.root / f"destination-{error}"
+            with self.subTest(errno=error), patch.object(ar, "_native_rename_exclusive", side_effect=OSError(error, "unsupported")):
+                ar.rename_exclusive(source, destination)
+            self.assertEqual(str(error), (destination / "complete").read_text())
+            self.assertFalse(source.exists())
+            self.assertFalse(destination.with_name("." + destination.name + ".publish.lock").exists())
+
+    def test_missing_native_symbol_falls_back(self):
+        with patch.object(ar.sys, "platform", "linux"), patch.object(ar.ctypes, "CDLL", return_value=SimpleNamespace()):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assert_complete()
+
+    def test_exact_capability_errno_set(self):
+        self.assertEqual({errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}, ar.UNSUPPORTED_NATIVE_ERRNOS)
+
+    def assert_no_fallback(self, error):
+        with patch.object(ar, "_native_rename_exclusive", side_effect=OSError(error, "real failure")), patch.object(ar, "_portable_rename_exclusive", side_effect=AssertionError("unrelated error must not fallback")), self.assertRaises(OSError) as caught:
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(error, caught.exception.errno)
+        self.assert_source_preserved()
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self.lock.exists())
+
+    def test_eacces_does_not_fallback(self):
+        self.assert_no_fallback(errno.EACCES)
+
+    def test_eperm_does_not_fallback(self):
+        self.assert_no_fallback(errno.EPERM)
+
+    def test_eio_does_not_fallback(self):
+        self.assert_no_fallback(errno.EIO)
+
+    def test_erofs_enospc_exdev_do_not_fallback(self):
+        for error in (errno.EROFS, errno.ENOSPC, errno.EXDEV):
+            with self.subTest(errno=error):
+                self.assert_no_fallback(error)
+
+    def test_native_existing_output_errors_do_not_fallback(self):
+        for error in (errno.EEXIST, errno.ENOTEMPTY):
+            with self.subTest(errno=error), patch.object(ar.sys, "platform", "linux"), patch.object(ar.ctypes, "CDLL", return_value=SimpleNamespace(renameat2=Mock(return_value=-1))), patch.object(ar.ctypes, "get_errno", return_value=error), patch.object(ar, "_portable_rename_exclusive", side_effect=AssertionError("must not fallback")), self.assertRaises(sc.CohortError):
+                ar.rename_exclusive(self.source, self.destination)
+            self.assertFalse(self.lock.exists())
+            self.assert_source_preserved()
+
+    def test_fallback_complete_directory_and_no_staging_left(self):
+        with self.fallback():
+            ar.rename_exclusive(self.source, self.destination)
+        self.assert_complete()
+
+    def test_fallback_preserves_existing_empty_destination(self):
+        self.destination.mkdir()
+        original_inode = self.destination.stat().st_ino
+        with self.fallback(), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(original_inode, self.destination.stat().st_ino)
+        self.assertEqual([], list(self.destination.iterdir()))
+        self.assert_source_preserved()
+        self.assertFalse(self.lock.exists())
+
+    def test_fallback_preserves_existing_nonempty_destination(self):
+        self.destination.mkdir()
+        (self.destination / "foreign").write_bytes(b"do not modify")
+        with self.fallback(), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual({"foreign": b"do not modify"}, {p.name: p.read_bytes() for p in self.destination.iterdir()})
+        self.assert_source_preserved()
+        self.assertFalse(self.lock.exists())
+
+    def test_existing_destination_symlink_including_dangling_rejected(self):
+        for target in (self.source, self.root / "missing"):
+            self.destination.symlink_to(target, target_is_directory=True)
+            with self.subTest(target=target), self.fallback(), self.assertRaises(sc.CohortError):
+                ar.rename_exclusive(self.source, self.destination)
+            self.assertEqual(target, self.destination.readlink())
+            self.assert_source_preserved()
+            self.assertFalse(self.lock.exists())
+            self.destination.unlink()
+
+    def test_existing_or_stale_lock_blocks_even_native_attempt(self):
+        self.lock.write_bytes(b"foreign or stale lock: operator inspection required")
+        original_inode = self.lock.stat().st_ino
+        with patch.object(ar, "_native_rename_exclusive", side_effect=AssertionError("must not bypass lock")), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(original_inode, self.lock.stat().st_ino)
+        self.assertEqual(b"foreign or stale lock: operator inspection required", self.lock.read_bytes())
+        self.assert_source_preserved()
+
+    def test_lock_symlink_never_followed_or_removed(self):
+        foreign = self.root / "foreign-lock"
+        foreign.write_bytes(b"foreign")
+        self.lock.symlink_to(foreign)
+        with self.fallback(), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(foreign, self.lock.readlink())
+        self.assertEqual(b"foreign", foreign.read_bytes())
+        self.assert_source_preserved()
+
+    def test_own_lock_released_after_handled_rename_failure(self):
+        def reject(*args):
+            self.assertTrue(self.lock.exists())
+            self.assertEqual(0o600, stat.S_IMODE(self.lock.stat().st_mode))
+            raise OSError(errno.EIO, "synthetic rename failure")
+        with self.fallback(), patch.object(ar.os, "rename", side_effect=reject), self.assertRaises(OSError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self.lock.exists())
+        self.assert_source_preserved()
+
+    def test_replaced_foreign_lock_never_cleaned(self):
+        def replace_lock(*args):
+            self.lock.unlink()
+            self.lock.write_bytes(b"replacement foreign lock")
+            raise OSError(errno.EIO, "synthetic external interference")
+        with self.fallback(), patch.object(ar.os, "rename", side_effect=replace_lock), self.assertRaises(OSError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(b"replacement foreign lock", self.lock.read_bytes())
+        self.assert_source_preserved()
+
+    def test_cross_device_staging_rejected_without_rename(self):
+        original = Path.lstat
+        def different_device(path):
+            result = original(path)
+            return SimpleNamespace(st_mode=result.st_mode, st_dev=result.st_dev + 1) if path == self.source else result
+        with self.fallback(), patch.object(Path, "lstat", different_device), patch.object(ar.os, "rename", side_effect=AssertionError("EXDEV must not rename")), self.assertRaises(OSError) as caught:
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(errno.EXDEV, caught.exception.errno)
+        self.assert_source_preserved()
+        self.assertFalse(self.lock.exists())
+
+    def test_staging_symlink_rejected_in_fallback(self):
+        alias = self.root / "staging-alias"
+        alias.symlink_to(self.source, target_is_directory=True)
+        with self.fallback(), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(alias, self.destination)
+        self.assertTrue(alias.is_symlink())
+        self.assert_source_preserved()
+        self.assertFalse(self.lock.exists())
+
+    def test_empty_destination_created_during_native_attempt_is_preserved(self):
+        def unsupported(*args):
+            self.destination.mkdir()
+            raise OSError(errno.EINVAL, "synthetic unsupported filesystem")
+        with patch.object(ar, "_native_rename_exclusive", side_effect=unsupported), self.assertRaises(sc.CohortError):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual([], list(self.destination.iterdir()))
+        self.assert_source_preserved()
+        self.assertFalse(self.lock.exists())
+
+    def test_parent_fsync_occurs_before_lock_release(self):
+        seen = []
+        def sync(descriptor):
+            self.assertTrue(self.lock.is_file())
+            self.assertEqual(self.root.stat().st_ino, os.fstat(descriptor).st_ino)
+            self.assertFalse(self.source.exists())
+            seen.append(descriptor)
+        with self.fallback(), patch.object(ar.os, "fsync", side_effect=sync):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(1, len(seen))
+        self.assert_complete()
+
+    def test_directory_fsync_unsupported_tolerated(self):
+        with self.fallback(), patch.object(ar.os, "fsync", side_effect=OSError(errno.EINVAL, "directory fsync unsupported")):
+            ar.rename_exclusive(self.source, self.destination)
+        self.assert_complete()
+
+    def test_directory_fsync_real_error_preserves_complete_output(self):
+        with self.fallback(), patch.object(ar.os, "fsync", side_effect=OSError(errno.EIO, "sync failure")), self.assertRaises(OSError) as caught:
+            ar.rename_exclusive(self.source, self.destination)
+        self.assertEqual(errno.EIO, caught.exception.errno)
+        self.assert_complete()
+
+    def test_freeze_revalidates_inputs_before_fallback_publication(self):
+        ledger = ar.Ledger()
+        before = self.root / "inputs" / "source.json"
+        before.parent.mkdir()
+        before.write_bytes(b"original")
+        ledger.add(before, "synthetic immutable source")
+        before.write_bytes(b"modified")
+        with self.fallback(), patch.object(ar, "rename_exclusive", side_effect=AssertionError("must revalidate first")), self.assertRaises(sc.CohortError):
+            ar.freeze(self.destination, self.payload, ledger)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(list(self.root.glob(".cohort-freeze-*")))
+
+    def test_freeze_rename_failure_cleans_only_own_staging(self):
+        foreign = self.root / ".cohort-freeze-foreign"
+        foreign.mkdir()
+        (foreign / "foreign").write_bytes(b"keep")
+        with self.fallback(), patch.object(ar.os, "rename", side_effect=OSError(errno.EIO, "rename failed")), self.assertRaises(OSError):
+            ar.freeze(self.destination, self.payload, ar.Ledger())
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self.lock.exists())
+        self.assertEqual([foreign], list(self.root.glob(".cohort-freeze-*")))
+        self.assertEqual(b"keep", (foreign / "foreign").read_bytes())
+        self.assert_source_preserved()
+
+    def test_two_process_publishers_exactly_one_complete_winner(self):
+        other = self.root / "other-staging"
+        other.mkdir()
+        for name in self.payload:
+            (other / name).write_bytes(b"other-complete-artifact-set")
+        context = multiprocessing.get_context("spawn")
+        start = context.Barrier(2)
+        failed = context.Event()
+        results = context.Queue()
+        workers = [context.Process(target=_publication_race_worker,
+                                   args=(str(source), str(self.destination), start, failed, results))
+                   for source in (self.source, other)]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=15)
+                self.assertEqual(0, worker.exitcode)
+            outcomes = dict(results.get(timeout=5) for _ in workers)
+            self.assertEqual({"PASS": 1, "REJECTED": 1}, Counter(outcomes.values()))
+            winner = next(name for name, result in outcomes.items() if result == "PASS")
+            expected = self.payload if winner == self.source.name else {name: b"other-complete-artifact-set" for name in self.payload}
+            self.assertEqual(expected, {p.name: p.read_bytes() for p in self.destination.iterdir()})
+            self.assertFalse((self.root / winner).exists())
+            loser = self.root / next(name for name, result in outcomes.items() if result == "REJECTED")
+            self.assertEqual(set(self.payload), {p.name for p in loser.iterdir()})
+            loser_expected = self.payload if loser == self.source else {name: b"other-complete-artifact-set" for name in self.payload}
+            self.assertEqual(loser_expected, {p.name: p.read_bytes() for p in loser.iterdir()})
+            self.assertFalse(self.lock.exists())
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=2)
+            results.close()
+            results.join_thread()
+
+    def test_revision_only_scientific_constants_and_salts_unchanged(self):
+        self.assertEqual("step2.6r-3c2a-r1-v1", sc.IMPLEMENTATION_REVISION)
+        self.assertEqual({"A": "step2.6r-3c2a-reviewer-a-v1", "B": "step2.6r-3c2a-reviewer-b-v1"}, sc.REVIEWER_SALTS)
+        protocol = frozen.load_preregistration()
+        self.assertEqual("step2.6r-3c1-v1", protocol["implementation_revision"])
+        self.assertEqual("81caac242f486eee630cb34c9009482065bcfab35ac920a799f097d9128bceff", sc.PREREGISTRATION_SHA256)
+        self.assertEqual("e807535556441434df0ef53a37921c0bdac5e27215ed045104ac08f38275e406", sc.AUTHORITATIVE_TRAIN_SHA256)
+        cohort = protocol["development_cohort"]
+        self.assertEqual({"GroundLie360": 60, "TRUE-3MFact": 60}, cohort["dataset_counts"])
+        self.assertEqual({"repair_train": 96, "repair_dev": 24}, cohort["split_counts"])
+        self.assertEqual("step2.6r-3c1-natural-pairwise-v1", cohort["sampling"]["salt"])
+        self.assertEqual("SHA-256", cohort["sampling"]["algorithm"])
+        self.assertEqual(("repair-development", "repair-split"),
+                         (cohort["sampling"]["selection_purpose"], cohort["sampling"]["split_purpose"]))
+        self.assertEqual({"prior_calibration": 1306, "revealed_audit": 30, "sealed_challenge": 6, "stage_a_replay": 7},
+                         protocol["exclusions"]["required_identity_counts"])
 
 
 if __name__ == "__main__":

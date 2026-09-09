@@ -1,6 +1,6 @@
 # Step 2.6R-3C2-A: score-blind repair-development cohort
 
-Implementation: `step2.6r-3c2a-v1`. Repair family:
+Implementation: `step2.6r-3c2a-r1-v1`. Repair family:
 `G1-RelevanceSelector-NaturalPairwise-v1`.
 
 This package constructs future repair-development data. It does not train,
@@ -235,15 +235,74 @@ artifacts are not followed. All inputs are rehashed immediately before publicati
 
 Outputs must be under an `outputs/` or `cache/` root, separate from source input
 directories. Files are staged in a private sibling temporary directory on the same
-filesystem, fsynced, then published with an OS atomic no-replace rename
-(Linux `renameat2(RENAME_NOREPLACE)` or macOS `renamex_np(RENAME_EXCL)`). Existing,
-partial, symlink or concurrently created destinations are never replaced or
-deleted. Only this invocation's temporary directory is cleaned on failure. Other
-platforms fail closed. Private directories/files use modes 0700/0600.
+filesystem and fsynced before publication. All immutable inputs are still
+revalidated by `freeze()` immediately before calling the publication layer.
+Private directories/files use modes 0700/0600.
+
+R1 fixes a filesystem portability failure reported on DICC `/scr`: libc exposes
+`renameat2`, but the filesystem returns `EINVAL` for `RENAME_NOREPLACE`. macOS
+used a different primitive and therefore did not exercise that failure. This
+is a pre-build engineering failure. Scientific rules, exclusions, reviewer salts,
+candidate exposure and the frozen 3C1 preregistration are unchanged.
+
+Publication prefers Linux `renameat2(RENAME_NOREPLACE)` or macOS
+`renamex_np(RENAME_EXCL)`. Only **EINVAL, ENOSYS, EOPNOTSUPP, ENOTSUP** permit
+fallback (aliases are deduplicated by the platform's errno values). A missing
+native symbol is treated as ENOSYS. EACCES, EPERM, EROFS, ENOSPC, EIO, EXDEV and
+other errors remain failures; EEXIST/ENOTEMPTY continue to reject existing output.
+
+Both the native path and fallback acquire the same deterministic sibling lock,
+`.<destination-name>.publish.lock`, with
+`os.open(O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0o600)` where O_CLOEXEC exists.
+Using the lock on both paths prevents a native publisher from bypassing an
+active fallback publisher or a stale lock. Working native primitives remain
+the preferred rename operation; successful native calls never invoke fallback.
+
+An existing lock causes immediate failure: no waiting, stealing, overwrite flag,
+automatic recovery or deletion. A crash can leave a stale lock. Operator
+inspection is required before a later retry; the program does not remove it.
+The lock descriptor remains open through publication and cleanup. On a normal
+handled return/failure, cleanup unlinks only the lock with the same device/inode
+as that descriptor. A foreign replacement is left untouched.
+
+While holding the lock, fallback rechecks that the destination does not exist
+and is not a symlink, including a dangling symlink. Existing empty/non-empty
+directories and partial outputs are preserved. Staging must be a real directory
+on the same device as the opened destination parent; otherwise publication fails
+with EXDEV. Normal same-filesystem `os.rename` then publishes the complete staged
+directory atomically to official readers. There is no copy/move fallback and no
+unlocked exists-then-rename sequence. Cooperating publishers must use this package's
+lock protocol; arbitrary external writers that ignore the lock are outside that
+cooperative guarantee.
+
+The destination parent is fsynced before releasing the lock. Platforms/filesystems
+that reject directory fsync with the same explicit unsupported-capability errno
+set are tolerated; other sync errors propagate. If a real sync error happens
+after rename, the complete published directory is preserved and the error is
+reported; the program never deletes it to attempt a rollback. Rename failures
+leave no partial final output. `freeze()` only cleans this invocation's own
+temporary staging directory on failure. Existing output is never reused or deleted.
 
 Exit codes: **0** valid PASS; **1** atomically frozen feasibility BLOCKED;
 **2** invalid input, integrity, runtime or contract failure. A changed scientific
 contract cannot be bypassed by CLI flags.
+
+## R1 DICC regression after a later reviewed commit
+
+This proposed command runs synthetic focused tests on the actual `/scr`
+filesystem. Run it only after the reviewed repair is committed and available
+on DICC; no commit or remote execution is performed by this implementation task.
+It does not run real preflight, cohort construction, annotation or model inference.
+
+```bash
+ROOT=/scr/user/kevin2002/TensorCat/uni-rumor
+DEFENSE="$ROOT/MDU/Defense_Engineering"
+PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
+  -m unittest discover \
+  -s "$DEFENSE/tests" \
+  -p 'test_selector_relevance_next_repair_cohort.py' -v
+```
 
 ## Proposed DICC commands — do not run locally
 
