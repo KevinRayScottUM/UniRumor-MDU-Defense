@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Tuple
 
-from scripts.selector_relevance_gate.schemas import EvaluationRequest, EvaluationUnit
+from scripts.selector_relevance_gate.schemas import EvaluationRequest
 
 
-IMPLEMENTATION_REVISION = "step2.6r-3b3-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3b3-r1-v1"
 SOURCE_3B1_REVISION = "step2.6r-3b1-r2-v1"
 SOURCE_3B2_REVISION = "step2.6r-3b2-v1"
 
@@ -33,6 +33,14 @@ CALIBRATED_SELECTOR_SHA256 = (
 )
 ALLOWED_STATE_DIFFERENCES = frozenset(
     {"selection_head.weight", "selection_head.bias"}
+)
+FROZEN_CANDIDATE_PAIRS = frozenset(
+    {
+        ("evidence", "text"),
+        ("title_span", "text"),
+        ("transcript", "text"),
+        ("ocr", "ocr"),
+    }
 )
 
 FINAL_GOLD_FIELDS = (
@@ -71,12 +79,38 @@ class IndependentEvaluationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class IndependentEvaluationUnit:
+    """Preserve the frozen 3B1 fields for the existing request/collator interface."""
+
+    unit_id: str
+    unit_type: str
+    modality: str
+    text: str
+
+    def __post_init__(self) -> None:
+        for field in ("unit_id", "unit_type", "modality", "text"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a nonblank string")
+        if (self.unit_type, self.modality) not in FROZEN_CANDIDATE_PAIRS:
+            raise ValueError("unit_type/modality is not a supported frozen 3B1 pair")
+
+    def to_dict(self) -> Mapping[str, str]:
+        return {
+            "unit_id": self.unit_id,
+            "unit_type": self.unit_type,
+            "modality": self.modality,
+            "text": self.text,
+        }
+
+
+@dataclass(frozen=True)
 class IndependentCase:
     audit_case_id: str
     dataset: str
     canonical_case_id: str
     claim: str
-    candidate_units: Tuple[EvaluationUnit, ...]
+    candidate_units: Tuple[IndependentEvaluationUnit, ...]
     positive_unit_ids: Tuple[str, ...]
 
     @property

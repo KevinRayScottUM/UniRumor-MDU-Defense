@@ -13,7 +13,6 @@ from scripts.selector_relevance_gate.runtime import (
     TrainingArtifacts,
     validate_training_artifacts,
 )
-from scripts.selector_relevance_gate.schemas import EvaluationUnit
 from scripts.selector_relevance_training.dicc_backend import (
     MAXIMUM_UNITS_PER_SAMPLE,
     MAX_LENGTH,
@@ -37,6 +36,7 @@ from .schemas import (
     IMPLEMENTATION_REVISION,
     IndependentCase,
     IndependentEvaluationError,
+    IndependentEvaluationUnit,
     PreparedInputs,
     RELEVANCE_LABELS,
     REQUIRED_SEED,
@@ -380,7 +380,7 @@ def _load_requests(
     path: Path,
     manifest_order: Sequence[str],
     manifest_by_id: Mapping[str, Mapping[str, Any]],
-) -> Mapping[str, Tuple[str, Tuple[EvaluationUnit, ...], str]]:
+) -> Mapping[str, Tuple[str, Tuple[IndependentEvaluationUnit, ...], str]]:
     rows = _read_jsonl(path, "3B1 independent audit requests")
     if len(rows) != EXPECTED_CASE_COUNT:
         raise IndependentEvaluationError("3B1 request count is not 30")
@@ -430,7 +430,7 @@ def _load_requests(
                 )
             try:
                 units.append(
-                    EvaluationUnit(
+                    IndependentEvaluationUnit(
                         unit_id=candidate["unit_id"],
                         unit_type=candidate["unit_type"],
                         modality=candidate["modality"],
@@ -1049,6 +1049,11 @@ def prepare_inputs(
         "formal_test_accessed": False,
         "sealed_historical_reference_content_accessed": False,
     }
+    candidate_pair_counts = Counter(
+        (unit.unit_type, unit.modality)
+        for case in cases
+        for unit in case.candidate_units
+    )
     case_manifest = {
         "status": "INDEPENDENT_SELECTOR_EVALUATION_CASES_FROZEN",
         "implementation_revision": IMPLEMENTATION_REVISION,
@@ -1057,6 +1062,11 @@ def prepare_inputs(
         "evaluable_case_count": EXPECTED_EVALUABLE_CASE_COUNT,
         "zero_direct_positive_case_count": EXPECTED_ZERO_DIRECT_CASE_COUNT,
         "per_dataset": EXPECTED_DATASET_COUNTS,
+        # Input-integrity diagnostics only; these counts do not enter the gate.
+        "candidate_pair_counts": [
+            {"unit_type": unit_type, "modality": modality, "candidate_count": count}
+            for (unit_type, modality), count in sorted(candidate_pair_counts.items())
+        ],
         "stable_original_candidate_order_for_score_ties": True,
         "zero_direct_positive_cases_retained": True,
         "positive_unit_definition": "all and only final_relevance_label == DIRECT",

@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest import mock
 
@@ -15,7 +16,11 @@ from scripts.selector_relevance_gate.runtime import (
     RuntimeIntegrationError,
     TrainingArtifacts,
 )
-from scripts.selector_relevance_gate.schemas import EvaluationUnit, PredictionSnapshot
+from scripts.selector_relevance_gate.schemas import (
+    EvaluationRequest,
+    EvaluationUnit as HistoricalEvaluationUnit,
+    PredictionSnapshot,
+)
 from scripts.selector_relevance_independent_eval.evaluator import (
     run_one_shot_evaluation,
     run_preflight,
@@ -30,9 +35,12 @@ from scripts.selector_relevance_independent_eval.schemas import (
     FINAL_GOLD_FIELDS,
     IndependentCase,
     IndependentEvaluationError,
+    IndependentEvaluationUnit,
 )
 from scripts.selector_relevance_independent_eval.source_loader import (
     _frozen_protocol,
+    _load_manifest_cases,
+    _load_requests,
     _validate_phase4a_config,
     _validate_coverage,
     prepare_inputs,
@@ -63,9 +71,82 @@ def _write_locked(path: Path, payload: bytes) -> str:
     return digest
 
 
+class LocalCandidateContractTests(unittest.TestCase):
+    def test_all_four_frozen_pairs_are_accepted(self):
+        for unit_type, modality in (
+            ("evidence", "text"),
+            ("title_span", "text"),
+            ("transcript", "text"),
+            ("ocr", "ocr"),
+        ):
+            with self.subTest(unit_type=unit_type, modality=modality):
+                unit = IndependentEvaluationUnit("synthetic-id", unit_type, modality, "content")
+                self.assertEqual(unit.unit_type, unit_type)
+                self.assertEqual(unit.modality, modality)
+
+    def test_evidence_fields_preserve_utf8_bytes_and_unit_is_immutable(self):
+        fields = {
+            "unit_id": " synthetic:evidence_text:0 ",
+            "unit_type": "evidence",
+            "modality": "text",
+            "text": "  Synthetic e\u0301 / 中文\nverbatim text\t ",
+        }
+        unit = IndependentEvaluationUnit(**fields)
+        for name, value in fields.items():
+            self.assertEqual(getattr(unit, name).encode("utf-8"), value.encode("utf-8"))
+            self.assertEqual(unit.to_dict()[name].encode("utf-8"), value.encode("utf-8"))
+        self.assertNotEqual(unit.unit_type, "text")
+        with self.assertRaises(FrozenInstanceError):
+            unit.unit_type = "text"
+        exported = unit.to_dict()
+        exported["unit_type"] = "text"
+        self.assertEqual(unit.unit_type, "evidence")
+
+    def test_all_candidate_fields_require_nonblank_strings(self):
+        original = dict(unit_id="id", unit_type="evidence", modality="text", text="content")
+        for field in original:
+            for invalid in ("", " \t\n", None, 1, []):
+                with self.subTest(field=field, invalid=invalid):
+                    fields = {**original, field: invalid}
+                    with self.assertRaisesRegex(ValueError, "nonblank string"):
+                        IndependentEvaluationUnit(**fields)
+
+    def test_visual_inconsistent_and_unsupported_pairs_are_rejected(self):
+        for unit_type, modality in (
+            ("visual", "text"),
+            ("image", "text"),
+            ("visual_observation", "text"),
+            ("grounded_visual_unit", "text"),
+            ("evidence", "ocr"),
+            ("transcript", "ocr"),
+            ("ocr", "text"),
+            ("title_span", "ocr"),
+            ("evidence", "image"),
+            ("evidence", "visual"),
+            ("evidence", "audio"),
+            ("unknown", "text"),
+            ("text", "text"),
+            ("Evidence", "text"),
+            ("evidence", "TEXT"),
+            (" evidence ", "text"),
+        ):
+            with self.subTest(unit_type=unit_type, modality=modality):
+                with self.assertRaises(ValueError):
+                    IndependentEvaluationUnit("id", unit_type, modality, "content")
+
+    def test_historical_unit_retains_its_legacy_contract(self):
+        with self.assertRaisesRegex(ValueError, "unit_type must be text"):
+            HistoricalEvaluationUnit("id", "evidence", "text", "content")
+        self.assertEqual(
+            HistoricalEvaluationUnit("id", "text", "text", "content").unit_type,
+            "text",
+        )
+
+
 class Synthetic3B3Fixture:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, frozen_pairs: bool = True) -> None:
         self.root = root
+        self.frozen_pairs = frozen_pairs
         self.project = root / "unirumor"
         phase3 = self.project / "MDU" / "scripts" / "clip12_phase3_common"
         phase4a = (
@@ -120,21 +201,33 @@ class Synthetic3B3Fixture:
         manifests = []
         requests = []
         gold = []
+        ocr_remaining = 111
         for case_index in range(30):
             dataset = "GroundLie360" if case_index < 15 else "TRUE-3MFact"
             canonical = f"{dataset}:synthetic-{case_index:03d}"
             count = 10 if case_index < 19 else 9
             ids = [f"u-{case_index:03d}-{position:02d}" for position in range(count)]
-            candidates = [
-                {
+            candidates = []
+            for position, unit_id in enumerate(ids):
+                unit_type, modality = "transcript", "text"
+                if self.frozen_pairs:
+                    if case_index >= 15 and position == 0:
+                        unit_type = "evidence"
+                    elif case_index < 10 and position == 0:
+                        unit_type = "title_span"
+                    elif ocr_remaining:
+                        unit_type, modality = "ocr", "ocr"
+                        ocr_remaining -= 1
+                text = f"Synthetic candidate {case_index}-{position}"
+                if unit_type == "evidence":
+                    text = f"  {text}: e\u0301 / 中文\nunchanged evidence\t "
+                candidates.append({
                     "unit_id": unit_id,
-                    "unit_type": "transcript",
-                    "modality": "text",
-                    "text": f"Synthetic candidate {case_index}-{position}",
+                    "unit_type": unit_type,
+                    "modality": modality,
+                    "text": text,
                     "original_candidate_position": position,
-                }
-                for position, unit_id in enumerate(ids)
-            ]
+                })
             manifests.append(
                 {
                     "dataset": dataset,
@@ -143,8 +236,12 @@ class Synthetic3B3Fixture:
                     "sampling_hash": hashlib.sha256(canonical.encode()).hexdigest(),
                     "model_exposed_unit_count": count,
                     "candidate_unit_ids_in_original_order": ids,
-                    "candidate_unit_types_in_original_order": ["transcript"] * count,
-                    "candidate_modalities_in_original_order": ["text"] * count,
+                    "candidate_unit_types_in_original_order": [
+                        candidate["unit_type"] for candidate in candidates
+                    ],
+                    "candidate_modalities_in_original_order": [
+                        candidate["modality"] for candidate in candidates
+                    ],
                 }
             )
             requests.append(
@@ -581,6 +678,36 @@ class PreflightAndSourceTests(IndependentEvalFixtureTestCase):
         locks = prepared.source_lock["authoritative_runtime_sources"]
         self.assertEqual({"phase3_model", "phase4a_engine"}, set(locks))
 
+    def test_frozen_style_pair_counts_pass_score_free_preflight(self):
+        prepared = self._prepared()
+        output = self.preflight()
+        manifest = json.loads((output / "evaluation_case_manifest.json").read_text())
+        self.assertEqual(
+            manifest["candidate_pair_counts"],
+            [
+                {"unit_type": "evidence", "modality": "text", "candidate_count": 15},
+                {"unit_type": "ocr", "modality": "ocr", "candidate_count": 111},
+                {"unit_type": "title_span", "modality": "text", "candidate_count": 10},
+                {"unit_type": "transcript", "modality": "text", "candidate_count": 153},
+            ],
+        )
+        self.assertEqual(sum(row["candidate_count"] for row in manifest["candidate_pair_counts"]), 289)
+        self.assertEqual(manifest["implementation_revision"], "step2.6r-3b3-r1-v1")
+        self.assertFalse(FakeRuntime.instances)
+        for path, digest in prepared.immutable_file_hashes.items():
+            self.assertEqual(_sha(Path(path)), digest)
+
+    def test_pair_counts_are_diagnostics_not_an_additional_gate(self):
+        fixture = Synthetic3B3Fixture(self.fixture.root / "alternate-pairs", frozen_pairs=False)
+        output = fixture.root / "preflight"
+        report = run_preflight(**fixture.kwargs(output))
+        self.assertEqual(report["status"], "INDEPENDENT_SELECTOR_ONE_SHOT_PREFLIGHT_PASS")
+        manifest = json.loads((output / "evaluation_case_manifest.json").read_text())
+        self.assertEqual(
+            manifest["candidate_pair_counts"],
+            [{"unit_type": "transcript", "modality": "text", "candidate_count": 289}],
+        )
+
     def test_defense_engineering_as_project_root_is_rejected(self):
         with self.assertRaisesRegex(
             IndependentEvaluationError, "authoritative UniRumor runtime layout"
@@ -742,6 +869,74 @@ class PreflightAndSourceTests(IndependentEvalFixtureTestCase):
 
 
 class GoldAndJoinTests(IndependentEvalFixtureTestCase):
+    def test_evidence_preserved_from_source_loader_to_request_and_collator(self):
+        kwargs = self.fixture.kwargs(self.fixture.root / "unused")
+        kwargs.pop("output_dir")
+        prepared = prepare_inputs(**kwargs)
+        evidence_count = 0
+        for source_case, case in zip(self.fixture.request_rows, prepared.cases):
+            request = case.evaluation_request()
+            self.assertIsInstance(request, EvaluationRequest)
+            item = request.collator_item()
+            expected = [
+                {field: candidate[field] for field in ("unit_id", "unit_type", "modality", "text")}
+                for candidate in source_case["candidate_units"]
+            ]
+            self.assertEqual(item["units"], expected)
+            for unit, original, delivered in zip(case.candidate_units, expected, item["units"]):
+                self.assertIsInstance(unit, IndependentEvaluationUnit)
+                if original["unit_type"] == "evidence":
+                    evidence_count += 1
+                    self.assertEqual(case.dataset, "TRUE-3MFact")
+                    self.assertEqual(delivered["unit_type"], "evidence")
+                    for field in original:
+                        self.assertEqual(delivered[field].encode("utf-8"), original[field].encode("utf-8"))
+        self.assertEqual(evidence_count, 15)
+
+    def test_evidence_mutation_reorder_deletion_and_replacement_fail_manifest_join(self):
+        selected = json.loads((self.fixture.cohort / "selected_case_manifest.json").read_text())
+        order, by_id = _load_manifest_cases(selected)
+        path = self.fixture.root / "mutated_synthetic_requests.jsonl"
+        for mutation in ("type", "modality", "id", "position", "reorder", "deletion", "replacement"):
+            with self.subTest(mutation=mutation):
+                rows = json.loads(json.dumps(self.fixture.request_rows))
+                candidates = rows[15]["candidate_units"]
+                self.assertEqual(candidates[0]["unit_type"], "evidence")
+                if mutation == "type":
+                    candidates[0]["unit_type"] = "transcript"
+                elif mutation == "modality":
+                    candidates[0]["modality"] = "ocr"
+                elif mutation == "id":
+                    candidates[0]["unit_id"] = "changed-id"
+                elif mutation == "position":
+                    candidates[0]["original_candidate_position"] = 1
+                elif mutation == "reorder":
+                    candidates[0], candidates[1] = candidates[1], candidates[0]
+                    for position, candidate in enumerate(candidates):
+                        candidate["original_candidate_position"] = position
+                elif mutation == "deletion":
+                    candidates.pop(0)
+                else:
+                    candidates[0] = {
+                        **candidates[0],
+                        "unit_id": "replacement-evidence",
+                        "text": "Synthetic replacement",
+                    }
+                path.write_bytes(_jsonl_bytes(rows))
+                # Exercise the join directly so rejection cannot be masked by SHA checks.
+                with self.assertRaisesRegex(
+                    IndependentEvaluationError, "candidate (metadata/order|count) changed"
+                ):
+                    _load_requests(path, order, by_id)
+
+    def test_evidence_text_replacement_fails_frozen_source_hash(self):
+        path = self.fixture.cohort / "independent_relevance_audit_requests.jsonl"
+        rows = json.loads(json.dumps(self.fixture.request_rows))
+        rows[15]["candidate_units"][0]["text"] = "Synthetic replacement evidence"
+        path.write_bytes(_jsonl_bytes(rows))
+        with self.assertRaisesRegex(IndependentEvaluationError, "SHA-256 mismatch"):
+            self.preflight()
+
     def test_valid_gold_contract_and_coverage(self):
         prepared = prepare_inputs(
             **{key: value for key, value in self.fixture.kwargs(self.fixture.root / "x").items() if key != "output_dir"}
@@ -867,12 +1062,12 @@ class RankingMetricAndGateTests(unittest.TestCase):
     @staticmethod
     def case(*, positives=("z",), dataset="GroundLie360") -> IndependentCase:
         units = (
-            EvaluationUnit("z", "transcript", "text", "first"),
-            EvaluationUnit("a", "transcript", "text", "second"),
-            EvaluationUnit("m", "ocr", "ocr", "third"),
-            EvaluationUnit("b", "transcript", "text", "fourth"),
-            EvaluationUnit("y", "ocr", "ocr", "fifth"),
-            EvaluationUnit("c", "transcript", "text", "sixth"),
+            IndependentEvaluationUnit("z", "transcript", "text", "first"),
+            IndependentEvaluationUnit("a", "transcript", "text", "second"),
+            IndependentEvaluationUnit("m", "ocr", "ocr", "third"),
+            IndependentEvaluationUnit("b", "transcript", "text", "fourth"),
+            IndependentEvaluationUnit("y", "ocr", "ocr", "fifth"),
+            IndependentEvaluationUnit("c", "transcript", "text", "sixth"),
         )
         return IndependentCase("audit", dataset, f"{dataset}:case", "claim", units, positives)
 
@@ -1218,6 +1413,10 @@ class OneShotOutputAndBoundaryTests(IndependentEvalFixtureTestCase):
             DICCEvaluationRuntime,
             "__init__",
             side_effect=AssertionError("runtime must not be constructed"),
+        ), mock.patch.object(
+            DICCEvaluationRuntime,
+            "evaluate",
+            side_effect=AssertionError("runtime must not score either selector"),
         ), mock.patch(
             "scripts.selector_relevance_gate.runtime._safe_torch_load",
             side_effect=AssertionError("selector tensors must not be loaded"),

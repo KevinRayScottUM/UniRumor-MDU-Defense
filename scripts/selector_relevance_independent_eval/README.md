@@ -1,6 +1,32 @@
 # Step 2.6R-3B3 independent selector evaluation
 
-Implementation revision: `step2.6r-3b3-v1`.
+Step 2.6R-3B3-R1 — Frozen 3B1 Candidate-Contract Compatibility Repair
+
+Implementation revision: `step2.6r-3b3-r1-v1`.
+
+`IndependentEvaluationUnit` preserves `unit_id`, `unit_type`, `modality`, and
+`text` exactly. It accepts the frozen cohort pairs `evidence/text`,
+`title_span/text`, `transcript/text`, and `ocr/ocr`. Every field must be a
+nonblank string; visual and other unsupported pairs are rejected. The loader
+still verifies candidate identity, type, modality, position, order, and count
+against the frozen 3B1 selected-case manifest and verifies the input hashes.
+In particular, `evidence` is never rewritten to `text`.
+
+The existing `EvaluationRequest` and `DICCEvaluationRuntime` consume `.unit_id`
+and `to_dict()` through `collator_item()` and need no changes. The historical
+`EvaluationUnit` retains its original contract. The preflight case manifest
+reports observed `candidate_pair_counts` as input-integrity metadata, without
+introducing a scientific gate. Upstream revisions remain `step2.6r-3b1-r2-v1`
+and `step2.6r-3b2-v1`.
+
+The user-reported DICC attempt at commit
+`08fbabde5310c4d1b27ae861ecd02c1b2f2b5c90` is recorded as
+**INVALID / FAIL-CLOSED PRE-SCORING INTEGRATION ATTEMPT**. The legacy unit
+schema rejected 15 frozen TRUE-3MFact `evidence/text` candidates. This was not
+a scientific 3B3 FAIL: no real selector scores or MRR/NDCG/Recall were produced
+and no one-shot output exists, according to that audit. There is no successful
+preflight to migrate. The repaired score-free preflight must be reviewed before
+any one-shot evaluation is authorized.
 
 This isolated package implements two deliberately separate modes:
 
@@ -15,8 +41,8 @@ This isolated package implements two deliberately separate modes:
   the two zero-DIRECT cases from macro denominators, and atomically freezes a
   scientifically valid PASS or FAIL.
 
-Only `scripts.selector_relevance_gate.runtime` and
-`scripts.selector_relevance_gate.metrics` are reused. The historical
+The shared runtime, request/snapshot interfaces, metrics, and metadata
+validators are reused. Candidate validation stays local to 3B3. The historical
 `run_heldout_gate`, `load_heldout_references`, `heldout_loader.py`, CPAC gate,
 and six-case evidence are not used.
 
