@@ -1,0 +1,255 @@
+{
+  "implementation_revision": "step2.6r-3c1-v1",
+  "stage": "Step 2.6R-3C0 / 3C1",
+  "title": "Post-Failure Audit Quarantine and Next-Repair Scientific Preregistration",
+  "repair_name": "G1-RelevanceSelector-NaturalPairwise-v1",
+  "scope": "PROTOCOL_ONLY",
+  "prior_result": {
+    "stage": "Step 2.6R-3B3-R1",
+    "provenance": "User-supplied authoritative result; real artifacts not reopened by this stage",
+    "status": "INDEPENDENT_SELECTOR_REPAIR_VERIFICATION_FAIL",
+    "scientific_result_valid": true,
+    "repair_verification_pass": false,
+    "deployment_remains_blocked": true,
+    "interpretation": "VALID SCIENTIFIC FAIL",
+    "pipeline_failure": false,
+    "permission_to_tune_against_revealed_audit": false,
+    "case_count": 30,
+    "unit_count": 289,
+    "evaluable_case_count": 28,
+    "zero_direct_case_count": 2,
+    "seed": 42,
+    "original_overall": {
+      "mrr": 0.9297619047619047,
+      "ndcg_at_5": 0.849883002226176,
+      "recall_at_5": 1.0
+    },
+    "calibrated_overall": {
+      "mrr": 0.6045068027210885,
+      "ndcg_at_5": 0.4901455859424643,
+      "recall_at_5": 0.7857142857142857
+    },
+    "deltas": {
+      "mrr": -0.3252551020408162,
+      "ndcg_at_5": -0.35973741628371164,
+      "recall_at_5": -0.2142857142857143,
+      "groundlie_mrr": -0.30952380952380953,
+      "true3m_mrr": -0.338888888888889
+    },
+    "descriptive_best_direct_rank_counts": {
+      "improvement": 1,
+      "regression": 14,
+      "unchanged": 13
+    }
+  },
+  "quarantine": {
+    "scope": "Complete canonical identity set of the revealed Step 3B1 / 3B2 / 3B3 audit",
+    "case_count": 30,
+    "permanent": true,
+    "required_identity_lock": true,
+    "override_permitted": false,
+    "forbidden_uses": [
+      "training", "calibration", "hyperparameter_tuning", "seed_selection",
+      "epoch_selection", "loss_selection", "architecture_selection",
+      "threshold_tuning", "model_selection", "future_acceptance_gating"
+    ],
+    "allowed_uses": [
+      "descriptive_failure_analysis", "scientific_reporting",
+      "reproducibility_checks", "artifact_integrity_verification"
+    ],
+    "future_design_source": "This frozen preregistration; revealed audit cannot inform any further selection or tuning"
+  },
+  "development_cohort": {
+    "source": "authoritative frozen G1 Train only",
+    "case_count": 120,
+    "dataset_counts": {"GroundLie360": 60, "TRUE-3MFact": 60},
+    "split_counts": {"repair_train": 96, "repair_dev": 24},
+    "split_dataset_counts": {
+      "repair_train": {"GroundLie360": 48, "TRUE-3MFact": 48},
+      "repair_dev": {"GroundLie360": 12, "TRUE-3MFact": 12}
+    },
+    "case_disjoint": true,
+    "sampling": {
+      "algorithm": "SHA-256",
+      "salt": "step2.6r-3c1-natural-pairwise-v1",
+      "hash_input": "UTF-8 compact JSON array [salt, purpose, dataset, canonical_case_id]; ensure_ascii=false",
+      "ordering": ["digest_ascending", "canonical_case_id_ascending"],
+      "selection_purpose": "repair-development",
+      "selection": "First 60 eligible, unexcluded identities per dataset",
+      "split_purpose": "repair-split",
+      "split": "Independently hash the selected 60 per dataset; first 48 repair_train, remaining 12 repair_dev",
+      "scores_labels_and_candidate_content_used_for_sampling": false,
+      "resampling_permitted": false,
+      "fallback_to_excluded_cases_permitted": false
+    },
+    "candidate_exposure": "same authoritative Phase4A normalization",
+    "minimum_candidates": 6,
+    "maximum_candidates": 24,
+    "allowed_pairs": [["evidence", "text"], ["title_span", "text"], ["transcript", "text"], ["ocr", "ocr"]],
+    "preserve_exactly": ["original_natural_claim", "unit_id", "unit_type", "modality", "text", "candidate_order"],
+    "visual_candidates_permitted": false,
+    "synthetic_neutral_claims_permitted": false
+  },
+  "exclusions": {
+    "required_identity_counts": {
+      "prior_calibration": 1306,
+      "revealed_audit": 30,
+      "sealed_challenge": 6,
+      "stage_a_replay": 7
+    },
+    "sequential_order": ["prior_calibration", "revealed_audit", "sealed_challenge", "stage_a_replay", "future_manifests_sorted_by_name"],
+    "future_exclusion_manifests_required_when_supplied": true,
+    "formal_validation_permitted": false,
+    "formal_test_permitted": false,
+    "identity_manifest_contract": ["name", "canonical_case_ids", "identity_sha256", "source_artifact_sha256"],
+    "identity_hash_encoding": "SHA-256 of UTF-8 compact JSON sorted identity array; ensure_ascii=false",
+    "accounting": ["membership_counts", "effective_sequential_counts", "pairwise_overlap_counts", "unique_excluded_union_count"],
+    "accounting_universe": "Supplied authoritative Train exposure inventory; locked identity counts also reported separately",
+    "missing_required_lock_blocks_cohort_validation": true,
+    "override_permitted": false
+  },
+  "annotation": {
+    "source": "independent human direct-relevance annotation",
+    "reviewers": ["A", "B"],
+    "independent": true,
+    "score_blind": true,
+    "veracity_label_blind": true,
+    "dataset_identity_blind": true,
+    "modality_identity_blind_where_practical": true,
+    "other_reviewer_output_blind": true,
+    "labels": ["DIRECT", "RELATED", "IRRELEVANT", "UNREADABLE"],
+    "binary_mapping": {"DIRECT": 1, "RELATED": 0, "IRRELEVANT": 0, "UNREADABLE": 0},
+    "all_four_class_disagreements": "Independent Reviewer C adjudication",
+    "confidence_tie_breaking_permitted": false,
+    "selector_derived_labels_permitted": false,
+    "veracity_derived_labels_permitted": false,
+    "neutral_lexical_anchor_templates_permitted": false
+  },
+  "coverage": {
+    "evaluable_definition": "At least one DIRECT unit",
+    "zero_direct_cases_retained": true,
+    "resampling_permitted": false,
+    "minimum_evaluable": {"overall": 96, "repair_train": 77, "repair_dev": 20},
+    "denominators": {"overall": 120, "repair_train": 96, "repair_dev": 24},
+    "all_conditions_required": true,
+    "failure_action": "repair training is blocked; retain frozen cohort; do not resample",
+    "combined_threshold_note": "Train >=77 and Dev >=20 imply at least 97 evaluable overall; overall >=96 remains an unchanged separate condition"
+  },
+  "model_boundary": {
+    "base_model": "Frozen G1",
+    "backbone": "microsoft/deberta-v3-base",
+    "base_checkpoint_sha256": "b694f2d4bb5ba6f72dd8a001bd984d46853546f2a85858a812f2496af1f1a0b9",
+    "frozen": ["encoder", "veracity_head"],
+    "trainable_only": ["selection_head.weight", "selection_head.bias"],
+    "prediction_path_unchanged": true,
+    "maximum_eligible_units": 24,
+    "maximum_sequence_length": 256,
+    "sample_pooling": "class-wise maximum over every evaluated eligible unit",
+    "labels": {"fake": 0, "real": 1},
+    "top_k": 5,
+    "top_k_explanation_only": true,
+    "selection_scores_determine_prediction_pool": false,
+    "production_change_permitted": false
+  },
+  "encoding": {
+    "sequence_a": "original natural claim",
+    "sequence_b": "[UNIT_TYPE=<unit_type>] [MODALITY=<modality>] <candidate text>",
+    "preserve_original_fields": true,
+    "forbidden_claim_templates": ["The relevant content states ...", "The speaker says ...", "The on-screen text reads ..."],
+    "neutral_synthetic_anchor_templates_permitted": false
+  },
+  "objective": {
+    "name": "pairwise direct-relevance ranking",
+    "P": "all DIRECT units in the case",
+    "N": "all non-DIRECT units in the case",
+    "d": "s_positive - s_negative",
+    "pair_loss": "softplus(-d)",
+    "case_loss": "mean over all positive-negative pairs in the case",
+    "batch_loss": "mean over evaluable cases in the batch",
+    "zero_direct_loss_contribution": "none",
+    "forbidden_supervision_and_weighting": ["veracity_margin", "veracity_labels", "modality_weighting", "dataset_weighting", "ocr_bonus", "transcript_penalty", "source_specific_offset", "confidence_weighting"]
+  },
+  "training": {
+    "seeds": [42, 43, 44],
+    "maximum_epochs": 10,
+    "optimizer": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0,
+    "early_stopping_patience": 2,
+    "early_stopping_monitor": "repair Dev MRR",
+    "best_epoch_order": ["Dev MRR descending", "Dev NDCG@5 descending", "Dev Recall@5 descending", "earlier epoch"],
+    "deployment_candidate_seed_order": ["Dev MRR descending", "Dev NDCG@5 descending", "Dev Recall@5 descending", "lower seed number"],
+    "model_selection_source": "new 24-case repair_dev split only",
+    "old_30_case_audit_selection_permitted": false
+  },
+  "development_metrics": {
+    "names": ["MRR", "NDCG@5", "Recall@1", "Recall@3", "Recall@5"],
+    "score_ties": "original candidate order",
+    "aggregation": "macro over evaluable cases",
+    "groups": ["overall", "GroundLie360", "TRUE-3MFact"],
+    "zero_direct_cases_retained": true,
+    "zero_direct_in_ranking_denominator": false
+  },
+  "new_invariance": {
+    "cohort": "new label-free deterministic inference replay cohort",
+    "sampling_salt": "step2.6r-3c1-natural-pairwise-invariance-v1",
+    "source": "authoritative frozen G1 Train only",
+    "disjoint_from": ["repair_train", "repair_dev", "revealed_audit", "sealed_challenge", "stage_a_replay", "prior_calibration", "future_exclusions"],
+    "verify_unchanged": ["candidate_ids", "candidate_order", "encoder_outputs", "veracity_logits", "sample_probabilities", "sample_prediction"],
+    "selection_rank_may_change": true,
+    "prediction_mismatch_count_required": 0,
+    "relevance_labels_used": false,
+    "cohort_size": "Not specified in this stage; must be frozen before replay cohort construction",
+    "use": "prediction invariance only; no relevance-based model selection"
+  },
+  "future_audit": {
+    "construction_requires": ["repair development complete", "best seed frozen", "model artifact frozen", "prediction invariance PASS"],
+    "case_count": 30,
+    "dataset_counts": {"GroundLie360": 15, "TRUE-3MFact": 15},
+    "source": "authoritative frozen G1 Train only",
+    "exclusions": ["prior_calibration", "revealed_audit", "all_120_repair_development_cases", "sealed_challenge", "stage_a_replay", "new_invariance_cohort", "all_other_exposed_scientific_cases", "all_future_exclusion_manifests", "Formal Validation", "Formal Test"],
+    "annotation": "independent human A and B; independent C for all four-class disagreements",
+    "final_relevance_gold_frozen_before_scoring": true,
+    "model_scores_viewed_before_final_gold_freeze": false,
+    "one_shot_scoring": true,
+    "post_scoring_model_or_gate_changes_permitted": false
+  },
+  "future_one_shot_gate": {
+    "baseline": "original Frozen G1 on the same new audit",
+    "candidate": "new repair artifact and Dev-selected seed frozen before new audit construction",
+    "minimum_evaluable_case_count": 24,
+    "overall_mrr_strictly_greater_than_original": true,
+    "overall_ndcg_at_5_strictly_greater_than_original": true,
+    "minimum_max_of_delta_mrr_and_delta_ndcg_at_5": 0.05,
+    "minimum_delta_recall_at_5": -0.02,
+    "minimum_groundlie_delta_mrr": -0.05,
+    "minimum_true3m_delta_mrr": -0.05,
+    "prediction_architecture_unchanged": true,
+    "all_conditions_required": true,
+    "recall_at_1_descriptive_only": true,
+    "recall_at_3_descriptive_only": true,
+    "cpac_gate": false,
+    "regression_count_gate": false,
+    "modality_gate": false,
+    "new_gate_after_scoring_permitted": false
+  },
+  "deployment": {
+    "automatic_after_future_pass": false,
+    "separate_explicit_downstream_authorization_required": true,
+    "prohibited_without_authorization": ["production_selector_switch", "ui_switch", "backend_default_change", "checkpoint_replacement"]
+  },
+  "current_stage_boundaries": {
+    "synthetic_fixtures_only": true,
+    "real_exclusion_identities_supplied": false,
+    "real_dataset_build_permitted": false,
+    "reviewer_packet_creation_permitted": false,
+    "training_permitted": false,
+    "torch_instantiation_permitted": false,
+    "model_loading_permitted": false,
+    "selector_scoring_permitted": false,
+    "real_ranking_output_access_permitted": false,
+    "formal_validation_access_permitted": false,
+    "formal_test_access_permitted": false,
+    "sealed_challenge_content_access_permitted": false
+  }
+}
