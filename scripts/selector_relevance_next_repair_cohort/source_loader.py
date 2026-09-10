@@ -372,6 +372,9 @@ def expose(row, row_index, adapter, protocol, train_sha):
     saved = copy.deepcopy(request)
     raw = saved["candidate_units"]
     maximum = protocol["development_cohort"]["maximum_candidates"]
+    raw_by_id = {unit["unit_id"]: unit for unit in raw}
+    if len(raw_by_id) != len(raw):
+        raise CohortError("duplicate candidate IDs in raw source")
     try:
         result = adapter.normalize(request)
     except (DatasetBuildError, FrozenExposureUnavailableError, TypeError, ImportError, OSError) as exc:
@@ -384,10 +387,10 @@ def expose(row, row_index, adapter, protocol, train_sha):
         raise CohortError("Phase4A mutated the exposure request")
     if not isinstance(result, ExposureResult):
         raise CohortError("invalid Phase4A exposure result")
-    expected_units = saved["candidate_units"][:maximum]
     if (result.source_candidate_count != len(raw)
             or result.truncated_count != max(0, len(raw) - maximum)
-            or result.dropped_unsupported_count != 0):
+            or result.dropped_unsupported_count != 0
+            or len(result.candidate_units) != min(len(raw), maximum)):
         raise CohortError("Phase4A candidate deletion/accounting drift")
     units = []
     for unit in result.candidate_units:
@@ -396,16 +399,21 @@ def expose(row, row_index, adapter, protocol, train_sha):
         if not all(isinstance(unit[k], str) and unit[k].strip() for k in CANDIDATE_FIELDS):
             raise CohortError("returned candidate core fields must be nonblank strings")
         units.append(unit)
-    # Compare only the frozen core, position by position. Enrichment values have
-    # no scientific role and no established structural type contract here.
-    if len(units) != len(expected_units) or any(
-            unit[k] != expected[k]
-            for unit, expected in zip(units, expected_units) for k in CANDIDATE_FIELDS):
-        raise CohortError("Phase4A candidate deletion/mutation/order drift")
-    if len({u["unit_id"] for u in units}) != len(units):
-        raise CohortError("duplicate candidate IDs")
+    returned_ids = {unit["unit_id"] for unit in units}
+    if len(returned_ids) != len(units):
+        raise CohortError("duplicate candidate IDs in Phase4A return")
+    if not returned_ids.issubset(raw_by_id):
+        raise CohortError("Phase4A unknown returned candidate ID")
+    if len(raw) <= maximum and returned_ids != set(raw_by_id):
+        raise CohortError("Phase4A non-truncated candidate membership drift")
+    # Phase4A orders before truncating. Validate identity/content against the
+    # complete raw pool, never a positional prefix or a reconstructed ordering.
+    if any(unit[k] != raw_by_id[unit["unit_id"]][k]
+           for unit in units for k in CANDIDATE_FIELDS):
+        raise CohortError("Phase4A same-ID core mutation")
     # Project fields only after every schema/preservation check; never filter
-    # units. The existing inventory applies whole-case pair eligibility later.
+    # or reorder units. The authoritative returned order is frozen downstream;
+    # the existing inventory applies whole-case pair eligibility later.
     return Case(dataset, canonical, original, row_index, saved["claim"],
                 tuple(tuple(u[k] for k in CANDIDATE_FIELDS) for u in units))
 

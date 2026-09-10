@@ -320,16 +320,14 @@ class PureContracts(unittest.TestCase):
             with self.subTest(top=top), self.assertRaises(sc.CohortError):
                 sl.expose(row, 0, FixtureAdapter(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
 
-    def test_candidate_deletion_mutation_reorder_and_fields_rejected(self):
-        for mode in ("delete", "text", "order", "id", "score", "label", "input", "count"):
+    def test_candidate_deletion_mutation_and_fields_rejected(self):
+        for mode in ("delete", "text", "id", "score", "label", "input", "count"):
             class BadAdapter(FixtureAdapter):
                 def normalize(self, request):
                     result = super().normalize(request)
                     units = list(result.candidate_units)
                     if mode == "delete":
                         units.pop()
-                    elif mode == "order":
-                        units.reverse()
                     elif mode == "input":
                         request["claim"] = "mutated"
                     elif mode == "count":
@@ -1211,7 +1209,7 @@ class PublicationCompatibilityTests(unittest.TestCase):
             results.join_thread()
 
     def test_revision_only_scientific_constants_and_salts_unchanged(self):
-        self.assertEqual("step2.6r-3c2a-r4-v1", sc.IMPLEMENTATION_REVISION)
+        self.assertEqual("step2.6r-3c2a-r5-v1", sc.IMPLEMENTATION_REVISION)
         self.assertEqual({"A": "step2.6r-3c2a-reviewer-a-v1", "B": "step2.6r-3c2a-reviewer-b-v1"}, sc.REVIEWER_SALTS)
         protocol = frozen.load_preregistration()
         self.assertEqual("step2.6r-3c1-v1", protocol["implementation_revision"])
@@ -1856,7 +1854,7 @@ class ExposureEligibilityBoundaryTests(unittest.TestCase):
         self.assertEqual(24, rows[0]["exposed_candidate_count"])
         self.assertEqual(1, counts["exposed_unsupported_unit_count"])
 
-    def test_custom_reordering_to_hide_unsupported_unit_rejected(self):
+    def test_authoritative_truncated_membership_may_differ_from_raw_prefix(self):
         self.f.rows[0]["candidate_units"] = source_row(ident="synthetic-0000", count=27)["candidate_units"]
         self.unsupported()
         row = self.f.rows[0]
@@ -1864,8 +1862,9 @@ class ExposureEligibilityBoundaryTests(unittest.TestCase):
             def normalize(self, request):
                 result = super().normalize(request)
                 return replace(result, candidate_units=tuple(copy.deepcopy(request["candidate_units"][1:25])))
-        with self.assertRaisesRegex(sc.CohortError, "order drift"):
-            sl.expose(row, 0, Reordered(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+        case = sl.expose(row, 0, Reordered(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+        self.assertEqual(row["candidate_units"][1:25],
+                         [dict(zip(sc.CANDIDATE_FIELDS, unit)) for unit in case.candidates])
 
     def test_adapter_silent_unsupported_deletion_still_fails_closed(self):
         self.unsupported()
@@ -1883,7 +1882,7 @@ class ExposureEligibilityBoundaryTests(unittest.TestCase):
                 result = super().normalize(request)
                 result.candidate_units[0]["unit_type"] = "ocr"
                 return result
-        with self.assertRaisesRegex(sc.CohortError, "deletion/mutation/order"):
+        with self.assertRaisesRegex(sc.CohortError, "same-ID core mutation"):
             sl.expose(self.f.rows[0], 0, Coerced(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
 
     def test_nonzero_dropped_unsupported_count_still_fails_closed(self):
@@ -2130,7 +2129,7 @@ class AuthoritativeReturnSchemaTests(unittest.TestCase):
                     units[0][field] += "changed"
                     return units
                 with self.subTest(enriched=metadata is not None, field=field), \
-                        self.assertRaisesRegex(sc.CohortError, "deletion/mutation/order drift"):
+                        self.assertRaisesRegex(sc.CohortError, "unknown returned candidate ID|same-ID core mutation"):
                     self.expose(self.adapter(metadata, mutated))
 
     def test_core_values_must_remain_nonblank_strings(self):
@@ -2143,9 +2142,10 @@ class AuthoritativeReturnSchemaTests(unittest.TestCase):
                         self.assertRaisesRegex(sc.CohortError, "nonblank strings"):
                     self.expose(self.adapter(self.ENRICHMENT, malformed))
 
-    def test_candidate_reordering_rejected(self):
-        with self.assertRaisesRegex(sc.CohortError, "order drift"):
-            self.expose(self.adapter(self.ENRICHMENT, lambda units: list(reversed(units))))
+    def test_enriched_authoritative_candidate_permutation_preserved(self):
+        case = self.expose(self.adapter(self.ENRICHMENT, lambda units: list(reversed(units))))
+        self.assertEqual(list(reversed(self.row["candidate_units"])),
+                         [dict(zip(sc.CANDIDATE_FIELDS, unit)) for unit in case.candidates])
 
     def test_candidate_deletion_rejected(self):
         with self.assertRaises(sc.CohortError):
@@ -2163,7 +2163,7 @@ class AuthoritativeReturnSchemaTests(unittest.TestCase):
             self.expose(self.adapter(self.ENRICHMENT, invalid_last))
         constructor.assert_not_called()
 
-    def test_enriched_truncation_is_exact_raw_prefix_for_zero_through_over_limit(self):
+    def test_enriched_prefix_returning_fixture_preserved_for_zero_through_over_limit(self):
         for count in (0, 5, 6, 24, 27):
             row = source_row(count=count)
             with self.subTest(count=count):
@@ -2273,7 +2273,7 @@ class AuthoritativeReturnSchemaTests(unittest.TestCase):
                 self.assertNotIn(key, text)
             self.assertNotIn("R4_METADATA_ONLY", text)
 
-    def test_r3_preflight_cannot_authorize_r4_build_and_is_preserved(self):
+    def test_r3_preflight_cannot_authorize_current_build_and_is_preserved(self):
         fixture = self.fixture()
         r3_revision = "step2.6r-3c2a-r3-v1"
         with fixture.patches():
@@ -2310,21 +2310,384 @@ class AuthoritativeReturnSchemaTests(unittest.TestCase):
             loader.assert_not_called()
         self.assertFalse(fixture.build_dir.exists())
 
-    def test_new_r4_sibling_preflight_preserves_historical_r3_artifacts(self):
+    def test_new_current_sibling_preflight_preserves_historical_r3_artifacts(self):
         fixture = self.fixture()
         with fixture.patches():
             with patch.object(cb, "IMPLEMENTATION_REVISION", "step2.6r-3c2a-r3-v1"):
                 cb.preflight(fixture.inputs, fixture.preflight)
             before = {path.name: path.read_bytes() for path in fixture.preflight.iterdir()}
-            r4_path = fixture.outputs / "00b_cohort_source_preflight_r4"
-            report = cb.preflight(fixture.inputs, r4_path)
-            self.assertEqual("step2.6r-3c2a-r4-v1", report["implementation_revision"])
+            current_path = fixture.outputs / "00c_cohort_source_preflight_r5"
+            report = cb.preflight(fixture.inputs, current_path)
+            self.assertEqual("step2.6r-3c2a-r5-v1", report["implementation_revision"])
             with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root",
                               return_value=self.adapter(self.ENRICHMENT)):
                 built = cb.build(fixture.inputs, fixture.build_dir,
-                                 r4_path / "cohort_source_preflight_report.json")
+                                 current_path / "cohort_source_preflight_report.json")
         self.assertEqual(cb.PASS_STATUS, built["status"])
         self.assertEqual(before, {path.name: path.read_bytes() for path in fixture.preflight.iterdir()})
+
+
+class AuthoritativeOrderingBoundaryTests(unittest.TestCase):
+    """R5 synthetic return sequences; no replica of the upstream ordering rule."""
+
+    ENRICHMENT = AuthoritativeReturnSchemaTests.ENRICHMENT
+    setUp = AuthoritativeReturnSchemaTests.setUp
+    fixture = AuthoritativeReturnSchemaTests.fixture
+    expose = AuthoritativeReturnSchemaTests.expose
+    PERMUTATION = (3, 0, 5, 1, 4, 2)
+    SPECIAL_ORDER = (24, 0, 25, 1, 26, 2, 27, 3, 28, 4, *range(5, 19))
+
+    def adapter(self, metadata=None, positions=None, transform=None):
+        def normalize_request(request, *, config, drop_unsupported_visual):
+            self.assertIs(False, drop_unsupported_visual)
+            raw = request["candidate_units"]
+            indexes = (range(min(len(raw), config["maximum_units_per_sample"]))
+                       if positions is None else positions)
+            if callable(indexes):
+                indexes = indexes(len(raw))
+            units = [copy.deepcopy(raw[i]) for i in indexes]
+            for unit in units:
+                if metadata is not None:
+                    unit.update(copy.deepcopy(metadata))
+            if transform is not None:
+                units = transform(units)
+            return {"candidate_units": units}
+        return sl.Phase4ANormalizationExposureAdapter(
+            normalize_request, {"maximum_units_per_sample": 24})
+
+    def special_row(self):
+        row = source_row(dataset="TRUE-3MFact", ident="synthetic-r5-36", count=36)
+        for unit in row["candidate_units"]:
+            unit.update(unit_type="ocr", modality="ocr")
+        for unit in row["candidate_units"][24:29]:
+            unit["unit_type"] = "review_certified_visual_unit"
+        return row
+
+    def inventory_one(self, row, adapter):
+        with patch.object(sl, "read_identity_rows", return_value=[(0, json.dumps(row), row)]), \
+                patch.object(sc, "EXPECTED_SOURCE_COUNTS", {row["dataset"]: 1}):
+            return sl.inventory(None, SimpleNamespace(ordered=()), self.protocol, adapter)
+
+    def assert_sequence(self, case, row, positions):
+        expected = [row["candidate_units"][i] for i in positions]
+        self.assertEqual(expected, [dict(zip(sc.CANDIDATE_FIELDS, unit)) for unit in case.candidates])
+        self.assertEqual([dict(unit, original_candidate_position=i) for i, unit in enumerate(expected)],
+                         case.units())
+        self.assertEqual(row["claim"], case.claim)
+
+    def test_exact_raw_order_passes_core_and_enriched(self):
+        for metadata in (None, self.ENRICHMENT):
+            with self.subTest(enriched=metadata is not None):
+                self.assert_sequence(self.expose(self.adapter(metadata)), self.row, range(6))
+
+    def test_nontruncated_permutation_preserves_full_membership_and_returned_order(self):
+        for count in (0, 1, 6, 24):
+            row = source_row(count=count)
+            positions = tuple(range(1, count, 2)) + tuple(range(0, count, 2))
+            for metadata in (None, self.ENRICHMENT):
+                with self.subTest(count=count, enriched=metadata is not None):
+                    case = self.expose(self.adapter(metadata, positions), row)
+                    self.assert_sequence(case, row, positions)
+                    self.assertEqual({unit["unit_id"] for unit in row["candidate_units"]},
+                                     {unit[0] for unit in case.candidates})
+
+    def test_same_id_core_content_is_exact_after_permutation(self):
+        pairs = (("evidence", "text"), ("title_span", "text"), ("transcript", "text"), ("ocr", "ocr"))
+        for index, unit in enumerate(self.row["candidate_units"]):
+            unit.update(unit_type=pairs[index % 4][0], modality=pairs[index % 4][1],
+                        text=f"  e\u0301 雨 {index}\n\t")
+        case = self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION))
+        self.assert_sequence(case, self.row, self.PERMUTATION)
+
+    def test_positions_and_manifest_follow_exposed_order_not_raw_order(self):
+        case = self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION))
+        selection = sc.Selection(case, "repair_train", "a" * 64, "b" * 64)
+        expected = [self.row["candidate_units"][i]["unit_id"] for i in self.PERMUTATION]
+        self.assertEqual(expected, selection.manifest()["candidate_unit_ids_in_original_order"])
+        request = selection.request()
+        self.assertEqual(expected, [unit["unit_id"] for unit in request["candidate_units"]])
+        self.assertEqual(list(range(6)), [unit["original_candidate_position"] for unit in request["candidate_units"]])
+
+    def test_authoritative_adapter_called_once_without_mutating_input_or_return(self):
+        adapter = self.adapter(self.ENRICHMENT, self.PERMUTATION)
+        observed = {}
+        normalize = adapter.normalize
+        def capture(request):
+            self.assertEqual(self.row["candidate_units"], request["candidate_units"])
+            observed["input"] = copy.deepcopy(request)
+            result = normalize(request)
+            observed["result"] = result
+            observed["saved_result"] = copy.deepcopy(result)
+            return result
+        before = copy.deepcopy(self.row)
+        with patch.object(adapter, "normalize", side_effect=capture) as call:
+            self.expose(adapter)
+        call.assert_called_once()
+        self.assertEqual(observed["input"], call.call_args.args[0])
+        self.assertEqual(observed["saved_result"], observed["result"])
+        self.assertEqual(before, self.row)
+
+    def test_36_to_24_five_outside_prefix_enter_without_same_id_mutation(self):
+        row = self.special_row()
+        for metadata in (None, self.ENRICHMENT):
+            with self.subTest(enriched=metadata is not None):
+                adapter = self.adapter(metadata, self.SPECIAL_ORDER)
+                result = adapter.normalize(row)
+                self.assertEqual((36, 12, 0), (result.source_candidate_count,
+                                               result.truncated_count, result.dropped_unsupported_count))
+                case = self.expose(adapter, row)
+                self.assert_sequence(case, row, self.SPECIAL_ORDER)
+                self.assertEqual(24, len(case.candidates))
+                returned = {unit[0] for unit in case.candidates}
+                prefix = {unit["unit_id"] for unit in row["candidate_units"][:24]}
+                self.assertEqual(5, len(returned - prefix))
+                self.assertEqual(5, len(prefix - returned))
+                self.assertTrue(returned.issubset({unit["unit_id"] for unit in row["candidate_units"]}))
+
+    def test_36_to_24_unsupported_returned_pairs_make_whole_case_ineligible(self):
+        row = self.special_row()
+        adapter = self.adapter(self.ENRICHMENT, self.SPECIAL_ORDER)
+        self.assert_sequence(self.expose(adapter, row), row, self.SPECIAL_ORDER)
+        rows, eligible, counts = self.inventory_one(row, adapter)
+        self.assertEqual([], eligible)
+        item = rows[0]
+        self.assertFalse(item["eligible"])
+        self.assertFalse(item["excluded"])
+        self.assertIsNone(item["exclusion_reason"])
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", item["exposure_status"])
+        self.assertEqual("EXPOSED_PAIR_OUTSIDE_FROZEN_ALLOWED_PAIRS", item["ineligibility_reason"])
+        self.assertEqual(24, item["exposed_candidate_count"])
+        self.assertEqual(0, counts["phase4a_exposure_failure_count"])
+        self.assertEqual(1, counts["exposed_candidate_contract_ineligible_case_count"])
+        self.assertEqual([{"unit_type": "review_certified_visual_unit", "modality": "ocr", "count": 5}],
+                         counts["exposed_unsupported_pair_counts"])
+
+    def test_unknown_returned_id_in_nontruncated_case_fails(self):
+        def unknown(units):
+            units[-1]["unit_id"] = "synthetic-unknown"
+            return units
+        with self.assertRaisesRegex(sc.CohortError, "unknown returned candidate ID"):
+            self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION, unknown))
+
+    def test_unknown_returned_id_in_truncated_subset_fails(self):
+        def unknown(units):
+            units[0]["unit_id"] = "synthetic-outside-raw-pool"
+            return units
+        with self.assertRaisesRegex(sc.CohortError, "unknown returned candidate ID"):
+            self.expose(self.adapter(self.ENRICHMENT, self.SPECIAL_ORDER, unknown), self.special_row())
+
+    def test_duplicate_raw_id_fails_before_adapter_invocation(self):
+        self.row["candidate_units"][1]["unit_id"] = self.row["candidate_units"][0]["unit_id"]
+        adapter = Mock()
+        with self.assertRaisesRegex(sc.CohortError, "duplicate candidate IDs in raw source"):
+            self.expose(adapter)
+        adapter.normalize.assert_not_called()
+
+    def test_duplicate_raw_id_outside_returned_subset_still_fails(self):
+        row = self.special_row()
+        row["candidate_units"][35]["unit_id"] = row["candidate_units"][34]["unit_id"]
+        with self.assertRaisesRegex(sc.CohortError, "duplicate candidate IDs in raw source"):
+            self.expose(self.adapter(self.ENRICHMENT, self.SPECIAL_ORDER), row)
+
+    def test_duplicate_returned_id_fails_for_nontruncated_and_truncated_cases(self):
+        def duplicate(units):
+            units[-1] = copy.deepcopy(units[0])
+            return units
+        for row, positions in ((self.row, self.PERMUTATION), (self.special_row(), self.SPECIAL_ORDER)):
+            with self.subTest(count=len(row["candidate_units"])), \
+                    self.assertRaisesRegex(sc.CohortError, "duplicate candidate IDs in Phase4A return"):
+                self.expose(self.adapter(self.ENRICHMENT, positions, duplicate), row)
+
+    def assert_same_id_mutation_rejected(self, field, value):
+        def mutate(units):
+            units[0][field] = value
+            return units
+        with self.assertRaisesRegex(sc.CohortError, "same-ID core mutation"):
+            self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION, mutate))
+
+    def test_same_id_unit_type_mutation_fails(self):
+        self.assert_same_id_mutation_rejected("unit_type", "ocr")
+
+    def test_same_id_modality_mutation_fails(self):
+        self.assert_same_id_mutation_rejected("modality", "ocr")
+
+    def test_same_id_text_mutation_fails(self):
+        self.assert_same_id_mutation_rejected("text", "synthetic changed content")
+
+    def test_whitespace_or_unicode_normalization_is_a_same_id_mutation(self):
+        self.row["candidate_units"][3]["text"] = "  e\u0301 雨\n"
+        for changed in ("e\u0301 雨", "  \u00e9 雨\n"):
+            with self.subTest(changed=changed):
+                self.assert_same_id_mutation_rejected("text", changed)
+
+    def test_reordered_malformed_or_partial_schema_still_fails(self):
+        for missing in (*sc.CANDIDATE_FIELDS, *sc.PHASE4A_ENRICHMENT_FIELDS):
+            def malformed(units):
+                del units[-1][missing]
+                return units
+            with self.subTest(missing=missing), self.assertRaisesRegex(sc.CohortError, "schema drift"):
+                self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION, malformed))
+
+    def test_reordered_unknown_model_label_score_fields_still_fail(self):
+        for key in ("selection_score", "veracity_logits", "label", "prediction", "ranking",
+                    "arbitrary_unknown_metadata"):
+            def unknown(units):
+                units[-1][key] = "SYNTHETIC_FORBIDDEN_VALUE"
+                return units
+            with self.subTest(key=key), self.assertRaisesRegex(sc.CohortError, "forbidden field"):
+                self.expose(self.adapter(self.ENRICHMENT, self.PERMUTATION, unknown))
+
+    def assert_bad_accounting(self, field, value, row=None):
+        row = self.row if row is None else row
+        result = self.adapter(self.ENRICHMENT).normalize(row)
+        # Exercise the caller's checks independently of ExposureResult's own
+        # constructor checks, simulating a corrupted interface result.
+        object.__setattr__(result, field, value)
+        with self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            self.expose(SimpleNamespace(normalize=lambda request: result), row)
+
+    def test_wrong_source_candidate_count_fails(self):
+        self.assert_bad_accounting("source_candidate_count", 7)
+
+    def test_wrong_truncated_count_fails(self):
+        self.assert_bad_accounting("truncated_count", 11, self.special_row())
+
+    def test_nonzero_dropped_unsupported_count_fails(self):
+        self.assert_bad_accounting("dropped_unsupported_count", 1)
+
+    def test_returned_count_below_expected_without_valueerror_fails(self):
+        for row in (self.row, self.special_row()):
+            result = self.adapter(self.ENRICHMENT).normalize(row)
+            with self.subTest(raw_count=len(row["candidate_units"])):
+                self.assert_bad_accounting("candidate_units", result.candidate_units[:-1], row)
+
+    def test_returned_count_above_maximum_fails(self):
+        row = self.special_row()
+        self.assert_bad_accounting("candidate_units", tuple(copy.deepcopy(row["candidate_units"][:25])), row)
+
+    def test_nontruncated_incomplete_membership_cannot_hide_behind_valid_drop_accounting(self):
+        result = self.adapter(self.ENRICHMENT, self.PERMUTATION).normalize(self.row)
+        incomplete = replace(result, candidate_units=result.candidate_units[:-1], dropped_unsupported_count=1)
+        with self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            self.expose(SimpleNamespace(normalize=lambda request: incomplete))
+
+    def test_request_mutation_still_fails_on_success_or_valueerror(self):
+        for fail in (False, True):
+            def mutate(request):
+                result = self.adapter(self.ENRICHMENT, self.PERMUTATION).normalize(request)
+                request["candidate_units"].reverse()
+                if fail:
+                    raise ValueError("synthetic normalization failure")
+                return result
+            with self.subTest(fail=fail), self.assertRaisesRegex(sc.CohortError, "mutated"):
+                self.expose(SimpleNamespace(normalize=mutate))
+
+    def test_plain_phase4a_valueerror_remains_exposure_failure(self):
+        adapter = Mock()
+        adapter.normalize.side_effect = ValueError("synthetic normalization failure")
+        self.assertIsNone(self.expose(adapter))
+
+    def test_enrichment_values_do_not_affect_reordered_eligibility_sampling_or_split(self):
+        fixture = self.fixture()
+        fixture.rows.append(self.special_row())
+        fixture.refresh_source()
+        fixture.save_old()
+        positions = lambda count: self.SPECIAL_ORDER if count == 36 else self.PERMUTATION
+        variants = (self.ENRICHMENT, {"evidence_refs": None, "frame_ids": [91, 19],
+                                     "phase1_source": "different-source", "source_snippet_type": "different-type"})
+        snapshots = []
+        with fixture.patches():
+            protocol, source, exclusions, *_ = cb.prepare(fixture.inputs)
+            for metadata in variants:
+                rows, eligible, counts = sl.inventory(source, exclusions, protocol, self.adapter(metadata, positions))
+                selected = cb.select(eligible, exclusions, protocol)
+                self.assertIsNotNone(selected)
+                self.assertEqual(120, len(selected))
+                self.assertEqual({"GroundLie360": 60, "TRUE-3MFact": 60},
+                                 dict(Counter(item.case.dataset for item in selected)))
+                self.assertEqual({"repair_train": 96, "repair_dev": 24},
+                                 dict(Counter(item.repair_split for item in selected)))
+                self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", rows[-1]["exposure_status"])
+                self.assertTrue(all(len(item.sampling_hash) == len(item.split_hash) == 64 for item in selected))
+                snapshots.append((rows, eligible, counts, selected, blind.packets(selected)))
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_reordered_synthetic_build_preserves_positions_blinding_and_no_metadata_leakage(self):
+        fixture = self.fixture()
+        with fixture.patches():
+            cb.preflight(fixture.inputs, fixture.preflight)
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root",
+                              return_value=self.adapter(self.ENRICHMENT, self.PERMUTATION)):
+                report = cb.build(fixture.inputs, fixture.build_dir,
+                                  fixture.preflight / "cohort_source_preflight_report.json")
+        self.assertEqual(cb.PASS_STATUS, report["status"])
+        requests = [json.loads(line) for line in
+                    (fixture.build_dir / "repair_development_requests.jsonl").read_text().splitlines()]
+        self.assertEqual(120, len(requests))
+        raw = {(row["dataset"], row["case_id"]): row for row in fixture.rows}
+        exposed = {}
+        for request in requests:
+            row = raw[request["dataset"], request["original_case_id"]]
+            expected = [dict(row["candidate_units"][position], original_candidate_position=i)
+                        for i, position in enumerate(self.PERMUTATION)]
+            self.assertEqual(expected, request["candidate_units"])
+            exposed[request["canonical_case_id"]] = expected
+        mapping = ar.read_json(fixture.build_dir / "review_mapping_private.json")
+        self.assertEqual(sc.REVIEWER_SALTS, mapping["reviewer_salts"])
+        for reviewer in ("A", "B"):
+            with (fixture.build_dir / f"reviewer_{reviewer}_template.csv").open(newline="") as stream:
+                reader = csv.DictReader(stream)
+                self.assertEqual(sc.PUBLIC_COLUMNS, tuple(reader.fieldnames))
+                public = list(reader)
+            private = mapping[f"reviewer_{reviewer}"]
+            self.assertEqual(720, len(public))
+            self.assertEqual(len(public), len(private))
+            expected_case_order = sorted(exposed, key=lambda ident: (blind.key(reviewer, "case-order", ident), ident))
+            self.assertEqual(expected_case_order, list(dict.fromkeys(item["canonical_case_id"] for item in private)))
+            for visible, hidden in zip(public, private):
+                unit = exposed[hidden["canonical_case_id"]][hidden["original_candidate_position"]]
+                self.assertEqual(unit["unit_id"], hidden["unit_id"])
+                self.assertEqual(unit["text"], visible["candidate_text"])
+                self.assertEqual(hidden["review_unit_id"], visible["review_unit_id"])
+                self.assertTrue(all(visible[key] == "" for key in sc.PUBLIC_COLUMNS[-3:]))
+            for ident in exposed:
+                expected_units = sorted(exposed[ident], key=lambda unit:
+                                        (blind.key(reviewer, "unit-order", ident, unit["unit_id"]), unit["unit_id"]))
+                self.assertEqual([unit["unit_id"] for unit in expected_units],
+                                 [item["unit_id"] for item in private if item["canonical_case_id"] == ident])
+        for name in ("repair_development_requests.jsonl", "reviewer_A_template.csv",
+                     "reviewer_B_template.csv", "review_mapping_private.json"):
+            text = (fixture.build_dir / name).read_text()
+            for key in self.ENRICHMENT:
+                self.assertNotIn(key, text)
+            self.assertNotIn("R4_METADATA_ONLY", text)
+
+    def test_r3_and_r4_preflights_rejected_and_preserved_with_new_r5_sibling(self):
+        fixture = self.fixture()
+        historical = {}
+        with fixture.patches():
+            for stage in ("r3", "r4"):
+                directory = fixture.outputs / ("historical-preflight-" + stage)
+                revision = f"step2.6r-3c2a-{stage}-v1"
+                with patch.object(cb, "IMPLEMENTATION_REVISION", revision):
+                    cb.preflight(fixture.inputs, directory)
+                historical[directory] = {path.name: path.read_bytes() for path in directory.iterdir()}
+                with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root") as loader, \
+                        self.assertRaisesRegex(sc.CohortError, "not byte-consistent"):
+                    cb.build(fixture.inputs, fixture.build_dir,
+                             directory / "cohort_source_preflight_report.json")
+                loader.assert_not_called()
+                self.assertFalse(fixture.build_dir.exists())
+            r5_path = fixture.outputs / "00c_cohort_source_preflight_r5"
+            report = cb.preflight(fixture.inputs, r5_path)
+            self.assertEqual("step2.6r-3c2a-r5-v1", report["implementation_revision"])
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root",
+                              return_value=self.adapter(self.ENRICHMENT, self.PERMUTATION)):
+                built = cb.build(fixture.inputs, fixture.build_dir,
+                                 r5_path / "cohort_source_preflight_report.json")
+        self.assertEqual(cb.PASS_STATUS, built["status"])
+        for directory, before in historical.items():
+            self.assertEqual(before, {path.name: path.read_bytes() for path in directory.iterdir()})
 
 
 if __name__ == "__main__":

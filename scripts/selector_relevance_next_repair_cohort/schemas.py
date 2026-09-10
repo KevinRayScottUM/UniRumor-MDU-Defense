@@ -14,7 +14,7 @@ from scripts.selector_relevance_independent_audit.schemas import (
     TARGET_DATASET_COUNTS as REVEALED_AUDIT_DATASET_COUNTS,
 )
 
-IMPLEMENTATION_REVISION = "step2.6r-3c2a-r4-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3c2a-r5-v1"
 CLOSURE_HASHES = {
     "step3b3_scientific_summary.json":
         "6ed3401614f68e58ae0efb3a1671f9f2f7b6b8b653f2100660199ee72938fdf0",
@@ -72,10 +72,11 @@ class Case:
     original_case_id: str
     source_row_index: int
     claim: str
-    # Candidate tuples prevent accidental mutation between exposure and selection.
+    # Immutable candidates in authoritative Phase4A returned order.
     candidates: Tuple[Tuple[str, str, str, str], ...]
 
     def units(self):
+        # Positions refer to the exposed sequence, not raw Train positions.
         return [dict(zip(CANDIDATE_FIELDS, unit), original_candidate_position=index)
                 for index, unit in enumerate(self.candidates)]
 

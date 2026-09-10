@@ -1,6 +1,6 @@
 # Step 2.6R-3C2-A: score-blind repair-development cohort
 
-Implementation: `step2.6r-3c2a-r4-v1`. Repair family:
+Implementation: `step2.6r-3c2a-r5-v1`. Repair family:
 `G1-RelevanceSelector-NaturalPairwise-v1`.
 
 This package constructs future repair-development data. It does not train,
@@ -182,12 +182,14 @@ raw request, with original unit IDs, types, modalities, text and order, is passe
 to the unchanged authoritative adapter during build. The existing strict visual
 policy invocation remains unchanged; no dropping mode is introduced.
 
-Normalization must preserve the original ordered four-core-field prefix up to the
-frozen maximum 24 exactly, with correct source/truncation counts and zero dropped
-unsupported units. Deletion, insertion, reordering, core mutation, unknown returned
-fields, duplicate exposed IDs or runtime/interface drift remain global integrity
-failures (exit 2). A plain normalization `ValueError` for an otherwise valid request remains an exposure
-failure. These checks finish before candidate eligibility is assessed.
+Normalization must preserve same-ID core content from the complete raw pool,
+with exact source/returned/truncation counts and zero dropped unsupported units.
+The authoritative returned sequence is the exposed order, including ordering
+before truncation. Unknown IDs, same-ID core mutations, unknown returned fields,
+duplicate raw/returned IDs, count drift and runtime/interface drift remain global
+integrity failures (exit 2). A plain normalization `ValueError` for an otherwise
+valid request remains an exposure failure. These checks finish before candidate
+eligibility is assessed.
 
 ### R4 authoritative return-schema compatibility
 
@@ -214,12 +216,12 @@ any unknown key fail closed. This rejects all additional model, label, score and
 ranking fields, including `selection_score`, `veracity_logits`, `label`,
 `prediction` and `arbitrary_unknown_metadata`; there is no unrestricted projection
 or extra-key bypass. Each core value must be a nonblank string and equal the
-corresponding raw-prefix value exactly, including whitespace and Unicode.
+raw value for the same unit ID exactly, including whitespace and Unicode.
 
-After exact schema, core structure, source/truncation/drop accounting, ordered
-core equality and duplicate-ID validation, each returned object becomes the same
+After exact schema, core structure, source/returned/truncation/drop accounting,
+membership, same-ID core equality and duplicate-ID validation, each returned object becomes the same
 one four-field candidate in `Case.candidates`. This is field projection, never
-candidate filtering. Candidate count and order are unchanged. The existing R3
+candidate filtering. Authoritative returned count and order are unchanged. The existing R3
 whole-case pair check runs only after this validated projection. An enriched
 `review_certified_visual_unit/ocr` object passes schema validation but makes its
 whole case `INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT`, with `eligible=false` and
@@ -236,6 +238,65 @@ schema still adds `original_candidate_position` to each four-field candidate.
 R1 publication, R2 historical Train provenance and R3 scientific eligibility
 semantics remain unchanged, as do frozen 3C1, exclusions, salts and Frozen G1.
 
+### R5 authoritative returned order and truncation boundary
+
+R4 repaired the eight-field representation but still compared each returned
+position with `raw[:maximum]` at the same position. The supplied score-free,
+label-free, model-free DICC by-ID diagnosis found 709 exact-prefix sequences,
+1,821 permutations within the raw prefix and one reorder-before-truncation case
+among 2,531 unexcluded cases. Unknown returned IDs, same-ID core mutations and
+duplicate raw/returned ID cases were all zero. These supplied diagnostic results
+are not locally rerun observations. The position-wise mismatches were reorderings,
+not changes to candidate identity or content.
+
+The supplied authoritative source calls `ordered_units(units, maximum_units)`
+before returning that ordered sequence and reports the difference in lengths as
+truncation. R5 continues to invoke the existing adapter exactly once with its
+unchanged strict visual policy. It does not reproduce, approximate or replace
+the upstream ordering algorithm. The request must remain unmutated on success
+or failure.
+
+R5 builds an ID lookup from the complete raw request and rejects duplicate raw
+IDs before adapter invocation, including duplicates outside the returned subset.
+After the unchanged R4 return-schema and nonblank-core checks, returned IDs must
+be unique and belong to that raw pool. All four core fields are compared against
+the raw candidate with the same `unit_id`. Any actual mutation fails closed;
+there is no text, whitespace, Unicode, type, modality or ID normalization.
+
+For raw count `n` and the frozen maximum `m=24`, all cases require:
+
+```text
+source_candidate_count == n
+returned_candidate_count == min(n, m)
+truncated_count == max(0, n - m)
+dropped_unsupported_count == 0
+```
+
+For `n <= m`, returned IDs must equal the complete raw ID set, with exactly `n`
+unique returned candidates. Any authoritative permutation is preserved. For
+`n > m`, exactly `m` unique returned IDs must be a subset of the complete raw ID
+set, with exactly `n-m` truncated candidates. Membership is not required to equal
+`raw[:24]`. The existing authoritative adapter determines that subset and order;
+the repair package neither chooses replacements nor sorts it again.
+
+Frozen 3C1's `candidate_exposure` remains the same authoritative Phase4A
+normalization. Its unchanged `candidate_order` preservation applies to this
+final exposed sequence. `Case.candidates`, requests and manifest arrays preserve
+the returned sequence exactly after projection. `original_candidate_position`
+is the zero-based position in this authoritative exposed sequence, not the raw
+Train position. The unchanged reviewer blinding code uses its existing salts and
+ordering rules; private mappings retain the authoritative exposed positions.
+
+The synthetic 36-to-24 regression returns five candidates from outside the raw
+prefix while five prefix OCR candidates fall outside the returned subset. Every
+returned ID remains in the original 36, every same-ID core value is unchanged,
+and accounting is exactly 36/24/12/0. This passes preservation. The five returned
+`review_certified_visual_unit/ocr` candidates then make the whole case ineligible
+under the unchanged R3 rule below. No candidate is dropped, renamed, replaced
+with a missing prefix OCR unit, or restored from `raw[:24]`. No identity exclusion,
+resampling, fallback or visual reintegration is introduced. The test uses a
+synthetic identity; there is no source-case-specific production rule.
+
 Only the FINAL exposed pool is checked against the frozen pairs:
 `evidence/text`, `title_span/text`, `transcript/text`, `ocr/ocr`. If any final pair
 is outside that set, the entire case has `eligible=false`, `excluded=false`,
@@ -248,9 +309,10 @@ Such cases never enter selection, requests, manifests, A/B packets or mappings.
 Only pair-valid cases are then checked against the frozen minimum 6; smaller
 pools have `ineligibility_reason=EXPOSED_CANDIDATE_COUNT_BELOW_MINIMUM`. A pool
 with five allowed units and one unsupported unit is a six-unit contract-ineligible
-case, not a five-unit case. An unsupported raw unit beyond authoritative truncation
-does not invalidate a final pool that contains only allowed pairs. No custom
-reordering or truncation policy is permitted.
+case, not a five-unit case. An unsupported raw unit omitted by authoritative
+ordering/truncation does not invalidate a final pool that contains only allowed
+pairs. Its raw index alone cannot determine whether it survives exposure.
+No custom ordering or truncation policy is permitted in the repair package.
 
 Both eligibility inventory and build report carry score-free/text-free counts:
 
@@ -290,7 +352,7 @@ Private request records contain exactly:
 `development_case_id`, `dataset`, `canonical_case_id`, `original_case_id`,
 `repair_split`, `claim`, `candidate_units`.
 Each candidate contains `unit_id`, `unit_type`, `modality`, `text`,
-`original_candidate_position` (zero-based). Natural claims, candidate text and
+`original_candidate_position` (zero-based in authoritative exposed order). Natural claims, candidate text and
 metadata are retained exactly, including whitespace and Unicode.
 
 The manifest separately locks dataset, canonical/original IDs, split, source row
@@ -424,9 +486,9 @@ Exit codes: **0** valid PASS; **1** atomically frozen feasibility BLOCKED;
 **2** invalid input, integrity, runtime or contract failure. A changed scientific
 contract cannot be bypassed by CLI flags.
 
-## R3 history and required new R4 preflight
+## R3/R4 history and required new R5 preflight
 
-The supplied reviewed DICC commit is
+The supplied historical R3 reviewed DICC commit is
 `82108e59d63e8793c4d296bc0812a664f5aaa79d`. Its R3 source preflight is CLOSED/PASS
 with `NEXT_REPAIR_COHORT_SOURCE_PREFLIGHT_PASS` and frozen-contract verification
 `3C2A_R3_FROZEN_PREFLIGHT_CONTRACT_PASS`. These are supplied historical results,
@@ -437,38 +499,55 @@ real cohort or reviewer packet. This remains an engineering integration event,
 not feasibility BLOCKED, cohort PASS or a selector/relevance result. Do not rerun
 the R3 build or delete, overwrite or relabel its valid historical preflight.
 
-R4 changes the implementation revision and source hashes. The unchanged approval
-logic requires exact current report/source-lock bytes, so an R3 preflight cannot
-authorize an R4 build. Synthetic tests independently cover stale revision and
+The supplied reviewed R4 DICC commit is
+`a82dcea9473e846c161d1e1b8b82da77e4a6832e`. Its regression passed 194 cohort,
+49 protocol, 523 combined selector and 1,057 backend tests, with zero failures
+and one harmless Starlette deprecation warning. R4 real preflight returned
+`NEXT_REPAIR_COHORT_SOURCE_PREFLIGHT_PASS`, exit 0, and remains CLOSED/PASS with:
+
+- `3C2A_R4_PREFLIGHT_ARTIFACT_INTEGRITY_PASS`;
+- `R4_PREFLIGHT_CURRENT_IMPLEMENTATION_APPROVAL_PASS`;
+- `3C2A_R4_FROZEN_PREFLIGHT_CONTRACT_PASS`.
+
+The authorized R4 real build returned `NEXT_REPAIR_COHORT_INVALID`, `CohortError`,
+`Phase4A candidate deletion/mutation/order drift`, exit 2. It published no cohort,
+reviewer packet or scientific selector result. Retain both R3 and R4 build
+attempts as historical engineering integration failures. These are supplied DICC
+results, not results of local execution. Do not rerun either build, or delete,
+overwrite or relabel either historical CLOSED/PASS preflight.
+
+R5 changes the implementation revision and source hashes. The unchanged approval
+logic requires exact current report/source-lock bytes, so neither R3 nor R4
+preflight can authorize an R5 build. Synthetic tests cover old-revision and
 stale implementation-hash rejection before adapter creation, plus preservation
-of the old preflight when a new R4 sibling is published. After a later reviewed
-commit/push and DICC regression, create and review a new R4 preflight. Any later
-separately authorized R4 build must use only that approved R4 report and a new
+of both old preflights when a new R5 sibling is published. After a later reviewed
+commit/push and DICC regression, create and review a new R5 preflight. Any later
+separately authorized R5 build must use only that approved R5 report and a new
 build output directory. No real preflight or build is authorized by this repair.
 
-## Proposed R4 DICC commands — report only
+## Proposed R5 DICC commands — report only
 
 Use Bash and the existing DICC environment after a later reviewed commit/push.
 No DICC command is executed by this implementation task. Retain the canonical
 input variables from the read-only diagnosis; no historical alias is substituted
 for a top-level input. Real construction still requires review of the repaired
-R4 preflight; no real build command is provided here.
+R5 preflight; no real build command is provided here.
 
 ```bash
 ROOT=/scr/user/kevin2002/TensorCat/uni-rumor
 DEFENSE="$ROOT/MDU/Defense_Engineering"
 PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
-PREFLIGHT_R4_DIR="$DEFENSE/outputs/selector_relevance_next_repair_v1/00b_cohort_source_preflight_r4"
-mkdir -p "$DEFENSE/cache/step2_6r_3c2a_r4_validation/tmp"
-export TMPDIR="$DEFENSE/cache/step2_6r_3c2a_r4_validation/tmp"
+PREFLIGHT_R5_DIR="$DEFENSE/outputs/selector_relevance_next_repair_v1/00c_cohort_source_preflight_r5"
+mkdir -p "$DEFENSE/cache/step2_6r_3c2a_r5_validation/tmp"
+export TMPDIR="$DEFENSE/cache/step2_6r_3c2a_r5_validation/tmp"
 ```
 
-**A. Focused synthetic regression**, including all R1/R2 tests:
+**A. Focused synthetic regression**, then complete cohort tests including R1-R4:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m unittest discover -s "$DEFENSE/tests" \
-  -p 'test_selector_relevance_next_repair_cohort.py' -k AuthoritativeReturnSchemaTests -v &&
+  -p 'test_selector_relevance_next_repair_cohort.py' -k AuthoritativeOrderingBoundaryTests -v &&
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m unittest discover -s "$DEFENSE/tests" \
   -p 'test_selector_relevance_next_repair_cohort.py' -v
@@ -485,7 +564,7 @@ export PYTHONPATH="$DEFENSE"
 "$PY" -m unittest discover -s tests -p 'test_selector_relevance_next_repair_protocol.py' -v
 "$PY" -m unittest discover -s tests -p 'test_selector*.py' -v
 "$PY" -m unittest discover -s tests -v
-PYTHONPYCACHEPREFIX="$DEFENSE/cache/step2_6r_3c2a_r4_pycache" "$PY" -m compileall -q app schemas services adapters webapp scripts tests
+PYTHONPYCACHEPREFIX="$DEFENSE/cache/step2_6r_3c2a_r5_pycache" "$PY" -m compileall -q app schemas services adapters webapp scripts tests
 "$PY" -m app.mock_demo
 git diff --check
 git status --short
@@ -497,10 +576,10 @@ previously supplied canonical future-manifest path. Use
 `FUTURE_EXCLUSION_MANIFESTS=()` only if none were supplied. Use the same array and
 canonical input variables for both commands. Missing variables fail closed.
 
-**C. New R4 score-blind source preflight**, only after the later reviewed
+**C. New R5 score-blind source preflight**, only after the later reviewed
 commit/push and A/B pass. The proposed directory must not already exist; retain
-all R3 preflight artifacts. Reuse the same verified canonical input paths and
-complete future-exclusion list from R3:
+all R3 and R4 preflight artifacts. Reuse the same verified canonical input paths
+and complete future-exclusion list from R4:
 
 ```bash
 (
@@ -519,7 +598,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   --step3b3-closure-dir "${CLOSURE_DIR:?Reuse the verified canonical closure directory}" \
   --neutral-dir "${NEUTRAL_DIR:?Reuse the verified canonical neutral directory}" \
   --stage-a-invariance-report "${STAGE_A_REPORT:?Reuse the verified canonical Stage-A report}" \
-  --output-dir "${PREFLIGHT_R4_DIR:?Use the new reviewed non-overwriting R4 preflight path}" \
+  --output-dir "${PREFLIGHT_R5_DIR:?Use the new reviewed non-overwriting R5 preflight path}" \
   "${future_args[@]}"
 )
 ```
@@ -536,7 +615,7 @@ set -e
 declare -p FUTURE_EXCLUSION_MANIFESTS >/dev/null
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   - "${ROOT:?}" "${PHASE4A_CONFIG:?}" "${COHORT_DIR:?}" "${CLOSURE_DIR:?}" \
-  "${NEUTRAL_DIR:?}" "${STAGE_A_REPORT:?}" "${PREFLIGHT_R4_DIR:?}" \
+  "${NEUTRAL_DIR:?}" "${STAGE_A_REPORT:?}" "${PREFLIGHT_R5_DIR:?}" \
   "${FUTURE_EXCLUSION_MANIFESTS[@]}" <<'PY'
 import json
 import sys
@@ -557,7 +636,7 @@ for name in expected:
 _, _, _, ledger, source_lock, exclusions, report = cb.prepare(inputs)
 cb.approve(output / "cohort_source_preflight_report.json", ledger, source_lock, exclusions, report)
 ledger.revalidate()
-print(json.dumps({"status": "R4_PREFLIGHT_ARTIFACT_INTEGRITY_PASS",
+print(json.dumps({"status": "R5_PREFLIGHT_ARTIFACT_INTEGRITY_PASS",
                   "implementation_revision": report["implementation_revision"],
                   "phase4a_exposure_performed": False, "real_cohort_written": False}))
 PY
