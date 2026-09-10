@@ -3,6 +3,7 @@
 import ast
 import copy
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -16,7 +17,7 @@ from scripts.selector_relevance_calibration.dataset_builder import (
 from scripts.selector_relevance_next_repair_protocol.schemas import canonical_identity
 
 from . import schemas
-from .artifacts import read_json, safe_path, unique_object
+from .artifacts import Ledger, read_json, safe_path, unique_object
 from .schemas import CANDIDATE_FIELDS, CohortError, IDENTITY_FIELDS, Case
 
 # Syntax-only skipping: excluded claims/candidates and neutral pseudo-labels are
@@ -184,24 +185,133 @@ def closure(ledger, directory):
             raise CohortError(f"3B3 quarantine authorization mismatch: {field}")
 
 
-def resolve_source(inputs, ledger, old_lock, protocol):
-    root = safe_path(inputs.project_root)
+def _train_path_provenance(root, historical, canonical):
+    """One metadata-only alias exception, never a general safe_path bypass."""
+    root, canonical = safe_path(root), safe_path(canonical)
+    if not canonical.is_relative_to(root):
+        raise CohortError("authoritative Train source escapes project root")
+    if ".." in historical.parts:
+        raise CohortError("historical Train path must not contain parent traversal")
+    alias_component = root / "MDU/outputs"
+    canonical_directory = root / "MDU/Academic_Research/outputs"
+    alias_used = historical != canonical
+    target = None
+    if alias_used:
+        if not historical.is_relative_to(alias_component):
+            raise CohortError("historical Train alias must be project-local MDU/outputs")
+        tail = historical.relative_to(alias_component)
+        if not tail.parts or canonical_directory / tail != canonical:
+            raise CohortError("historical and canonical Train path tails differ")
+        # The canonical path passed strict safe_path above, including its tail's
+        # Formal Validation/Test checks. Check every historical component too;
+        # the single explicitly named alias is the only permitted symlink.
+        current = root
+        for part in historical.relative_to(root).parts:
+            current = current / part
+            if current.is_symlink() and current != alias_component:
+                raise CohortError("unexpected additional Train provenance symlink")
+        if not alias_component.is_symlink():
+            raise CohortError("historical MDU/outputs alias is not the expected symlink")
+        target = os.readlink(alias_component)
+        if target not in {"Academic_Research/outputs", str(canonical_directory)}:
+            raise CohortError("historical MDU/outputs link target is unexpected")
+        if alias_component.resolve(strict=True) != canonical_directory:
+            raise CohortError("historical Train alias target differs from canonical directory")
+    # Resolution is for identity comparison only; callers always read canonical.
+    resolved = historical.resolve(strict=True)
+    if resolved != canonical:
+        raise CohortError("historical Train path resolves to a different frozen source")
+    if not canonical.is_file():
+        raise CohortError("canonical authoritative Train source is missing or not a file")
+    return {
+        "historical_source_path": str(historical),
+        "historical_source_resolved_path": str(resolved),
+        "canonical_authoritative_train_path": str(canonical),
+        "historical_alias_used": alias_used,
+        "historical_alias_component": str(alias_component) if alias_used else None,
+        "historical_alias_link_target": target,
+    }
+
+
+class TrainSourceLedger(Ledger):
+    """Add Train provenance revalidation without changing generic artifact IO."""
+
+    def __init__(self):
+        super().__init__()
+        self._train_paths = None
+        self._train_provenance = None
+
+    def bind_train_provenance(self, root, historical, canonical):
+        observed = _train_path_provenance(root, historical, canonical)
+        if self._train_provenance is not None and observed != self._train_provenance:
+            raise CohortError("authoritative Train provenance changed during resolution")
+        self._train_paths = (root, historical, canonical)
+        self._train_provenance = observed
+
+    def payload(self):
+        result = super().payload()
+        if self._train_provenance is not None:
+            result["authoritative_train_provenance"] = dict(self._train_provenance)
+        return result
+
+    def _revalidate_train_provenance(self):
+        if self._train_paths is not None:
+            current = _train_path_provenance(*self._train_paths)
+            if current != self._train_provenance:
+                raise CohortError("authoritative Train provenance changed before final freeze")
+
+    def revalidate(self):
+        self._revalidate_train_provenance()
+        super().revalidate()
+        self._revalidate_train_provenance()
+
+
+def _resolve_authoritative_train(root, ledger, old_lock):
+    if not isinstance(ledger, TrainSourceLedger):
+        raise CohortError("Train source resolution requires a provenance-aware ledger")
+    record = old_lock.get("artifacts", {}).get("authoritative_g1_train")
+    if (not isinstance(record, dict) or set(record) != {"path", "sha256"}
+            or not isinstance(record["path"], str) or not record["path"].strip()):
+        raise CohortError("missing exact 3B1 authoritative_g1_train record")
+    canonical = Path(record["path"]).expanduser()
+    if not canonical.is_absolute():
+        canonical = root / canonical
+    canonical = safe_path(canonical)
+    if not canonical.is_relative_to(root):
+        raise CohortError("authoritative Train source escapes project root")
+    if record["sha256"] != schemas.AUTHORITATIVE_TRAIN_SHA256:
+        raise CohortError("3B1 authoritative Train SHA differs from frozen requirement")
+    ledger.add(canonical, "authoritative Train", expected=schemas.AUTHORITATIVE_TRAIN_SHA256)
     report_path = bound_input(ledger, old_lock, "phase3a_train_lock_report",
                               "Train-lock provenance", project_root=root)
     report = read_json(report_path)
     section = report.get("train_lock", report)
+    if not isinstance(section, dict):
+        raise CohortError("Train-lock metadata must be an object")
     source = section.get("source", report.get("source"))
-    if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+    if (not isinstance(source, dict) or not isinstance(source.get("path"), str)
+            or not source["path"].strip()):
         raise CohortError("Train source provenance missing")
-    source_path = Path(source["path"])
-    if not source_path.is_absolute():
-        source_path = root / source_path
-    # Check path policy BEFORE the reused helper can open or hash this source.
-    safe_path(source_path)
+    historical = Path(source["path"]).expanduser()
+    if not historical.is_absolute():
+        historical = root / historical
+    ledger.bind_train_provenance(root, historical, canonical)
+    # The unchanged helper resolves its report's path before hashing the file.
+    # The alias is already constrained and tied to the independent 3B1 record.
     train_lock = verify_train_lock(root, report_path,
                                    expected_sha256=schemas.AUTHORITATIVE_TRAIN_SHA256)
+    if (Path(train_lock.source_path).resolve(strict=True) != canonical
+            or train_lock.source_sha256 != schemas.AUTHORITATIVE_TRAIN_SHA256):
+        raise CohortError("Train-lock helper result differs from frozen 3B1 source")
+    ledger.bind_train_provenance(root, historical, canonical)
     bound_input(ledger, old_lock, "authoritative_g1_train", "authoritative Train",
-                supplied=train_lock.source_path, project_root=root)
+                supplied=canonical, project_root=root)
+    return canonical
+
+
+def resolve_source(inputs, ledger, old_lock, protocol):
+    root = safe_path(inputs.project_root)
+    canonical = _resolve_authoritative_train(root, ledger, old_lock)
     config_path = bound_input(ledger, old_lock, "phase4a_configuration", "Phase4A configuration",
                              supplied=inputs.phase4a_config, project_root=root)
     config = read_json(config_path)
@@ -223,7 +333,7 @@ def resolve_source(inputs, ledger, old_lock, protocol):
                          and n.name == "normalize_request"]
             if len(functions) != 1:
                 raise CohortError("actual Phase4A normalize_request is unavailable")
-    return train_lock.source_path
+    return canonical
 
 
 def check_top_provenance(row):

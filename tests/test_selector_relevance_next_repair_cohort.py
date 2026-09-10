@@ -96,7 +96,7 @@ class Fixture:
         self.neutral = root / "neutral"
         self.stage = root / "stage"
         self.closure = root / "closure"
-        self.source = root / "source" / "g1_train.jsonl"
+        self.source = self.project / "source" / "g1_train.jsonl"
         self.phase3 = root / "provenance" / "train_lock.json"
         self.config = root / "provenance" / "phase4a_config.json"
         self.preflight = self.outputs / "preflight"
@@ -1204,7 +1204,7 @@ class PublicationCompatibilityTests(unittest.TestCase):
             results.join_thread()
 
     def test_revision_only_scientific_constants_and_salts_unchanged(self):
-        self.assertEqual("step2.6r-3c2a-r1-v1", sc.IMPLEMENTATION_REVISION)
+        self.assertEqual("step2.6r-3c2a-r2-v1", sc.IMPLEMENTATION_REVISION)
         self.assertEqual({"A": "step2.6r-3c2a-reviewer-a-v1", "B": "step2.6r-3c2a-reviewer-b-v1"}, sc.REVIEWER_SALTS)
         protocol = frozen.load_preregistration()
         self.assertEqual("step2.6r-3c1-v1", protocol["implementation_revision"])
@@ -1219,6 +1219,370 @@ class PublicationCompatibilityTests(unittest.TestCase):
                          (cohort["sampling"]["selection_purpose"], cohort["sampling"]["split_purpose"]))
         self.assertEqual({"prior_calibration": 1306, "revealed_audit": 30, "sealed_challenge": 6, "stage_a_replay": 7},
                          protocol["exclusions"]["required_identity_counts"])
+
+
+class HistoricalTrainPathTests(unittest.TestCase):
+    """Synthetic DICC provenance only; never inspect a real Train artifact."""
+
+    def setUp(self):
+        SYNTHETIC_ROOT.mkdir(parents=True, exist_ok=True)
+        temp = tempfile.TemporaryDirectory(prefix="historical-", dir=SYNTHETIC_ROOT)
+        self.addCleanup(temp.cleanup)
+        self.f = Fixture(Path(temp.name))
+        self.tail = Path(
+            "clip12_phase1_full_train_multidataset_visual_candidate_expansion_mdu_integration_and_controlled_ablation"
+            "/05_mdu_variants/G1_text_ocr.jsonl")
+        self.canonical_dir = self.f.project / "MDU/Academic_Research/outputs"
+        canonical = self.canonical_dir / self.tail
+        canonical.parent.mkdir(parents=True)
+        self.f.source.rename(canonical)
+        self.f.source = canonical
+        self.f.refresh_source()
+        self.alias = self.f.project / "MDU/outputs"
+        self.alias.symlink_to("Academic_Research/outputs", target_is_directory=True)
+        self.historical = self.alias / self.tail
+        self.set_report_path(self.historical)
+
+    def set_report_path(self, path, **section_changes):
+        report = ar.read_json(self.f.phase3)
+        report["train_lock"]["source"]["path"] = str(path)
+        report["train_lock"].update(section_changes)
+        write_json(self.f.phase3, report)
+        self.f.bind("phase3a_train_lock_report", self.f.phase3)
+        self.f.save_old()
+
+    def prepared(self):
+        with self.f.patches():
+            return cb.prepare(self.f.inputs)
+
+    def preflight(self):
+        with self.f.patches():
+            return cb.preflight(self.f.inputs, self.f.preflight)
+
+    def build(self):
+        with self.f.patches():
+            return cb.build(self.f.inputs, self.f.build_dir,
+                            self.f.preflight / "cohort_source_preflight_report.json")
+
+    def retarget(self, target):
+        self.alias.unlink()
+        self.alias.symlink_to(target, target_is_directory=True)
+
+    def assert_preflight_rejected(self, error=sc.CohortError):
+        with self.assertRaises(error):
+            self.preflight()
+        self.assertFalse(self.f.preflight.exists())
+
+    def test_exact_dicc_alias_preflight_records_canonical_source_and_provenance(self):
+        original_open = Path.open
+        source_opens = []
+
+        def guarded_open(path, *args, **kwargs):
+            self.assertFalse(path.is_relative_to(self.alias), "content opened through historical alias")
+            if path == self.f.source:
+                source_opens.append(path)
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", guarded_open), \
+                patch.object(sl, "read_identity_rows", wraps=sl.read_identity_rows) as inventory_read, \
+                patch.object(sl, "verify_train_lock", wraps=verify_train_lock) as helper:
+            report = self.preflight()
+        self.assertEqual(cb.PREFLIGHT_STATUS, report["status"])
+        helper.assert_called_once_with(self.f.project, self.f.phase3, expected_sha256=self.f.train_sha)
+        self.assertTrue(source_opens)
+        self.assertTrue(inventory_read.call_args_list)
+        self.assertTrue(all(call.args[0] == self.f.source for call in inventory_read.call_args_list))
+        self.assertEqual(self.f.train_sha, ar.sha_file(self.f.source))
+        lock = ar.read_json(self.f.preflight / "cohort_source_lock.json")
+        self.assertEqual({
+            "historical_source_path": str(self.historical),
+            "historical_source_resolved_path": str(self.f.source),
+            "canonical_authoritative_train_path": str(self.f.source),
+            "historical_alias_used": True,
+            "historical_alias_component": str(self.alias),
+            "historical_alias_link_target": "Academic_Research/outputs",
+        }, lock["authoritative_train_provenance"])
+        self.assertIn({"path": str(self.f.source), "sha256": self.f.train_sha,
+                       "role": "authoritative Train"}, lock["artifacts"])
+        self.assertEqual(ar.sha_file(self.f.preflight / "cohort_source_lock.json"),
+                         report["cohort_source_lock_sha256"])
+        with self.assertRaises(sc.CohortError):
+            ar.safe_path(self.historical)
+
+    def test_canonical_report_source_accepted_without_alias_exception(self):
+        self.set_report_path(self.f.source)
+        self.alias.unlink()
+        prepared = self.prepared()
+        self.assertEqual(self.f.source, prepared[1])
+        provenance = prepared[4]["authoritative_train_provenance"]
+        self.assertFalse(provenance["historical_alias_used"])
+        self.assertIsNone(provenance["historical_alias_component"])
+        self.assertIsNone(provenance["historical_alias_link_target"])
+
+    def test_relative_historical_report_path_accepted(self):
+        self.set_report_path(self.historical.relative_to(self.f.project))
+        self.assertEqual(self.f.source, self.prepared()[1])
+
+    def test_relative_canonical_3b1_path_accepted(self):
+        self.f.old_lock["artifacts"]["authoritative_g1_train"]["path"] = str(
+            self.f.source.relative_to(self.f.project))
+        self.f.save_old()
+        self.assertEqual(self.f.source, self.prepared()[1])
+
+    def test_wrong_alias_file_rejected_even_with_identical_bytes(self):
+        other = self.canonical_dir / "another.jsonl"
+        other.write_bytes(self.f.source.read_bytes())
+        self.set_report_path(self.alias / other.name)
+        self.assert_preflight_rejected()
+
+    def test_retarget_to_other_directory_rejected_even_with_identical_bytes(self):
+        other = self.f.project / "MDU/other_outputs"
+        target = other / self.tail
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.f.source.read_bytes())
+        self.retarget(other)
+        self.assert_preflight_rejected()
+
+    def test_tail_mismatch_rejected_even_for_same_inode(self):
+        other = self.canonical_dir / "hardlink.jsonl"
+        os.link(self.f.source, other)
+        self.set_report_path(self.alias / other.name)
+        self.assertTrue(other.samefile(self.f.source))
+        self.assert_preflight_rejected()
+
+    def test_arbitrary_alias_location_rejected(self):
+        link = self.f.project / "historical_source"
+        link.symlink_to(self.f.source)
+        self.set_report_path(link)
+        self.assert_preflight_rejected()
+
+    def test_extra_symlink_in_alias_target_rejected(self):
+        intermediate = self.f.project / "MDU/intermediate"
+        intermediate.symlink_to(self.canonical_dir, target_is_directory=True)
+        self.retarget("intermediate")
+        self.assert_preflight_rejected()
+
+    def test_nested_symlink_rejected(self):
+        parent = self.f.source.parent
+        moved = parent.with_name("moved_variants")
+        parent.rename(moved)
+        parent.symlink_to(moved, target_is_directory=True)
+        self.assert_preflight_rejected()
+
+    def test_direct_canonical_file_symlink_rejected(self):
+        moved = self.f.source.with_name("moved.jsonl")
+        self.f.source.rename(moved)
+        self.f.source.symlink_to(moved)
+        self.assert_preflight_rejected()
+
+    def test_canonical_3b1_record_using_historical_alias_rejected(self):
+        self.f.old_lock["artifacts"]["authoritative_g1_train"]["path"] = str(self.historical)
+        self.f.save_old()
+        self.assert_preflight_rejected()
+
+    def test_wrong_3b1_authoritative_sha_rejected_before_train_helper(self):
+        self.f.old_lock["artifacts"]["authoritative_g1_train"]["sha256"] = "0" * 64
+        self.f.save_old()
+        with patch.object(sl, "verify_train_lock") as helper:
+            self.assert_preflight_rejected()
+        helper.assert_not_called()
+
+    def test_changed_canonical_source_bytes_rejected(self):
+        with self.f.source.open("ab") as stream:
+            stream.write(b"\n")
+        self.assert_preflight_rejected()
+
+    def test_wrong_report_source_sha_rejected_by_existing_helper(self):
+        self.set_report_path(self.historical, source={"path": str(self.historical), "sha256": "0" * 64})
+        self.assert_preflight_rejected(sl.DatasetBuildError)
+
+    def test_train_lock_fail_status_rejected_by_existing_helper(self):
+        self.set_report_path(self.historical, status="FAIL")
+        self.assert_preflight_rejected(sl.DatasetBuildError)
+
+    def test_3b1_canonical_binding_to_different_file_rejected(self):
+        other = self.canonical_dir / "another.jsonl"
+        other.write_bytes(self.f.source.read_bytes())
+        self.f.bind("authoritative_g1_train", other)
+        self.f.save_old()
+        self.assert_preflight_rejected()
+
+    def test_helper_source_resolving_elsewhere_rejected(self):
+        other = self.canonical_dir / "another.jsonl"
+        other.write_bytes(self.f.source.read_bytes())
+        result = SimpleNamespace(source_path=other, source_sha256=self.f.train_sha)
+        with patch.object(sl, "verify_train_lock", return_value=result):
+            self.assert_preflight_rejected()
+
+    def test_helper_wrong_sha_rejected(self):
+        result = SimpleNamespace(source_path=self.f.source, source_sha256="0" * 64)
+        with patch.object(sl, "verify_train_lock", return_value=result):
+            self.assert_preflight_rejected()
+
+    def test_helper_alias_result_compared_after_resolution_but_canonical_returned(self):
+        result = SimpleNamespace(source_path=self.historical, source_sha256=self.f.train_sha)
+        with patch.object(sl, "verify_train_lock", return_value=result):
+            self.assertEqual(self.f.source, self.prepared()[1])
+
+    def test_helper_cannot_change_canonical_bytes_before_final_sha_check(self):
+        def changed(*args, **kwargs):
+            with self.f.source.open("ab") as stream:
+                stream.write(b"\n")
+            return SimpleNamespace(source_path=self.f.source, source_sha256=self.f.train_sha)
+        with patch.object(sl, "verify_train_lock", side_effect=changed):
+            self.assert_preflight_rejected()
+
+    def test_missing_authoritative_source_rejected(self):
+        self.f.source.unlink()
+        self.assert_preflight_rejected(FileNotFoundError)
+
+    def test_canonical_source_outside_project_rejected_before_read(self):
+        other = self.f.root / "outside.jsonl"
+        other.write_bytes(self.f.source.read_bytes())
+        self.f.bind("authoritative_g1_train", other)
+        self.f.save_old()
+        self.set_report_path(other)
+        with patch.object(sl, "verify_train_lock") as helper:
+            self.assert_preflight_rejected()
+        helper.assert_not_called()
+
+    def test_historical_parent_traversal_rejected(self):
+        self.set_report_path(self.alias / ".." / "outputs" / self.tail)
+        self.assert_preflight_rejected()
+
+    def test_formal_paths_rejected_before_source_reads(self):
+        original = copy.deepcopy(self.f.old_lock)
+        for name in ("Formal_Validation", "Formal_Test", "Validation", "Test"):
+            with self.subTest(name=name):
+                forbidden = self.canonical_dir / name / "G1_text_ocr.jsonl"
+                self.f.old_lock = copy.deepcopy(original)
+                self.f.old_lock["artifacts"]["authoritative_g1_train"]["path"] = str(forbidden)
+                self.f.save_old()
+                self.set_report_path(self.alias / name / "G1_text_ocr.jsonl")
+                with patch.object(sl, "verify_train_lock") as helper:
+                    self.assert_preflight_rejected()
+                helper.assert_not_called()
+
+    def test_generic_safe_path_symlink_file_directory_output_and_future_rejected(self):
+        directory = self.f.root / "generic_directory"
+        directory.mkdir()
+        future = self.f.future("held", ["GroundLie360:synthetic-held"])
+        for name, target in (("file", self.f.source), ("directory", directory),
+                             ("output", self.f.outputs), ("future", future)):
+            with self.subTest(name=name):
+                link = self.f.root / ("generic_" + name + "_link")
+                link.symlink_to(target, target_is_directory=name in {"directory", "output"})
+                with self.assertRaises(sc.CohortError):
+                    ar.safe_path(link)
+
+    def test_all_top_level_input_symlinks_still_rejected_before_provenance(self):
+        fields = ("project_root", "phase4a_config", "source_3b1_cohort_dir",
+                  "step3b3_closure_dir", "neutral_dir", "stage_a_invariance_report")
+        original_inputs = self.f.inputs
+        for field in fields:
+            with self.subTest(field=field):
+                target = getattr(original_inputs, field)
+                link = self.f.root / (field + "_alias")
+                link.symlink_to(target, target_is_directory=target.is_dir())
+                self.f.inputs = replace(original_inputs, **{field: link})
+                with patch.object(cb, "resolve_source") as resolver:
+                    self.assert_preflight_rejected()
+                resolver.assert_not_called()
+
+    def test_symlinked_future_manifest_rejected_before_provenance(self):
+        future = self.f.future("held", ["GroundLie360:synthetic-held"])
+        link = self.f.root / "future_alias.json"
+        link.symlink_to(future)
+        self.f.inputs = replace(self.f.inputs, future_exclusion_manifests=(link,))
+        with patch.object(cb, "resolve_source") as resolver:
+            self.assert_preflight_rejected()
+        resolver.assert_not_called()
+
+    def test_symlinked_output_rejected_before_provenance(self):
+        target = self.f.root / "output_target"
+        target.mkdir()
+        self.f.outputs.mkdir()
+        self.f.preflight.symlink_to(target, target_is_directory=True)
+        with patch.object(cb, "resolve_source") as resolver, self.assertRaises(sc.CohortError):
+            self.preflight()
+        resolver.assert_not_called()
+        self.assertTrue(self.f.preflight.is_symlink())
+        self.assertEqual([], list(target.iterdir()))
+
+    def test_other_source_lock_record_symlink_rejected(self):
+        link = self.f.root / "train_report_alias.json"
+        link.symlink_to(self.f.phase3)
+        self.f.old_lock["artifacts"]["phase3a_train_lock_report"]["path"] = str(link)
+        self.f.save_old()
+        self.assert_preflight_rejected()
+
+    def test_retarget_after_preflight_rejects_build_before_exposure(self):
+        self.preflight()
+        self.retarget(self.f.root / "missing_outputs")
+        with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root") as exposure:
+            with self.assertRaises(sc.CohortError):
+                self.build()
+        exposure.assert_not_called()
+        self.assertFalse(self.f.build_dir.exists())
+
+    def test_changed_raw_link_target_same_resolution_invalidates_approved_preflight(self):
+        self.preflight()
+        self.retarget(self.canonical_dir)
+        self.assertEqual(self.f.source, self.historical.resolve(strict=True))
+        with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root") as exposure:
+            with self.assertRaisesRegex(sc.CohortError, "not byte-consistent"):
+                self.build()
+        exposure.assert_not_called()
+        self.assertFalse(self.f.build_dir.exists())
+
+    def test_final_preflight_freeze_rechecks_link_and_cleans_staging(self):
+        def changed(output, artifacts, ledger):
+            self.retarget(self.canonical_dir)
+            return ar.freeze(output, artifacts, ledger)
+        with patch.object(cb, "freeze", side_effect=changed):
+            self.assert_preflight_rejected()
+        self.assertEqual([], list(self.f.outputs.iterdir()))
+
+    def test_final_build_freeze_rechecks_link_and_cleans_staging(self):
+        self.preflight()
+        def changed(output, artifacts, ledger):
+            self.retarget(self.canonical_dir)
+            return ar.freeze(output, artifacts, ledger)
+        with patch.object(cb, "freeze", side_effect=changed), self.assertRaises(sc.CohortError):
+            self.build()
+        self.assertFalse(self.f.build_dir.exists())
+        self.assertEqual([self.f.preflight], list(self.f.outputs.iterdir()))
+
+    def test_ledger_rechecks_alias_after_hash_revalidation(self):
+        ledger = self.prepared()[3]
+        original = ar.Ledger.revalidate
+        def changed(instance):
+            original(instance)
+            self.retarget(self.canonical_dir)
+        with patch.object(ar.Ledger, "revalidate", changed), self.assertRaises(sc.CohortError):
+            ledger.revalidate()
+
+    def test_generic_ledger_cannot_omit_train_provenance_revalidation(self):
+        with self.f.patches(), self.assertRaises(sc.CohortError):
+            sl.resolve_source(self.f.inputs, ar.Ledger(), self.f.old_lock, frozen.load_preregistration())
+
+    def test_synthetic_build_uses_canonical_source_preserves_frozen_inputs(self):
+        paths = [self.f.source, self.f.phase3, *self.f.old.iterdir()]
+        original = {path: path.read_bytes() for path in paths}
+        self.preflight()
+        with patch.object(sl, "read_identity_rows", wraps=sl.read_identity_rows) as reader:
+            report = self.build()
+        self.assertEqual(cb.PASS_STATUS, report["status"])
+        self.assertEqual({"GroundLie360": 60, "TRUE-3MFact": 60}, report["selected_dataset_counts"])
+        self.assertEqual({"repair_train": 96, "repair_dev": 24}, report["split_counts"])
+        self.assertTrue(reader.call_args_list)
+        self.assertTrue(all(call.args[0] == self.f.source for call in reader.call_args_list))
+        before = ar.read_json(self.f.preflight / "cohort_source_lock.json")
+        after = ar.read_json(self.f.build_dir / "development_cohort_source_lock.json")
+        self.assertEqual(before["authoritative_train_provenance"], after["authoritative_train_provenance"])
+        for path, data in original.items():
+            self.assertEqual(data, path.read_bytes())
+        self.assertEqual("Academic_Research/outputs", os.readlink(self.alias))
 
 
 if __name__ == "__main__":

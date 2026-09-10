@@ -1,6 +1,6 @@
 # Step 2.6R-3C2-A: score-blind repair-development cohort
 
-Implementation: `step2.6r-3c2a-r1-v1`. Repair family:
+Implementation: `step2.6r-3c2a-r2-v1`. Repair family:
 `G1-RelevanceSelector-NaturalPairwise-v1`.
 
 This package constructs future repair-development data. It does not train,
@@ -25,7 +25,52 @@ Train from the 3B1 `cohort_source_lock.json` and the existing `verify_train_lock
 function. There is no guessed dataset path or CLI hash/fixture override.
 All Train rows require an explicit top-level Train split and consistent unique
 canonical identities. Formal Validation/Test paths are rejected before reads.
-Symlink inputs are rejected so a lock cannot silently change its target.
+Generic symlink inputs remain rejected by the unchanged `safe_path()` contract.
+
+R2 accepts one historical provenance alias, only inside the hash-locked Phase3A
+Train-lock report's `source.path`. The independent 3B1 `authoritative_g1_train`
+record is validated first: its path must be canonical, inside the project root,
+and its declared and actual SHA must match the frozen authoritative Train SHA.
+All inventory, exposure and build reads use that canonical path of record.
+
+The historical report path may already equal the canonical path. Otherwise it
+must have exactly this project-local relationship, with an identical nonempty
+relative tail and no parent traversal or additional symlink components:
+
+```text
+<project-root>/MDU/outputs/<relative-tail>
+  -> <project-root>/MDU/Academic_Research/outputs/<relative-tail>
+```
+
+`MDU/outputs` must itself be a symlink directly targeting
+`Academic_Research/outputs` (the diagnosed DICC target string) or the exact
+absolute canonical directory. Other spellings, intermediate links, different
+tails, missing sources, outside-root sources and Formal Validation/Test paths
+fail closed. Strict resolution must equal the frozen canonical file path;
+matching bytes or inode alone is insufficient. The existing `verify_train_lock()`
+is reused unchanged. Its returned source must resolve to the same canonical path
+and its returned SHA must match; the canonical file is then hash-checked again.
+Neither historical report nor 3B1 source lock nor symlink is rewritten.
+
+Both preflight and development source locks contain
+`authoritative_train_provenance`, recording `historical_source_path`,
+`historical_source_resolved_path`, `canonical_authoritative_train_path`,
+`historical_alias_used`, `historical_alias_component`, and
+`historical_alias_link_target`. The component/target are null when no alias is
+used. The preflight report binds this metadata through `cohort_source_lock_sha256`;
+the build report binds its source lock through `artifact_sha256`.
+
+The source layer's `TrainSourceLedger` checks the exact relationship before and
+after normal input hash revalidation. `cohort_builder.py` only changes its ledger
+import so the existing preparation and final `freeze()` checks cover this
+metadata; `artifacts.py`, `safe_path()` and R1 publication behavior are unchanged.
+Build preparation recomputes provenance and requires byte equality with the
+approved preflight. Retargeting to another source fails; changing the raw link
+target string even while retaining the same resolution invalidates approval.
+Changes detected before publication leave no final output. There is no link
+repair, generic symlink permission, or override flag. All top-level paths,
+other source-lock records, reviewer artifacts, future exclusion manifests and
+output paths retain strict path validation.
 
 The old 3B1 directory has an explicit, closed read allowlist:
 
@@ -287,7 +332,7 @@ Exit codes: **0** valid PASS; **1** atomically frozen feasibility BLOCKED;
 **2** invalid input, integrity, runtime or contract failure. A changed scientific
 contract cannot be bypassed by CLI flags.
 
-## R1 DICC regression after a later reviewed commit
+## R2 DICC regression after a later reviewed commit
 
 This proposed command runs synthetic focused tests on the actual `/scr`
 filesystem. Run it only after the reviewed repair is committed and available
@@ -324,7 +369,10 @@ frozen 3B1 build before invoking preflight; do not guess a dated directory.
 The builder itself resolves the exact Train-lock and Stage-A identity-manifest
 paths through that existing source lock.
 
-**A. Score-blind preflight**, after setting the discovered `COHORT_DIR`:
+**A. Score-blind preflight**, only after the later R2 DICC regression passes and
+after setting the existing verified `COHORT_DIR` (or discovering it as above):
+retain the canonical variables from the read-only DICC diagnosis. Their exact
+values are required below; do not replace them with historical aliases.
 
 ```bash
 : "${COHORT_DIR:?Set COHORT_DIR to the discovered frozen 3B1 directory}"
@@ -332,12 +380,12 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m scripts.selector_relevance_next_repair_cohort.run_cohort \
   --preflight \
   --project-root "$ROOT" \
-  --phase4a-config "$ROOT/MDU/configs/clip12_phase4a_frozen_g1_inference_handoff.json" \
+  --phase4a-config "${PHASE4A_CONFIG:?Reuse the verified canonical Phase4A config}" \
   --source-3b1-cohort-dir "$COHORT_DIR" \
-  --step3b3-closure-dir "$AUDIT/06_one_shot_selector_evaluation_closure" \
-  --neutral-dir "$DEFENSE/outputs/selector_relevance_calibration_neutral_v1/01_neutral_revision" \
-  --stage-a-invariance-report "$DEFENSE/outputs/selector_relevance_gate_v1/00_prediction_invariance_smoke/prediction_invariance_smoke_report.json" \
-  --output-dir "$DEFENSE/outputs/selector_relevance_next_repair_v1/00_cohort_source_preflight"
+  --step3b3-closure-dir "${CLOSURE_DIR:?Reuse the verified canonical closure directory}" \
+  --neutral-dir "${NEUTRAL_DIR:?Reuse the verified canonical neutral directory}" \
+  --stage-a-invariance-report "${STAGE_A_REPORT:?Reuse the verified canonical Stage-A report}" \
+  --output-dir "${PREFLIGHT_DIR:?Reuse the verified canonical preflight output path}"
 ```
 
 **B. Deterministic build**, only after the resulting preflight is reviewed and

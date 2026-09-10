@@ -9,12 +9,13 @@ from scripts.selector_relevance_next_repair_protocol.protocol import validate_de
 from scripts.selector_relevance_next_repair_protocol.schemas import Candidate, DevelopmentCase, FrozenTrainCase
 
 from . import schemas
-from .artifacts import (Ledger, assert_new_output, compact, digest_bytes, freeze,
+from .artifacts import (assert_new_output, compact, digest_bytes, freeze,
                         json_bytes, safe_path)
 from .blinding import packets
 from .exclusion_loader import exclusion_payload, load_exclusions, old_provenance
 from .schemas import CohortError, IMPLEMENTATION_REVISION, Selection
 from .source_loader import Phase4ANormalizationExposureAdapter, closure, inventory, resolve_source
+from .source_loader import TrainSourceLedger as Ledger
 
 PREFLIGHT_STATUS = "NEXT_REPAIR_COHORT_SOURCE_PREFLIGHT_PASS"
 PASS_STATUS = "NEXT_REPAIR_DEVELOPMENT_COHORT_BUILD_PASS"
