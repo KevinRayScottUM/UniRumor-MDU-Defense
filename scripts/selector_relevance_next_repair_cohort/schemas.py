@@ -14,7 +14,7 @@ from scripts.selector_relevance_independent_audit.schemas import (
     TARGET_DATASET_COUNTS as REVEALED_AUDIT_DATASET_COUNTS,
 )
 
-IMPLEMENTATION_REVISION = "step2.6r-3c2a-r3-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3c2a-r4-v1"
 CLOSURE_HASHES = {
     "step3b3_scientific_summary.json":
         "6ed3401614f68e58ae0efb3a1671f9f2f7b6b8b653f2100660199ee72938fdf0",
@@ -31,6 +31,14 @@ PUBLIC_COLUMNS = (
     "direct_relevance_label", "review_confidence", "review_note",
 )
 CANDIDATE_FIELDS = ("unit_id", "unit_type", "modality", "text")
+PHASE4A_ENRICHMENT_FIELDS = (
+    "evidence_refs", "frame_ids", "phase1_source", "source_snippet_type",
+)
+# Exact interface representations, not additional downstream scientific inputs.
+PHASE4A_RETURN_SCHEMAS = (
+    frozenset(CANDIDATE_FIELDS),
+    frozenset(CANDIDATE_FIELDS + PHASE4A_ENRICHMENT_FIELDS),
+)
 IDENTITY_FIELDS = frozenset({
     "dataset", "source_dataset", "case_id", "sample_id", "id",
     "original_case_id", "source_case_id", "canonical_case_id",

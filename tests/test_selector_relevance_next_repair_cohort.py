@@ -1211,7 +1211,7 @@ class PublicationCompatibilityTests(unittest.TestCase):
             results.join_thread()
 
     def test_revision_only_scientific_constants_and_salts_unchanged(self):
-        self.assertEqual("step2.6r-3c2a-r3-v1", sc.IMPLEMENTATION_REVISION)
+        self.assertEqual("step2.6r-3c2a-r4-v1", sc.IMPLEMENTATION_REVISION)
         self.assertEqual({"A": "step2.6r-3c2a-reviewer-a-v1", "B": "step2.6r-3c2a-reviewer-b-v1"}, sc.REVIEWER_SALTS)
         protocol = frozen.load_preregistration()
         self.assertEqual("step2.6r-3c1-v1", protocol["implementation_revision"])
@@ -2021,6 +2021,310 @@ class ExposureEligibilityBoundaryTests(unittest.TestCase):
 
     def test_true3m_contract_ineligibility_leaves_59_and_freezes_blocked(self):
         self.assert_contract_feasibility_block("TRUE-3MFact")
+
+
+class AuthoritativeReturnSchemaTests(unittest.TestCase):
+    """R4 exact return schemas through synthetic, model-free normalization."""
+
+    ENRICHMENT = {
+        "evidence_refs": ["R4_METADATA_ONLY_EVIDENCE"],
+        "frame_ids": ["R4_METADATA_ONLY_FRAME"],
+        "phase1_source": "R4_METADATA_ONLY_SOURCE",
+        "source_snippet_type": "R4_METADATA_ONLY_SNIPPET",
+    }
+
+    def setUp(self):
+        self.protocol = frozen.load_preregistration()
+        self.row = source_row()
+
+    def adapter(self, metadata=None, transform=None):
+        def normalize_request(request, *, config, drop_unsupported_visual):
+            self.assertIs(False, drop_unsupported_visual)
+            units = copy.deepcopy(request["candidate_units"][:config["maximum_units_per_sample"]])
+            if metadata is not None:
+                for unit in units:
+                    unit.update(copy.deepcopy(metadata))
+            if transform is not None:
+                units = transform(units)
+            return {"candidate_units": units}
+        return sl.Phase4ANormalizationExposureAdapter(
+            normalize_request, {"maximum_units_per_sample": 24})
+
+    def expose(self, adapter=None, row=None):
+        return sl.expose(self.row if row is None else row, 0,
+                         self.adapter(self.ENRICHMENT) if adapter is None else adapter,
+                         self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def fixture(self):
+        SYNTHETIC_ROOT.mkdir(parents=True, exist_ok=True)
+        temp = tempfile.TemporaryDirectory(prefix="return-schema-", dir=SYNTHETIC_ROOT)
+        self.addCleanup(temp.cleanup)
+        return Fixture(Path(temp.name))
+
+    def assert_preserved(self, case, row):
+        expected = row["candidate_units"][:24]
+        self.assertEqual(row["claim"], case.claim)
+        self.assertEqual(len(expected), len(case.candidates))
+        self.assertEqual(expected, [dict(zip(sc.CANDIDATE_FIELDS, unit)) for unit in case.candidates])
+        self.assertTrue(all(len(unit) == 4 for unit in case.candidates))
+        self.assertEqual([u["unit_id"] for u in expected], [u[0] for u in case.candidates])
+
+    def test_exact_four_core_fields_accepted_and_preserved(self):
+        self.assert_preserved(self.expose(self.adapter()), self.row)
+
+    def test_exact_eight_fields_accepted_and_projected_without_metadata(self):
+        self.assertEqual(
+            {"unit_id", "unit_type", "modality", "text", "evidence_refs", "frame_ids",
+             "phase1_source", "source_snippet_type"},
+            set(self.adapter(self.ENRICHMENT).normalize(self.row).candidate_units[0]))
+        self.assert_preserved(self.expose(), self.row)
+
+    def test_core_and_enriched_units_can_coexist_without_order_or_count_changes(self):
+        def alternate(units):
+            for unit in units[::2]:
+                unit.update(copy.deepcopy(self.ENRICHMENT))
+            return units
+        self.assert_preserved(self.expose(self.adapter(transform=alternate)), self.row)
+
+    def test_partial_enrichment_all_fourteen_nonempty_proper_subsets_rejected(self):
+        fields = tuple(self.ENRICHMENT)
+        for mask in range(1, 15):
+            metadata = {key: self.ENRICHMENT[key] for i, key in enumerate(fields) if mask & (1 << i)}
+            with self.subTest(fields=tuple(metadata)), self.assertRaisesRegex(sc.CohortError, "schema drift"):
+                self.expose(self.adapter(metadata))
+
+    def test_unknown_model_label_score_and_arbitrary_fields_fail_closed(self):
+        fields = (
+            "label", "veracity_label", "relevance_label", "direct_relevance_label",
+            "selection_score", "selection_scores", "selection_probability", "veracity_logits",
+            "sample_logits", "probabilities", "prediction", "prediction_id", "rank", "ranking",
+            "top_k", "gold", "target", "loss", "arbitrary_unknown_metadata",
+        )
+        for metadata in ({}, self.ENRICHMENT):
+            for key in fields:
+                with self.subTest(enriched=bool(metadata), key=key), \
+                        self.assertRaisesRegex(sc.CohortError, "forbidden field"):
+                    self.expose(self.adapter({**metadata, key: "SYNTHETIC_FORBIDDEN_VALUE"}))
+
+    def test_non_dict_returned_candidate_rejected(self):
+        for value in (None, [], "candidate", SimpleNamespace(**self.row["candidate_units"][0])):
+            result = FixtureAdapter().normalize(self.row)
+            result = replace(result, candidate_units=(value, *result.candidate_units[1:]))
+            with self.subTest(value_type=type(value).__name__), self.assertRaises(sc.CohortError):
+                self.expose(SimpleNamespace(normalize=lambda request: result))
+
+    def test_each_missing_core_field_rejected_in_both_forms(self):
+        for metadata in (None, self.ENRICHMENT):
+            for field in sc.CANDIDATE_FIELDS:
+                def missing(units):
+                    del units[0][field]
+                    return units
+                with self.subTest(enriched=metadata is not None, field=field), \
+                        self.assertRaisesRegex(sc.CohortError, "schema drift"):
+                    self.expose(self.adapter(metadata, missing))
+
+    def test_each_mutated_core_field_rejected_in_both_forms(self):
+        for metadata in (None, self.ENRICHMENT):
+            for field in sc.CANDIDATE_FIELDS:
+                def mutated(units):
+                    units[0][field] += "changed"
+                    return units
+                with self.subTest(enriched=metadata is not None, field=field), \
+                        self.assertRaisesRegex(sc.CohortError, "deletion/mutation/order drift"):
+                    self.expose(self.adapter(metadata, mutated))
+
+    def test_core_values_must_remain_nonblank_strings(self):
+        for field in sc.CANDIDATE_FIELDS:
+            for value in (None, 0, False, [], {}, "", " \n\t"):
+                def malformed(units):
+                    units[0][field] = value
+                    return units
+                with self.subTest(field=field, value=value), \
+                        self.assertRaisesRegex(sc.CohortError, "nonblank strings"):
+                    self.expose(self.adapter(self.ENRICHMENT, malformed))
+
+    def test_candidate_reordering_rejected(self):
+        with self.assertRaisesRegex(sc.CohortError, "order drift"):
+            self.expose(self.adapter(self.ENRICHMENT, lambda units: list(reversed(units))))
+
+    def test_candidate_deletion_rejected(self):
+        with self.assertRaises(sc.CohortError):
+            self.expose(self.adapter(self.ENRICHMENT, lambda units: units[1:]))
+
+    def test_candidate_insertion_rejected(self):
+        with self.assertRaises(sc.CohortError):
+            self.expose(self.adapter(self.ENRICHMENT, lambda units: [*units, dict(units[0], unit_id="inserted")]))
+
+    def test_schema_failure_at_last_position_prevents_downstream_case_creation(self):
+        def invalid_last(units):
+            units[-1]["selection_score"] = 1
+            return units
+        with patch.object(sl, "Case") as constructor, self.assertRaises(sc.CohortError):
+            self.expose(self.adapter(self.ENRICHMENT, invalid_last))
+        constructor.assert_not_called()
+
+    def test_enriched_truncation_is_exact_raw_prefix_for_zero_through_over_limit(self):
+        for count in (0, 5, 6, 24, 27):
+            row = source_row(count=count)
+            with self.subTest(count=count):
+                self.assert_preserved(self.expose(row=row), row)
+
+    def test_enriched_incorrect_truncation_accounting_rejected(self):
+        row = source_row(count=27)
+        result = self.adapter(self.ENRICHMENT).normalize(row)
+        result = replace(result, candidate_units=result.candidate_units[:-1], truncated_count=4)
+        with self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            self.expose(SimpleNamespace(normalize=lambda request: result), row)
+
+    def test_enriched_nonzero_dropped_unsupported_count_rejected(self):
+        result = self.adapter(self.ENRICHMENT).normalize(self.row)
+        result = replace(result, candidate_units=result.candidate_units[1:], dropped_unsupported_count=1)
+        with self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            self.expose(SimpleNamespace(normalize=lambda request: result))
+
+    def test_enriched_duplicate_source_unit_ids_still_rejected(self):
+        self.row["candidate_units"][1]["unit_id"] = self.row["candidate_units"][0]["unit_id"]
+        with self.assertRaisesRegex(sc.CohortError, "duplicate candidate IDs"):
+            self.expose()
+
+    def test_enriched_unsupported_pair_preserved_then_whole_case_ineligible(self):
+        fixture = self.fixture()
+        row = fixture.rows[0]
+        row["candidate_units"][0].update(unit_type="review_certified_visual_unit", modality="ocr")
+        fixture.refresh_source()
+        fixture.save_old()
+        adapter = self.adapter(self.ENRICHMENT)
+        self.assert_preserved(self.expose(adapter, row), row)
+        with fixture.patches():
+            protocol, source, exclusions, *_ = cb.prepare(fixture.inputs)
+            rows, eligible, counts = sl.inventory(source, exclusions, protocol, adapter)
+        item = rows[0]
+        self.assertFalse(item["eligible"])
+        self.assertFalse(item["excluded"])
+        self.assertIsNone(item["exclusion_reason"])
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", item["exposure_status"])
+        self.assertEqual(6, item["exposed_candidate_count"])
+        self.assertNotIn(item["canonical_case_id"], {case.canonical_case_id for case in eligible})
+        self.assertEqual(1, counts["exposed_candidate_contract_ineligible_case_count"])
+        self.assertEqual(0, counts["phase4a_exposure_failure_count"])
+        self.assertEqual([{"unit_type": "review_certified_visual_unit", "modality": "ocr", "count": 1}],
+                         counts["exposed_unsupported_pair_counts"])
+
+    def test_enrichment_values_do_not_affect_eligibility_hashes_split_or_membership(self):
+        fixture = self.fixture()
+        fixture.rows[0]["candidate_units"][0].update(unit_type="review_certified_visual_unit", modality="ocr")
+        fixture.refresh_source()
+        fixture.save_old()
+        variants = (self.ENRICHMENT, {
+            "evidence_refs": ["DIFFERENT_SYNTHETIC_REFERENCE", "SECOND_REFERENCE"],
+            "frame_ids": [8, 19], "phase1_source": "DIFFERENT_VISUAL_SOURCE",
+            "source_snippet_type": "DIFFERENT_SNIPPET_TYPE",
+        })
+        snapshots = []
+        with fixture.patches():
+            protocol, source, exclusions, *_ = cb.prepare(fixture.inputs)
+            for metadata in variants:
+                rows, eligible, counts = sl.inventory(source, exclusions, protocol, self.adapter(metadata))
+                selected = cb.select(eligible, exclusions, protocol)
+                self.assertIsNotNone(selected)
+                self.assertEqual(120, len(selected))
+                self.assertEqual({"repair_train": 96, "repair_dev": 24},
+                                 dict(Counter(item.repair_split for item in selected)))
+                self.assertTrue(all(len(item.sampling_hash) == len(item.split_hash) == 64 for item in selected))
+                snapshots.append((rows, eligible, counts, selected))
+        # Selection equality includes the core cases, membership, hashes and split.
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_no_speculative_enrichment_value_type_or_provenance_rules(self):
+        for metadata in ({key: None for key in self.ENRICHMENT},
+                         {key: {"opaque": [False, 7]} for key in self.ENRICHMENT}):
+            with self.subTest(metadata=metadata):
+                self.assert_preserved(self.expose(self.adapter(metadata)), self.row)
+
+    def test_enrichment_never_leaks_to_synthetic_requests_reviewers_or_private_mapping(self):
+        fixture = self.fixture()
+        with fixture.patches():
+            cb.preflight(fixture.inputs, fixture.preflight)
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root",
+                              return_value=self.adapter(self.ENRICHMENT)):
+                report = cb.build(fixture.inputs, fixture.build_dir,
+                                  fixture.preflight / "cohort_source_preflight_report.json")
+        self.assertEqual(cb.PASS_STATUS, report["status"])
+        requests = [json.loads(line) for line in
+                    (fixture.build_dir / "repair_development_requests.jsonl").read_text().splitlines()]
+        self.assertEqual(120, len(requests))
+        source = {(row["dataset"], row["case_id"]): row for row in fixture.rows}
+        for request in requests:
+            raw = source[request["dataset"], request["original_case_id"]]
+            expected = [dict(unit, original_candidate_position=i) for i, unit in enumerate(raw["candidate_units"])]
+            self.assertEqual(raw["claim"], request["claim"])
+            self.assertEqual(expected, request["candidate_units"])
+        for reviewer in ("A", "B"):
+            with (fixture.build_dir / f"reviewer_{reviewer}_template.csv").open(newline="") as stream:
+                reader = csv.DictReader(stream)
+                self.assertEqual(sc.PUBLIC_COLUMNS, tuple(reader.fieldnames))
+                public = list(reader)
+            self.assertEqual(720, len(public))
+            self.assertTrue(all(row[key] == "" for row in public for key in sc.PUBLIC_COLUMNS[-3:]))
+        for name in ("repair_development_requests.jsonl", "reviewer_A_template.csv",
+                     "reviewer_B_template.csv", "review_mapping_private.json"):
+            text = (fixture.build_dir / name).read_text()
+            for key in self.ENRICHMENT:
+                self.assertNotIn(key, text)
+            self.assertNotIn("R4_METADATA_ONLY", text)
+
+    def test_r3_preflight_cannot_authorize_r4_build_and_is_preserved(self):
+        fixture = self.fixture()
+        r3_revision = "step2.6r-3c2a-r3-v1"
+        with fixture.patches():
+            with patch.object(cb, "IMPLEMENTATION_REVISION", r3_revision), \
+                    patch.object(sc, "IMPLEMENTATION_REVISION", r3_revision):
+                report = cb.preflight(fixture.inputs, fixture.preflight)
+            self.assertEqual(r3_revision, report["implementation_revision"])
+            before = {path.name: path.read_bytes() for path in fixture.preflight.iterdir()}
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root") as loader, \
+                    self.assertRaisesRegex(sc.CohortError, "not byte-consistent"):
+                cb.build(fixture.inputs, fixture.build_dir,
+                         fixture.preflight / "cohort_source_preflight_report.json")
+            loader.assert_not_called()
+        self.assertFalse(fixture.build_dir.exists())
+        self.assertEqual(before, {path.name: path.read_bytes() for path in fixture.preflight.iterdir()})
+
+    def test_changed_implementation_hash_invalidates_preflight_even_at_same_revision(self):
+        fixture = self.fixture()
+        with fixture.patches():
+            cb.preflight(fixture.inputs, fixture.preflight)
+            lock_path = fixture.preflight / "cohort_source_lock.json"
+            lock = ar.read_json(lock_path)
+            record = next(item for item in lock["artifacts"]
+                          if item["path"] == str(Path(sl.__file__).resolve()))
+            record["sha256"] = "0" * 64
+            lock_sha = write_json(lock_path, lock, True)
+            report_path = fixture.preflight / "cohort_source_preflight_report.json"
+            report = ar.read_json(report_path)
+            report["cohort_source_lock_sha256"] = lock_sha
+            write_json(report_path, report, True)
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root") as loader, \
+                    self.assertRaisesRegex(sc.CohortError, "not byte-consistent"):
+                cb.build(fixture.inputs, fixture.build_dir, report_path)
+            loader.assert_not_called()
+        self.assertFalse(fixture.build_dir.exists())
+
+    def test_new_r4_sibling_preflight_preserves_historical_r3_artifacts(self):
+        fixture = self.fixture()
+        with fixture.patches():
+            with patch.object(cb, "IMPLEMENTATION_REVISION", "step2.6r-3c2a-r3-v1"):
+                cb.preflight(fixture.inputs, fixture.preflight)
+            before = {path.name: path.read_bytes() for path in fixture.preflight.iterdir()}
+            r4_path = fixture.outputs / "00b_cohort_source_preflight_r4"
+            report = cb.preflight(fixture.inputs, r4_path)
+            self.assertEqual("step2.6r-3c2a-r4-v1", report["implementation_revision"])
+            with patch.object(cb.Phase4ANormalizationExposureAdapter, "from_project_root",
+                              return_value=self.adapter(self.ENRICHMENT)):
+                built = cb.build(fixture.inputs, fixture.build_dir,
+                                 r4_path / "cohort_source_preflight_report.json")
+        self.assertEqual(cb.PASS_STATUS, built["status"])
+        self.assertEqual(before, {path.name: path.read_bytes() for path in fixture.preflight.iterdir()})
 
 
 if __name__ == "__main__":

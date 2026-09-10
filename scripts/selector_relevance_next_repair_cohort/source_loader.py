@@ -391,13 +391,21 @@ def expose(row, row_index, adapter, protocol, train_sha):
         raise CohortError("Phase4A candidate deletion/accounting drift")
     units = []
     for unit in result.candidate_units:
-        if not isinstance(unit, dict) or set(unit) != set(CANDIDATE_FIELDS):
-            raise CohortError("forbidden field or projected candidate schema drift")
+        if not isinstance(unit, dict) or set(unit) not in schemas.PHASE4A_RETURN_SCHEMAS:
+            raise CohortError("forbidden field or authoritative candidate schema drift")
+        if not all(isinstance(unit[k], str) and unit[k].strip() for k in CANDIDATE_FIELDS):
+            raise CohortError("returned candidate core fields must be nonblank strings")
         units.append(unit)
-    if units != expected_units:
+    # Compare only the frozen core, position by position. Enrichment values have
+    # no scientific role and no established structural type contract here.
+    if len(units) != len(expected_units) or any(
+            unit[k] != expected[k]
+            for unit, expected in zip(units, expected_units) for k in CANDIDATE_FIELDS):
         raise CohortError("Phase4A candidate deletion/mutation/order drift")
     if len({u["unit_id"] for u in units}) != len(units):
         raise CohortError("duplicate candidate IDs")
+    # Project fields only after every schema/preservation check; never filter
+    # units. The existing inventory applies whole-case pair eligibility later.
     return Case(dataset, canonical, original, row_index, saved["claim"],
                 tuple(tuple(u[k] for k in CANDIDATE_FIELDS) for u in units))
 

@@ -1,6 +1,6 @@
 # Step 2.6R-3C2-A: score-blind repair-development cohort
 
-Implementation: `step2.6r-3c2a-r3-v1`. Repair family:
+Implementation: `step2.6r-3c2a-r4-v1`. Repair family:
 `G1-RelevanceSelector-NaturalPairwise-v1`.
 
 This package constructs future repair-development data. It does not train,
@@ -182,12 +182,59 @@ raw request, with original unit IDs, types, modalities, text and order, is passe
 to the unchanged authoritative adapter during build. The existing strict visual
 policy invocation remains unchanged; no dropping mode is introduced.
 
-Normalization must preserve the original ordered prefix up to the frozen maximum
-24 exactly, with correct source/truncation counts and zero dropped unsupported
-units. Deletion, reordering, mutation, added projected fields, duplicate exposed
-IDs or runtime/interface drift remain global integrity failures (exit 2). A plain
-normalization `ValueError` for an otherwise valid request remains an exposure
+Normalization must preserve the original ordered four-core-field prefix up to the
+frozen maximum 24 exactly, with correct source/truncation counts and zero dropped
+unsupported units. Deletion, insertion, reordering, core mutation, unknown returned
+fields, duplicate exposed IDs or runtime/interface drift remain global integrity
+failures (exit 2). A plain normalization `ValueError` for an otherwise valid request remains an exposure
 failure. These checks finish before candidate eligibility is assessed.
+
+### R4 authoritative return-schema compatibility
+
+R3 incorrectly required every authoritative returned candidate to have exactly
+four keys and compared entire returned dictionaries with the raw prefix. The
+supplied score-free, label-free, model-free DICC diagnosis observed the same
+eight-key enriched representation for every exposed unit, with no missing core
+keys. This was an interface representation mismatch, not scientific candidate
+drift. The external Phase4A adapter and normalizer remain unchanged.
+
+R4 accepts a dict with **exactly one** of these two key sets:
+
+```text
+core-only:
+{unit_id, unit_type, modality, text}
+
+authoritative enriched:
+{unit_id, unit_type, modality, text,
+ evidence_refs, frame_ids, phase1_source, source_snippet_type}
+```
+
+Missing core keys, any nonempty proper subset of the four enrichment fields, or
+any unknown key fail closed. This rejects all additional model, label, score and
+ranking fields, including `selection_score`, `veracity_logits`, `label`,
+`prediction` and `arbitrary_unknown_metadata`; there is no unrestricted projection
+or extra-key bypass. Each core value must be a nonblank string and equal the
+corresponding raw-prefix value exactly, including whitespace and Unicode.
+
+After exact schema, core structure, source/truncation/drop accounting, ordered
+core equality and duplicate-ID validation, each returned object becomes the same
+one four-field candidate in `Case.candidates`. This is field projection, never
+candidate filtering. Candidate count and order are unchanged. The existing R3
+whole-case pair check runs only after this validated projection. An enriched
+`review_certified_visual_unit/ocr` object passes schema validation but makes its
+whole case `INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT`, with `eligible=false` and
+`excluded=false`; its unit is neither removed nor converted. No visual
+reintegration is authorized.
+
+The four enrichment values have no scientific role. The local adapter contract
+does not establish their exact value types, so R4 validates only their key-set
+presence and adds no speculative type or provenance rules. Their values never
+affect identity/pair/count eligibility, sampling or split hashes, membership,
+review order/labels, training, model selection or future audit gating. They are
+absent from requests, A/B templates and private mappings. The existing request
+schema still adds `original_candidate_position` to each four-field candidate.
+R1 publication, R2 historical Train provenance and R3 scientific eligibility
+semantics remain unchanged, as do frozen 3C1, exclusions, salts and Frozen G1.
 
 Only the FINAL exposed pool is checked against the frozen pairs:
 `evidence/text`, `title_span/text`, `transcript/text`, `ocr/ocr`. If any final pair
@@ -377,18 +424,43 @@ Exit codes: **0** valid PASS; **1** atomically frozen feasibility BLOCKED;
 **2** invalid input, integrity, runtime or contract failure. A changed scientific
 contract cannot be bypassed by CLI flags.
 
-## Proposed R3 DICC commands — report only
+## R3 history and required new R4 preflight
+
+The supplied reviewed DICC commit is
+`82108e59d63e8793c4d296bc0812a664f5aaa79d`. Its R3 source preflight is CLOSED/PASS
+with `NEXT_REPAIR_COHORT_SOURCE_PREFLIGHT_PASS` and frozen-contract verification
+`3C2A_R3_FROZEN_PREFLIGHT_CONTRACT_PASS`. These are supplied historical results,
+not locally rerun results. The first authorized R3 build returned
+`NEXT_REPAIR_COHORT_INVALID`, `CohortError`,
+`forbidden field or projected candidate schema drift`, exit 2. It published no
+real cohort or reviewer packet. This remains an engineering integration event,
+not feasibility BLOCKED, cohort PASS or a selector/relevance result. Do not rerun
+the R3 build or delete, overwrite or relabel its valid historical preflight.
+
+R4 changes the implementation revision and source hashes. The unchanged approval
+logic requires exact current report/source-lock bytes, so an R3 preflight cannot
+authorize an R4 build. Synthetic tests independently cover stale revision and
+stale implementation-hash rejection before adapter creation, plus preservation
+of the old preflight when a new R4 sibling is published. After a later reviewed
+commit/push and DICC regression, create and review a new R4 preflight. Any later
+separately authorized R4 build must use only that approved R4 report and a new
+build output directory. No real preflight or build is authorized by this repair.
+
+## Proposed R4 DICC commands — report only
 
 Use Bash and the existing DICC environment after a later reviewed commit/push.
 No DICC command is executed by this implementation task. Retain the canonical
 input variables from the read-only diagnosis; no historical alias is substituted
 for a top-level input. Real construction still requires review of the repaired
-preflight; no real build command is provided in R3.
+R4 preflight; no real build command is provided here.
 
 ```bash
 ROOT=/scr/user/kevin2002/TensorCat/uni-rumor
 DEFENSE="$ROOT/MDU/Defense_Engineering"
 PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
+PREFLIGHT_R4_DIR="$DEFENSE/outputs/selector_relevance_next_repair_v1/00b_cohort_source_preflight_r4"
+mkdir -p "$DEFENSE/cache/step2_6r_3c2a_r4_validation/tmp"
+export TMPDIR="$DEFENSE/cache/step2_6r_3c2a_r4_validation/tmp"
 ```
 
 **A. Focused synthetic regression**, including all R1/R2 tests:
@@ -396,7 +468,7 @@ PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m unittest discover -s "$DEFENSE/tests" \
-  -p 'test_selector_relevance_next_repair_cohort.py' -k ExposureEligibilityBoundaryTests -v &&
+  -p 'test_selector_relevance_next_repair_cohort.py' -k AuthoritativeReturnSchemaTests -v &&
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m unittest discover -s "$DEFENSE/tests" \
   -p 'test_selector_relevance_next_repair_cohort.py' -v
@@ -413,7 +485,7 @@ export PYTHONPATH="$DEFENSE"
 "$PY" -m unittest discover -s tests -p 'test_selector_relevance_next_repair_protocol.py' -v
 "$PY" -m unittest discover -s tests -p 'test_selector*.py' -v
 "$PY" -m unittest discover -s tests -v
-PYTHONPYCACHEPREFIX="$DEFENSE/cache/step2_6r_3c2a_r3_pycache" "$PY" -m compileall -q app schemas services adapters webapp scripts tests
+PYTHONPYCACHEPREFIX="$DEFENSE/cache/step2_6r_3c2a_r4_pycache" "$PY" -m compileall -q app schemas services adapters webapp scripts tests
 "$PY" -m app.mock_demo
 git diff --check
 git status --short
@@ -425,7 +497,10 @@ previously supplied canonical future-manifest path. Use
 `FUTURE_EXCLUSION_MANIFESTS=()` only if none were supplied. Use the same array and
 canonical input variables for both commands. Missing variables fail closed.
 
-**C. Real score-blind source preflight**, only after A/B pass:
+**C. New R4 score-blind source preflight**, only after the later reviewed
+commit/push and A/B pass. The proposed directory must not already exist; retain
+all R3 preflight artifacts. Reuse the same verified canonical input paths and
+complete future-exclusion list from R3:
 
 ```bash
 (
@@ -444,7 +519,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   --step3b3-closure-dir "${CLOSURE_DIR:?Reuse the verified canonical closure directory}" \
   --neutral-dir "${NEUTRAL_DIR:?Reuse the verified canonical neutral directory}" \
   --stage-a-invariance-report "${STAGE_A_REPORT:?Reuse the verified canonical Stage-A report}" \
-  --output-dir "${PREFLIGHT_DIR:?Reuse the verified canonical preflight output path}" \
+  --output-dir "${PREFLIGHT_R4_DIR:?Use the new reviewed non-overwriting R4 preflight path}" \
   "${future_args[@]}"
 )
 ```
@@ -461,7 +536,7 @@ set -e
 declare -p FUTURE_EXCLUSION_MANIFESTS >/dev/null
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   - "${ROOT:?}" "${PHASE4A_CONFIG:?}" "${COHORT_DIR:?}" "${CLOSURE_DIR:?}" \
-  "${NEUTRAL_DIR:?}" "${STAGE_A_REPORT:?}" "${PREFLIGHT_DIR:?}" \
+  "${NEUTRAL_DIR:?}" "${STAGE_A_REPORT:?}" "${PREFLIGHT_R4_DIR:?}" \
   "${FUTURE_EXCLUSION_MANIFESTS[@]}" <<'PY'
 import json
 import sys
@@ -482,7 +557,7 @@ for name in expected:
 _, _, _, ledger, source_lock, exclusions, report = cb.prepare(inputs)
 cb.approve(output / "cohort_source_preflight_report.json", ledger, source_lock, exclusions, report)
 ledger.revalidate()
-print(json.dumps({"status": "R3_PREFLIGHT_ARTIFACT_INTEGRITY_PASS",
+print(json.dumps({"status": "R4_PREFLIGHT_ARTIFACT_INTEGRITY_PASS",
                   "implementation_revision": report["implementation_revision"],
                   "phase4a_exposure_performed": False, "real_cohort_written": False}))
 PY
