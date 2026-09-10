@@ -1,6 +1,6 @@
 # Step 2.6R-3C2-A: score-blind repair-development cohort
 
-Implementation: `step2.6r-3c2a-r2-v1`. Repair family:
+Implementation: `step2.6r-3c2a-r3-v1`. Repair family:
 `G1-RelevanceSelector-NaturalPairwise-v1`.
 
 This package constructs future repair-development data. It does not train,
@@ -167,15 +167,60 @@ same-case inherited `:test:` unit-ID exception. It is accepted only with the exa
 authoritative Train SHA, GroundLie360 dataset, top-level Train split and exact
 same-case historical unit-ID pattern. Non-unit-ID ambiguity remains forbidden.
 
-Eligibility requires successful authoritative exposure, 6–24 candidates,
-nonblank exact metadata/text, unique unit IDs and only these pairs:
-`evidence/text`, `title_span/text`, `transcript/text`, `ocr/ocr`.
-Visual, image and unknown pairs fail closed. Normalization must preserve the
-original ordered prefix up to 24 units exactly, with correct truncation accounting
-and no unsupported-unit dropping. Deletion, reordering, mutation, added projected
-fields or runtime/interface drift is invalid. A plain normalization `ValueError`
-for an otherwise valid request is recorded as an exposure failure; integrity and
-adapter-contract errors abort construction with exit 2.
+R3 separates raw source structure from final exposed-candidate eligibility. The
+R2 preflight applied the final `allowed_pairs` to every raw unit, failing before
+exposure with `unsupported/visual source candidate pair`. The supplied DICC
+diagnosis found that the strict authoritative normalizer preserves
+`review_certified_visual_unit/ocr` in some final pools. That observation is not
+an identity exclusion or a special unit-type rule; no diagnostic counts enter
+the implementation.
+
+Preflight still checks locked Train identity/provenance, natural claim, list/dict
+structure and nonblank required candidate strings. It does not apply the final
+pair allowlist to raw candidates and does not import/execute Phase4A. The complete
+raw request, with original unit IDs, types, modalities, text and order, is passed
+to the unchanged authoritative adapter during build. The existing strict visual
+policy invocation remains unchanged; no dropping mode is introduced.
+
+Normalization must preserve the original ordered prefix up to the frozen maximum
+24 exactly, with correct source/truncation counts and zero dropped unsupported
+units. Deletion, reordering, mutation, added projected fields, duplicate exposed
+IDs or runtime/interface drift remain global integrity failures (exit 2). A plain
+normalization `ValueError` for an otherwise valid request remains an exposure
+failure. These checks finish before candidate eligibility is assessed.
+
+Only the FINAL exposed pool is checked against the frozen pairs:
+`evidence/text`, `title_span/text`, `transcript/text`, `ocr/ocr`. If any final pair
+is outside that set, the entire case has `eligible=false`, `excluded=false`,
+`exclusion_reason=null`, status `INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT` and
+`ineligibility_reason=EXPOSED_PAIR_OUTSIDE_FROZEN_ALLOWED_PAIRS`. No unit is dropped,
+renamed or coerced, and the full exposed count is retained in the private
+inventory. This is neither an identity exclusion nor an exposure failure.
+Such cases never enter selection, requests, manifests, A/B packets or mappings.
+
+Only pair-valid cases are then checked against the frozen minimum 6; smaller
+pools have `ineligibility_reason=EXPOSED_CANDIDATE_COUNT_BELOW_MINIMUM`. A pool
+with five allowed units and one unsupported unit is a six-unit contract-ineligible
+case, not a five-unit case. An unsupported raw unit beyond authoritative truncation
+does not invalidate a final pool that contains only allowed pairs. No custom
+reordering or truncation policy is permitted.
+
+Both eligibility inventory and build report carry score-free/text-free counts:
+
+- `phase4a_exposure_attempt_count`, `phase4a_exposure_failure_count`;
+- `exposed_candidate_contract_ineligible_case_count` and
+  `exposed_candidate_contract_ineligible_dataset_counts`;
+- `exposed_unsupported_unit_count` and `exposed_unsupported_pair_counts`
+  (sorted records with `unit_type`, `modality`, `count`);
+- `candidate_count_below_6_count`, `candidate_count_valid_count` and
+  `eligible_unexcluded_counts`.
+
+Attempts partition into exposure failures, candidate-contract ineligible cases,
+pair-valid cases below minimum and eligible cases. Identity exclusions remain
+separate skipped cases. Preflight does not determine final eligibility. Existing
+build report/inventory assembly carries the new counts without changing the
+builder or sampling functions. Fewer than 60 eligible cases in either dataset
+uses the existing feasibility BLOCKED publication with no fallback or resampling.
 
 Only identity enters selection:
 
@@ -332,80 +377,119 @@ Exit codes: **0** valid PASS; **1** atomically frozen feasibility BLOCKED;
 **2** invalid input, integrity, runtime or contract failure. A changed scientific
 contract cannot be bypassed by CLI flags.
 
-## R2 DICC regression after a later reviewed commit
+## Proposed R3 DICC commands — report only
 
-This proposed command runs synthetic focused tests on the actual `/scr`
-filesystem. Run it only after the reviewed repair is committed and available
-on DICC; no commit or remote execution is performed by this implementation task.
-It does not run real preflight, cohort construction, annotation or model inference.
+Use Bash and the existing DICC environment after a later reviewed commit/push.
+No DICC command is executed by this implementation task. Retain the canonical
+input variables from the read-only diagnosis; no historical alias is substituted
+for a top-level input. Real construction still requires review of the repaired
+preflight; no real build command is provided in R3.
 
 ```bash
 ROOT=/scr/user/kevin2002/TensorCat/uni-rumor
 DEFENSE="$ROOT/MDU/Defense_Engineering"
 PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
+```
+
+**A. Focused synthetic regression**, including all R1/R2 tests:
+
+```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
-  -m unittest discover \
-  -s "$DEFENSE/tests" \
+  -m unittest discover -s "$DEFENSE/tests" \
+  -p 'test_selector_relevance_next_repair_cohort.py' -k ExposureEligibilityBoundaryTests -v &&
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
+  -m unittest discover -s "$DEFENSE/tests" \
   -p 'test_selector_relevance_next_repair_cohort.py' -v
 ```
 
-## Proposed DICC commands — do not run locally
-
-The exact old 3B1 cohort subdirectory is not established by repository code.
-Discover its identity-only manifest path first. This command lists paths and
-performs no cohort construction or artifact-content reads:
+**B. Full synthetic regression**:
 
 ```bash
-ROOT=/scr/user/kevin2002/TensorCat/uni-rumor
-DEFENSE="$ROOT/MDU/Defense_Engineering"
-PY=/scr/user/kevin2002/TensorCat/.venv310/bin/python
-AUDIT="$DEFENSE/outputs/selector_relevance_independent_audit_v1"
-find "$AUDIT" -type f -name selected_case_manifest.json -print
+(
+set -e
+cd "$DEFENSE"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$DEFENSE"
+"$PY" -m unittest discover -s tests -p 'test_selector_relevance_next_repair_protocol.py' -v
+"$PY" -m unittest discover -s tests -p 'test_selector*.py' -v
+"$PY" -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX="$DEFENSE/cache/step2_6r_3c2a_r3_pycache" "$PY" -m compileall -q app schemas services adapters webapp scripts tests
+"$PY" -m app.mock_demo
+git diff --check
+git status --short
+)
 ```
 
-After discovery, set `COHORT_DIR` to the exact existing directory printed above
-(without the filename). If multiple candidates exist, identify the intended
-frozen 3B1 build before invoking preflight; do not guess a dated directory.
-The builder itself resolves the exact Train-lock and Stage-A identity-manifest
-paths through that existing source lock.
+Before C and D, define the Bash array `FUTURE_EXCLUSION_MANIFESTS` containing every
+previously supplied canonical future-manifest path. Use
+`FUTURE_EXCLUSION_MANIFESTS=()` only if none were supplied. Use the same array and
+canonical input variables for both commands. Missing variables fail closed.
 
-**A. Score-blind preflight**, only after the later R2 DICC regression passes and
-after setting the existing verified `COHORT_DIR` (or discovering it as above):
-retain the canonical variables from the read-only DICC diagnosis. Their exact
-values are required below; do not replace them with historical aliases.
+**C. Real score-blind source preflight**, only after A/B pass:
 
 ```bash
-: "${COHORT_DIR:?Set COHORT_DIR to the discovered frozen 3B1 directory}"
+(
+set -e
+declare -p FUTURE_EXCLUSION_MANIFESTS >/dev/null
+future_args=()
+for manifest in "${FUTURE_EXCLUSION_MANIFESTS[@]}"; do
+  future_args+=(--future-exclusion-manifest "$manifest")
+done
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
   -m scripts.selector_relevance_next_repair_cohort.run_cohort \
   --preflight \
-  --project-root "$ROOT" \
+  --project-root "${ROOT:?Reuse the verified canonical project root}" \
   --phase4a-config "${PHASE4A_CONFIG:?Reuse the verified canonical Phase4A config}" \
-  --source-3b1-cohort-dir "$COHORT_DIR" \
+  --source-3b1-cohort-dir "${COHORT_DIR:?Reuse the verified canonical frozen 3B1 directory}" \
   --step3b3-closure-dir "${CLOSURE_DIR:?Reuse the verified canonical closure directory}" \
   --neutral-dir "${NEUTRAL_DIR:?Reuse the verified canonical neutral directory}" \
   --stage-a-invariance-report "${STAGE_A_REPORT:?Reuse the verified canonical Stage-A report}" \
-  --output-dir "${PREFLIGHT_DIR:?Reuse the verified canonical preflight output path}"
+  --output-dir "${PREFLIGHT_DIR:?Reuse the verified canonical preflight output path}" \
+  "${future_args[@]}"
+)
 ```
 
-**B. Deterministic build**, only after the resulting preflight is reviewed and
-explicitly approved for the later DICC run:
+**D. Strict preflight artifact integrity verification**, read-only. Require
+exactly three JSON artifacts and their sidecars, strict paths, current source and
+implementation hashes, fresh exclusion locks, R2 alias provenance and byte-exact
+report/lock agreement. This reuses preflight preparation and input revalidation;
+it performs no Phase4A import/exposure, publication or cohort construction.
 
 ```bash
-: "${COHORT_DIR:?Set COHORT_DIR to the discovered frozen 3B1 directory}"
+(
+set -e
+declare -p FUTURE_EXCLUSION_MANIFESTS >/dev/null
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$DEFENSE" "$PY" \
-  -m scripts.selector_relevance_next_repair_cohort.run_cohort \
-  --build-cohort \
-  --project-root "$ROOT" \
-  --phase4a-config "$ROOT/MDU/configs/clip12_phase4a_frozen_g1_inference_handoff.json" \
-  --source-3b1-cohort-dir "$COHORT_DIR" \
-  --step3b3-closure-dir "$AUDIT/06_one_shot_selector_evaluation_closure" \
-  --neutral-dir "$DEFENSE/outputs/selector_relevance_calibration_neutral_v1/01_neutral_revision" \
-  --stage-a-invariance-report "$DEFENSE/outputs/selector_relevance_gate_v1/00_prediction_invariance_smoke/prediction_invariance_smoke_report.json" \
-  --approved-preflight-report "$DEFENSE/outputs/selector_relevance_next_repair_v1/00_cohort_source_preflight/cohort_source_preflight_report.json" \
-  --output-dir "$DEFENSE/outputs/selector_relevance_next_repair_v1/01_repair_development_cohort"
+  - "${ROOT:?}" "${PHASE4A_CONFIG:?}" "${COHORT_DIR:?}" "${CLOSURE_DIR:?}" \
+  "${NEUTRAL_DIR:?}" "${STAGE_A_REPORT:?}" "${PREFLIGHT_DIR:?}" \
+  "${FUTURE_EXCLUSION_MANIFESTS[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+from scripts.selector_relevance_next_repair_cohort import artifacts as ar, cohort_builder as cb
+from scripts.selector_relevance_next_repair_cohort.schemas import CohortError, Inputs
+
+paths = [Path(value) for value in sys.argv[1:]]
+inputs = Inputs(*paths[:6], future_exclusion_manifests=tuple(paths[7:]))
+output = ar.safe_path(paths[6])
+names = {"cohort_source_preflight_report.json", "cohort_source_lock.json", "exclusion_source_lock.json"}
+expected = names | {Path(name).with_suffix(".sha256").name for name in names}
+if {path.name for path in output.iterdir()} != expected:
+    raise CohortError("preflight artifact set differs from exact six-file contract")
+for name in expected:
+    if not ar.safe_path(output / name).is_file():
+        raise CohortError("preflight artifact is not a canonical regular file")
+_, _, _, ledger, source_lock, exclusions, report = cb.prepare(inputs)
+cb.approve(output / "cohort_source_preflight_report.json", ledger, source_lock, exclusions, report)
+ledger.revalidate()
+print(json.dumps({"status": "R3_PREFLIGHT_ARTIFACT_INTEGRITY_PASS",
+                  "implementation_revision": report["implementation_revision"],
+                  "phase4a_exposure_performed": False, "real_cohort_written": False}))
+PY
+)
 ```
 
-Append every explicitly supplied `--future-exclusion-manifest /exact/path.json`
-to **both** invocations. No future manifest is guessed. No commands in this
-section authorize inference, training, annotation, commit or push.
+The verification command checks engineering provenance only. It does not certify
+cohort feasibility or produce a scientific result. Review the repaired preflight
+before separately authorizing real construction. No inference, training,
+annotation, commit or push is performed by these proposed preflight commands.

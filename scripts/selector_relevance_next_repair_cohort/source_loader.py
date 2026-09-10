@@ -359,11 +359,9 @@ def exposure_request(row, row_index, protocol, train_sha):
         raise CohortError("ambiguous candidate provenance")
     request = {"dataset": dataset, "case_id": original, "claim": claim,
                "candidate_units": [{k: u.get(k) for k in CANDIDATE_FIELDS} for u in raw]}
-    pairs = {tuple(pair) for pair in protocol["development_cohort"]["allowed_pairs"]}
-    # Unsupported source units must not be silently dropped or hidden by errors.
+    # Raw source vocabulary is wider than the final exposed-pair contract.
+    # Preserve every structurally valid unit for authoritative normalization.
     for unit in request["candidate_units"]:
-        if (unit["unit_type"], unit["modality"]) not in pairs:
-            raise CohortError("unsupported/visual source candidate pair")
         if not all(isinstance(v, str) and v.strip() for v in unit.values()):
             raise CohortError("candidate fields must be nonblank strings")
     return dataset, original, canonical, request
@@ -374,7 +372,6 @@ def expose(row, row_index, adapter, protocol, train_sha):
     saved = copy.deepcopy(request)
     raw = saved["candidate_units"]
     maximum = protocol["development_cohort"]["maximum_candidates"]
-    pairs = {tuple(pair) for pair in protocol["development_cohort"]["allowed_pairs"]}
     try:
         result = adapter.normalize(request)
     except (DatasetBuildError, FrozenExposureUnavailableError, TypeError, ImportError, OSError) as exc:
@@ -396,8 +393,6 @@ def expose(row, row_index, adapter, protocol, train_sha):
     for unit in result.candidate_units:
         if not isinstance(unit, dict) or set(unit) != set(CANDIDATE_FIELDS):
             raise CohortError("forbidden field or projected candidate schema drift")
-        if (unit["unit_type"], unit["modality"]) not in pairs:
-            raise CohortError("unsupported/visual exposed pair")
         units.append(unit)
     if units != expected_units:
         raise CohortError("Phase4A candidate deletion/mutation/order drift")
@@ -411,6 +406,9 @@ def inventory(source, exclusions, protocol, adapter=None):
     rows, eligible, seen = [], [], set()
     counts = Counter()
     attempts = failures = below = valid = 0
+    contract_ineligible = Counter()
+    unsupported_pairs = Counter()
+    pairs = {tuple(pair) for pair in protocol["development_cohort"]["allowed_pairs"]}
     by_name = exclusions.ordered
     for index, line, metadata in read_identity_rows(source):
         dataset, original, canonical = identity(metadata, require_train=True)
@@ -423,7 +421,8 @@ def inventory(source, exclusions, protocol, adapter=None):
                 "original_case_id": original, "source_row_index": index,
                 "excluded": bool(reasons), "exclusion_reason": reasons[0] if reasons else None,
                 "exposure_status": "SKIPPED_EXCLUDED" if reasons else "NOT_RUN_PREFLIGHT",
-                "exposed_candidate_count": None, "eligible": False}
+                "exposed_candidate_count": None, "eligible": False,
+                "ineligibility_reason": None}
         # Do not deserialize excluded content, especially the sealed six.
         if not reasons:
             row = project_line(line, IDENTITY_FIELDS | {"claim", "candidate_units"}
@@ -440,8 +439,18 @@ def inventory(source, exclusions, protocol, adapter=None):
                 else:
                     count = len(case.candidates)
                     item.update(exposure_status="PASS", exposed_candidate_count=count)
-                    if count < protocol["development_cohort"]["minimum_candidates"]:
+                    # Count violations in the complete, preservation-validated
+                    # exposure. Never filter/coerce units to manufacture a pool.
+                    unsupported = Counter((unit[1], unit[2]) for unit in case.candidates
+                                          if (unit[1], unit[2]) not in pairs)
+                    if unsupported:
+                        contract_ineligible[dataset] += 1
+                        unsupported_pairs.update(unsupported)
+                        item.update(exposure_status="INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT",
+                                    ineligibility_reason="EXPOSED_PAIR_OUTSIDE_FROZEN_ALLOWED_PAIRS")
+                    elif count < protocol["development_cohort"]["minimum_candidates"]:
                         below += 1
+                        item["ineligibility_reason"] = "EXPOSED_CANDIDATE_COUNT_BELOW_MINIMUM"
                     else:
                         valid += 1
                         eligible.append(case)
@@ -453,6 +462,13 @@ def inventory(source, exclusions, protocol, adapter=None):
                   "phase4a_exposure_attempt_count": attempts,
                   "phase4a_exposure_failure_count": failures,
                   "phase4a_exposure_skipped_excluded_count": sum(r["excluded"] for r in rows),
+                  "exposed_candidate_contract_ineligible_case_count": sum(contract_ineligible.values()),
+                  "exposed_candidate_contract_ineligible_dataset_counts": {
+                      d: contract_ineligible[d] for d in counts},
+                  "exposed_unsupported_unit_count": sum(unsupported_pairs.values()),
+                  "exposed_unsupported_pair_counts": [
+                      {"unit_type": pair[0], "modality": pair[1], "count": count}
+                      for pair, count in sorted(unsupported_pairs.items())],
                   "candidate_count_below_6_count": below, "candidate_count_valid_count": valid,
                   "eligible_unexcluded_counts": {d: sum(c.dataset == d for c in eligible)
                                                   for d in counts}}

@@ -14,7 +14,7 @@ from scripts.selector_relevance_independent_audit.schemas import (
     TARGET_DATASET_COUNTS as REVEALED_AUDIT_DATASET_COUNTS,
 )
 
-IMPLEMENTATION_REVISION = "step2.6r-3c2a-r2-v1"
+IMPLEMENTATION_REVISION = "step2.6r-3c2a-r3-v1"
 CLOSURE_HASHES = {
     "step3b3_scientific_summary.json":
         "6ed3401614f68e58ae0efb3a1671f9f2f7b6b8b653f2100660199ee72938fdf0",

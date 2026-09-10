@@ -287,8 +287,15 @@ class PureContracts(unittest.TestCase):
         for pair in (("visual", "visual"), ("image", "image"), ("evidence", "audio"), ("ocr", "text")):
             row = source_row()
             row["candidate_units"][0].update(unit_type=pair[0], modality=pair[1])
-            with self.subTest(pair=pair), self.assertRaises(sc.CohortError):
-                sl.expose(row, 0, FixtureAdapter(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+            # R3 rejects whole-case eligibility after exposure, not raw syntax.
+            with self.subTest(pair=pair), \
+                    patch.object(sl, "read_identity_rows", return_value=[(0, json.dumps(row), row)]), \
+                    patch.object(sc, "EXPECTED_SOURCE_COUNTS", {row["dataset"]: 1}):
+                rows, eligible, _ = sl.inventory(None, SimpleNamespace(ordered=()),
+                                                 self.protocol, FixtureAdapter())
+            self.assertEqual([], eligible)
+            self.assertFalse(rows[0]["eligible"])
+            self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", rows[0]["exposure_status"])
 
     def test_groundlie_inherited_exception_exact(self):
         row = source_row(ident="123456")
@@ -1204,7 +1211,7 @@ class PublicationCompatibilityTests(unittest.TestCase):
             results.join_thread()
 
     def test_revision_only_scientific_constants_and_salts_unchanged(self):
-        self.assertEqual("step2.6r-3c2a-r2-v1", sc.IMPLEMENTATION_REVISION)
+        self.assertEqual("step2.6r-3c2a-r3-v1", sc.IMPLEMENTATION_REVISION)
         self.assertEqual({"A": "step2.6r-3c2a-reviewer-a-v1", "B": "step2.6r-3c2a-reviewer-b-v1"}, sc.REVIEWER_SALTS)
         protocol = frozen.load_preregistration()
         self.assertEqual("step2.6r-3c1-v1", protocol["implementation_revision"])
@@ -1583,6 +1590,437 @@ class HistoricalTrainPathTests(unittest.TestCase):
         for path, data in original.items():
             self.assertEqual(data, path.read_bytes())
         self.assertEqual("Academic_Research/outputs", os.readlink(self.alias))
+
+
+class ExposureEligibilityBoundaryTests(unittest.TestCase):
+    """R3 uses only synthetic source content and injected pure normalization."""
+
+    def setUp(self):
+        SYNTHETIC_ROOT.mkdir(parents=True, exist_ok=True)
+        temp = tempfile.TemporaryDirectory(prefix="eligibility-", dir=SYNTHETIC_ROOT)
+        self.addCleanup(temp.cleanup)
+        self.f = Fixture(Path(temp.name))
+        self.protocol = frozen.load_preregistration()
+
+    def refresh(self):
+        self.f.refresh_source()
+        self.f.save_old()
+
+    def unsupported(self, row=0, position=0, pair=("review_certified_visual_unit", "ocr")):
+        self.f.rows[row]["candidate_units"][position].update(unit_type=pair[0], modality=pair[1])
+
+    def preflight(self):
+        with self.f.patches():
+            return cb.preflight(self.f.inputs, self.f.preflight)
+
+    def build(self):
+        with self.f.patches():
+            return cb.build(self.f.inputs, self.f.build_dir,
+                            self.f.preflight / "cohort_source_preflight_report.json")
+
+    def inventory(self, adapter=None):
+        with self.f.patches():
+            protocol, source, exclusions, *_ = cb.prepare(self.f.inputs)
+            rows, eligible, counts = sl.inventory(source, exclusions, protocol,
+                                                  adapter if adapter is not None else FixtureAdapter())
+        return exclusions, rows, eligible, counts
+
+    def assert_raw_rejected(self):
+        self.refresh()
+        with self.assertRaises(sc.CohortError):
+            self.preflight()
+        self.assertFalse(self.f.preflight.exists())
+
+    def test_locked_raw_unsupported_pair_passes_preflight_without_phase4a_or_models(self):
+        self.unsupported()
+        self.refresh()
+        self.f.engine.write_text('raise AssertionError("NO_IMPORT")\ndef normalize_request(request):\n    pass\n')
+        original_import = builtins.__import__
+        def guard(name, *args, **kwargs):
+            self.assertNotIn(name.split(".")[0], {"torch", "transformers", "paddle"})
+            return original_import(name, *args, **kwargs)
+        with patch.object(builtins, "__import__", side_effect=guard), \
+                patch.object(sl.Phase4ANormalizationExposureAdapter, "from_project_root",
+                             side_effect=AssertionError("NO_PHASE4A_IMPORT")), \
+                patch.object(sl, "expose", side_effect=AssertionError("NO_EXPOSURE")):
+            report = self.preflight()
+        self.assertEqual(cb.PREFLIGHT_STATUS, report["status"])
+        for field in ("phase4a_normalization_imported", "phase4a_exposure_performed",
+                      "real_cohort_written", "reviewer_packets_written", "model_loaded"):
+            self.assertIs(False, report[field])
+        self.assertEqual(self.f.train_sha, report["authoritative_train_sha256"])
+        with self.f.patches():
+            prepared = cb.prepare(self.f.inputs)
+            rows, eligible, counts = sl.inventory(prepared[1], prepared[2], self.protocol)
+        self.assertEqual([], eligible)
+        self.assertEqual("NOT_RUN_PREFLIGHT", rows[0]["exposure_status"])
+        self.assertIsNone(rows[0]["ineligibility_reason"])
+        self.assertEqual(0, counts["phase4a_exposure_attempt_count"])
+        self.assertEqual(0, counts["exposed_candidate_contract_ineligible_case_count"])
+
+    def test_raw_request_preserves_unknown_pair_fields_text_and_order(self):
+        self.unsupported()
+        row = self.f.rows[0]
+        before = copy.deepcopy(row)
+        *_, request = sl.exposure_request(row, 0, self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+        self.assertEqual(before, row)
+        self.assertEqual(before["candidate_units"], request["candidate_units"])
+        self.assertEqual(before["claim"], request["claim"])
+
+    def test_malformed_raw_candidate_list_or_member_rejected(self):
+        for value in (None, {}, "invalid", [None], ["invalid"]):
+            with self.subTest(value=value):
+                self.f.rows[0]["candidate_units"] = value
+                self.assert_raw_rejected()
+
+    def test_missing_raw_required_candidate_fields_rejected(self):
+        original = copy.deepcopy(self.f.rows[0])
+        for field in sc.CANDIDATE_FIELDS:
+            with self.subTest(field=field):
+                self.f.rows[0] = copy.deepcopy(original)
+                self.unsupported()
+                del self.f.rows[0]["candidate_units"][0][field]
+                self.assert_raw_rejected()
+
+    def test_nonstring_raw_candidate_fields_rejected(self):
+        for field in sc.CANDIDATE_FIELDS:
+            with self.subTest(field=field):
+                self.f.rows[0] = source_row(ident="synthetic-0000")
+                self.f.rows[0]["candidate_units"][0][field] = ["invalid"]
+                self.assert_raw_rejected()
+
+    def assert_blank_rejected(self, field):
+        self.unsupported()
+        self.f.rows[0]["candidate_units"][0][field] = " \t\n "
+        self.assert_raw_rejected()
+
+    def test_blank_raw_unit_id_rejected(self):
+        self.assert_blank_rejected("unit_id")
+
+    def test_blank_raw_unit_type_rejected(self):
+        self.assert_blank_rejected("unit_type")
+
+    def test_blank_raw_modality_rejected(self):
+        self.assert_blank_rejected("modality")
+
+    def test_blank_raw_text_rejected(self):
+        self.assert_blank_rejected("text")
+
+    def test_missing_or_blank_claim_still_rejected(self):
+        self.unsupported()
+        self.f.rows[0]["claim"] = "  "
+        self.assert_raw_rejected()
+
+    def test_unsupported_raw_candidate_forbidden_provenance_still_rejected(self):
+        self.unsupported()
+        self.f.rows[0]["candidate_units"][0]["source_path"] = "/synthetic/test/source"
+        self.assert_raw_rejected()
+
+    def test_excluded_and_sealed_candidates_never_deserialized_or_exposed(self):
+        ids = [self.f.audit_ids[0], sorted(sc.SEALED_CHALLENGE_IDS)[0]]
+        for canonical in ids:
+            dataset, ident = canonical.split(":", 1)
+            self.f.rows.append({"dataset": dataset, "case_id": ident, "split": "Train",
+                                "claim": "R3_PRIVATE_SENTINEL", "candidate_units": "R3_PRIVATE_SENTINEL"})
+        self.unsupported()
+        self.refresh()
+        original_loads = json.loads
+        def guard(value, *args, **kwargs):
+            self.assertNotIn("R3_PRIVATE_SENTINEL", value)
+            return original_loads(value, *args, **kwargs)
+        with patch.object(sl.json, "loads", side_effect=guard):
+            self.preflight()
+            _, rows, _, counts = self.inventory()
+        skipped = [row for row in rows if row["canonical_case_id"] in ids]
+        self.assertEqual(2, len(skipped))
+        self.assertTrue(all(row["excluded"] and row["exposure_status"] == "SKIPPED_EXCLUDED"
+                            and row["ineligibility_reason"] is None for row in skipped))
+        self.assertEqual(140, counts["phase4a_exposure_attempt_count"])
+        self.assertEqual(2, counts["phase4a_exposure_skipped_excluded_count"])
+        self.assertEqual(1, counts["exposed_candidate_contract_ineligible_case_count"])
+
+    def test_all_final_allowed_pairs_can_enter_eligible_pool(self):
+        for index, pair in enumerate(self.protocol["development_cohort"]["allowed_pairs"]):
+            self.f.rows[0]["candidate_units"][index].update(unit_type=pair[0], modality=pair[1])
+        self.refresh()
+        _, rows, eligible, counts = self.inventory()
+        self.assertTrue(rows[0]["eligible"])
+        self.assertEqual("PASS", rows[0]["exposure_status"])
+        self.assertEqual(tuple(tuple(u[k] for k in sc.CANDIDATE_FIELDS)
+                               for u in self.f.rows[0]["candidate_units"]), eligible[0].candidates)
+        self.assertEqual(0, counts["exposed_unsupported_unit_count"])
+
+    def test_five_allowed_plus_one_unsupported_invalidates_whole_case(self):
+        self.unsupported()
+        self.refresh()
+        exclusions, rows, eligible, counts = self.inventory()
+        item = rows[0]
+        self.assertFalse(item["excluded"])
+        self.assertIsNone(item["exclusion_reason"])
+        self.assertFalse(item["eligible"])
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", item["exposure_status"])
+        self.assertEqual("EXPOSED_PAIR_OUTSIDE_FROZEN_ALLOWED_PAIRS", item["ineligibility_reason"])
+        self.assertEqual(6, item["exposed_candidate_count"])
+        self.assertTrue(all(item["canonical_case_id"] not in group.canonical_case_ids for group in exclusions.ordered))
+        self.assertTrue(all(case.canonical_case_id != item["canonical_case_id"] for case in eligible))
+        self.assertEqual(0, counts["candidate_count_below_6_count"])
+        self.assertEqual(139, counts["candidate_count_valid_count"])
+        self.assertEqual(0, counts["phase4a_exposure_failure_count"])
+        self.assertEqual(1, counts["exposed_unsupported_unit_count"])
+
+    def test_multiple_unsupported_units_count_once_per_case_and_by_pair(self):
+        for index in range(3):
+            self.unsupported(position=index)
+        for index in range(3, 5):
+            self.unsupported(position=index, pair=("synthetic_signal", "synthetic_modality"))
+        self.unsupported(row=70)
+        self.unsupported(row=70, position=1)
+        self.refresh()
+        _, _, eligible, counts = self.inventory()
+        self.assertEqual(2, counts["exposed_candidate_contract_ineligible_case_count"])
+        self.assertEqual({"GroundLie360": 1, "TRUE-3MFact": 1},
+                         counts["exposed_candidate_contract_ineligible_dataset_counts"])
+        self.assertEqual(7, counts["exposed_unsupported_unit_count"])
+        self.assertEqual([{"unit_type": "review_certified_visual_unit", "modality": "ocr", "count": 5},
+                          {"unit_type": "synthetic_signal", "modality": "synthetic_modality", "count": 2}],
+                         counts["exposed_unsupported_pair_counts"])
+        self.assertEqual(138, len(eligible))
+
+    def test_unrelated_unsupported_pair_gets_same_generic_status(self):
+        self.unsupported()
+        self.unsupported(row=1, pair=("synthetic_signal", "synthetic_modality"))
+        self.refresh()
+        _, rows, _, _ = self.inventory()
+        self.assertEqual(rows[0]["exposure_status"], rows[1]["exposure_status"])
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", rows[1]["exposure_status"])
+        self.assertNotIn("review_certified_visual_unit", Path(sl.__file__).read_text())
+
+    def test_complete_returned_candidate_pool_is_not_filtered_or_mutated(self):
+        self.unsupported()
+        self.refresh()
+        adapter = FixtureAdapter()
+        returned = []
+        original = adapter.normalize
+        def capture(request):
+            result = original(request)
+            returned.append((result, copy.deepcopy(result)))
+            return result
+        with patch.object(adapter, "normalize", side_effect=capture):
+            _, rows, _, _ = self.inventory(adapter)
+        self.assertTrue(returned)
+        for result, before in returned:
+            self.assertEqual(before, result)
+        self.assertEqual(6, len(returned[0][0].candidate_units))
+        self.assertEqual("review_certified_visual_unit", returned[0][0].candidate_units[0]["unit_type"])
+        self.assertEqual(6, rows[0]["exposed_candidate_count"])
+
+    def test_contract_check_precedes_minimum_candidate_threshold(self):
+        self.f.rows[0]["candidate_units"] = self.f.rows[0]["candidate_units"][:3]
+        self.unsupported()
+        self.refresh()
+        _, rows, _, counts = self.inventory()
+        self.assertEqual(3, rows[0]["exposed_candidate_count"])
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", rows[0]["exposure_status"])
+        self.assertEqual(0, counts["candidate_count_below_6_count"])
+        self.assertEqual(1, counts["exposed_candidate_contract_ineligible_case_count"])
+
+    def test_allowed_candidate_count_zero_five_six_and_twenty_four(self):
+        for index, count in enumerate((0, 5, 6, 24)):
+            row = self.f.rows[index]
+            row["candidate_units"] = source_row(row["dataset"], row["case_id"], count)["candidate_units"]
+        self.refresh()
+        _, rows, _, counts = self.inventory()
+        self.assertEqual([False, False, True, True], [row["eligible"] for row in rows[:4]])
+        self.assertEqual(2, counts["candidate_count_below_6_count"])
+        self.assertEqual(138, counts["candidate_count_valid_count"])
+        self.assertEqual(0, counts["exposed_candidate_contract_ineligible_case_count"])
+
+    def test_unsupported_only_beyond_authoritative_truncation_remains_eligible(self):
+        self.f.rows[0]["candidate_units"] = source_row(ident="synthetic-0000", count=27)["candidate_units"]
+        self.unsupported(position=24)
+        self.refresh()
+        _, rows, eligible, counts = self.inventory()
+        self.assertTrue(rows[0]["eligible"])
+        self.assertEqual(24, rows[0]["exposed_candidate_count"])
+        self.assertEqual(0, counts["exposed_unsupported_unit_count"])
+        self.assertEqual(tuple(tuple(u[k] for k in sc.CANDIDATE_FIELDS)
+                               for u in self.f.rows[0]["candidate_units"][:24]), eligible[0].candidates)
+
+    def test_unsupported_surviving_inside_truncation_invalidates_whole_case(self):
+        self.f.rows[0]["candidate_units"] = source_row(ident="synthetic-0000", count=27)["candidate_units"]
+        self.unsupported(position=23)
+        self.unsupported(position=24)
+        self.refresh()
+        _, rows, _, counts = self.inventory()
+        self.assertFalse(rows[0]["eligible"])
+        self.assertEqual(24, rows[0]["exposed_candidate_count"])
+        self.assertEqual(1, counts["exposed_unsupported_unit_count"])
+
+    def test_custom_reordering_to_hide_unsupported_unit_rejected(self):
+        self.f.rows[0]["candidate_units"] = source_row(ident="synthetic-0000", count=27)["candidate_units"]
+        self.unsupported()
+        row = self.f.rows[0]
+        class Reordered(FixtureAdapter):
+            def normalize(self, request):
+                result = super().normalize(request)
+                return replace(result, candidate_units=tuple(copy.deepcopy(request["candidate_units"][1:25])))
+        with self.assertRaisesRegex(sc.CohortError, "order drift"):
+            sl.expose(row, 0, Reordered(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def test_adapter_silent_unsupported_deletion_still_fails_closed(self):
+        self.unsupported()
+        class Dropped(FixtureAdapter):
+            def normalize(self, request):
+                result = super().normalize(request)
+                return replace(result, candidate_units=result.candidate_units[1:], source_candidate_count=5)
+        with self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            sl.expose(self.f.rows[0], 0, Dropped(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def test_adapter_type_coercion_still_fails_closed(self):
+        self.unsupported()
+        class Coerced(FixtureAdapter):
+            def normalize(self, request):
+                result = super().normalize(request)
+                result.candidate_units[0]["unit_type"] = "ocr"
+                return result
+        with self.assertRaisesRegex(sc.CohortError, "deletion/mutation/order"):
+            sl.expose(self.f.rows[0], 0, Coerced(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def test_nonzero_dropped_unsupported_count_still_fails_closed(self):
+        self.unsupported()
+        adapter = FixtureAdapter()
+        result = adapter.normalize(self.f.rows[0])
+        with patch.object(adapter, "normalize", return_value=replace(
+                result, candidate_units=result.candidate_units[1:], dropped_unsupported_count=1)), \
+                self.assertRaisesRegex(sc.CohortError, "accounting drift"):
+            sl.expose(self.f.rows[0], 0, adapter, self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def test_duplicate_exposed_id_remains_invalid_even_in_unsupported_case(self):
+        self.unsupported()
+        row = self.f.rows[0]
+        row["candidate_units"][1]["unit_id"] = row["candidate_units"][0]["unit_id"]
+        with self.assertRaisesRegex(sc.CohortError, "duplicate candidate"):
+            sl.expose(row, 0, FixtureAdapter(), self.protocol, sc.AUTHORITATIVE_TRAIN_SHA256)
+
+    def test_exact_upstream_adapter_keeps_strict_visual_policy_invocation(self):
+        self.unsupported()
+        self.refresh()
+        calls = []
+        def normalize_request(request, *, config, drop_unsupported_visual):
+            calls.append(drop_unsupported_visual)
+            return {"candidate_units": copy.deepcopy(request["candidate_units"][:24])}
+        adapter = sl.Phase4ANormalizationExposureAdapter(normalize_request, {"maximum_units_per_sample": 24})
+        self.assertEqual("config_keyword_with_strict_visual_policy", adapter._invocation)
+        _, rows, _, counts = self.inventory(adapter)
+        self.assertEqual([False] * 140, calls)
+        self.assertEqual("INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", rows[0]["exposure_status"])
+        self.assertEqual(0, counts["phase4a_exposure_failure_count"])
+
+    def test_exclusion_failure_contract_count_and_eligibility_categories_stay_distinct(self):
+        self.unsupported()
+        self.f.rows[2]["candidate_units"] = self.f.rows[2]["candidate_units"][:5]
+        future = self.f.future("r3-held", ["GroundLie360:synthetic-0003"])
+        self.f.inputs = replace(self.f.inputs, future_exclusion_manifests=(future,))
+        self.refresh()
+        class Failing(FixtureAdapter):
+            def normalize(self, request):
+                if request["dataset"] == "GroundLie360" and request["case_id"] == "synthetic-0001":
+                    raise ValueError("SYNTHETIC_EXPOSURE_FAILURE")
+                return super().normalize(request)
+        _, rows, eligible, counts = self.inventory(Failing())
+        self.assertEqual(["INELIGIBLE_EXPOSED_CANDIDATE_CONTRACT", "FAILED", "PASS", "SKIPPED_EXCLUDED"],
+                         [row["exposure_status"] for row in rows[:4]])
+        self.assertEqual(139, counts["phase4a_exposure_attempt_count"])
+        self.assertEqual(1, counts["phase4a_exposure_failure_count"])
+        self.assertEqual(1, counts["phase4a_exposure_skipped_excluded_count"])
+        self.assertEqual(1, counts["exposed_candidate_contract_ineligible_case_count"])
+        self.assertEqual(1, counts["candidate_count_below_6_count"])
+        self.assertEqual(136, counts["candidate_count_valid_count"])
+        self.assertEqual(136, len(eligible))
+        self.assertEqual(counts["phase4a_exposure_attempt_count"],
+                         counts["phase4a_exposure_failure_count"] +
+                         counts["exposed_candidate_contract_ineligible_case_count"] +
+                         counts["candidate_count_below_6_count"] + counts["candidate_count_valid_count"])
+
+    def test_ineligible_case_absent_from_all_build_and_review_artifacts(self):
+        self.unsupported()
+        row = self.f.rows[0]
+        row["claim"] = "R3_UNSUPPORTED_CASE_CONTENT"
+        for unit in row["candidate_units"]:
+            unit["text"] = "R3_UNSUPPORTED_CASE_CONTENT"
+        self.refresh()
+        original = {path: path.read_bytes() for path in (self.f.source, self.f.phase3, *self.f.old.iterdir())}
+        self.preflight()
+        report = self.build()
+        self.assertEqual(cb.PASS_STATUS, report["status"])
+        self.assertFalse(report["resampling_performed"])
+        self.assertEqual(1, report["exposed_candidate_contract_ineligible_case_count"])
+        canonical = "GroundLie360:synthetic-0000"
+        manifest = ar.read_json(self.f.build_dir / "repair_development_manifest.json")
+        requests = [json.loads(line) for line in (self.f.build_dir / "repair_development_requests.jsonl").read_text().splitlines()]
+        self.assertNotIn(canonical, {item["canonical_case_id"] for item in manifest["selected_cases"]})
+        self.assertNotIn(canonical, {item["canonical_case_id"] for item in requests})
+        mapping = ar.read_json(self.f.build_dir / "review_mapping_private.json")
+        for reviewer in ("A", "B"):
+            self.assertNotIn(canonical, {item["canonical_case_id"] for item in mapping["reviewer_" + reviewer]})
+            rows = list(csv.DictReader(io.StringIO((self.f.build_dir / f"reviewer_{reviewer}_template.csv").read_text())))
+            excluded_review_id = "case-" + blind.key(reviewer, "case-id", canonical)
+            self.assertNotIn(excluded_review_id, {item["review_case_id"] for item in rows})
+        for path in self.f.build_dir.iterdir():
+            if path.suffix != ".sha256":
+                self.assertNotIn("R3_UNSUPPORTED_CASE_CONTENT", path.read_text())
+        before = ar.read_json(self.f.preflight / "exclusion_source_lock.json")
+        self.assertEqual(before, ar.read_json(self.f.build_dir / "exclusion_lock.json"))
+        inventory = ar.read_json(self.f.build_dir / "eligibility_inventory.json")
+        for field in ("phase4a_exposure_attempt_count", "phase4a_exposure_failure_count",
+                      "exposed_candidate_contract_ineligible_case_count",
+                      "exposed_candidate_contract_ineligible_dataset_counts", "exposed_unsupported_unit_count",
+                      "exposed_unsupported_pair_counts", "candidate_count_below_6_count",
+                      "candidate_count_valid_count", "eligible_unexcluded_counts"):
+            self.assertEqual(report[field], inventory[field])
+        for path, data in original.items():
+            self.assertEqual(data, path.read_bytes())
+
+    def test_initial_sampling_ranks_only_eligible_cases_with_frozen_hashes(self):
+        dataset = "GroundLie360"
+        ranked = sorted(range(70), key=lambda i: cb.identity_hash(
+            self.protocol, "repair-development", dataset, f"{dataset}:synthetic-{i:04d}"))
+        self.unsupported(row=ranked[0])
+        self.refresh()
+        exclusions, _, eligible, _ = self.inventory()
+        selected = cb.select(eligible, exclusions, self.protocol)
+        expected = {f"{dataset}:synthetic-{i:04d}" for i in ranked[1:61]}
+        actual = {item.case.canonical_case_id for item in selected if item.case.dataset == dataset}
+        self.assertEqual(expected, actual)
+        self.assertEqual(Counter({"repair_train": 96, "repair_dev": 24}), Counter(item.repair_split for item in selected))
+
+    def assert_contract_feasibility_block(self, dataset):
+        indices = [i for i, row in enumerate(self.f.rows) if row["dataset"] == dataset]
+        for index in indices[:11]:
+            self.unsupported(row=index)
+        self.refresh()
+        self.preflight()
+        report = self.build()
+        self.assertEqual(cb.BLOCKED_STATUS, report["status"])
+        self.assertEqual(59, report["eligible_unexcluded_counts"][dataset])
+        self.assertEqual(11, report["exposed_candidate_contract_ineligible_case_count"])
+        self.assertEqual(0, report["phase4a_exposure_failure_count"])
+        self.assertEqual(0, report["candidate_count_below_6_count"])
+        self.assertFalse(report["resampling_performed"])
+        self.assertFalse(report["selector_scientific_result_produced"])
+        self.assertEqual(0, report["selected_case_count"])
+        self.assertEqual({"development_cohort_source_lock.json", "exclusion_lock.json",
+                          "eligibility_inventory.json", "development_cohort_build_report.json"},
+                         {path.name for path in self.f.build_dir.iterdir() if path.suffix != ".sha256"})
+        for path in self.f.build_dir.iterdir():
+            if path.suffix != ".sha256":
+                self.assertEqual(ar.sha_file(path), ar.sidecar(path).read_text().strip())
+
+    def test_groundlie_contract_ineligibility_leaves_59_and_freezes_blocked(self):
+        self.assert_contract_feasibility_block("GroundLie360")
+
+    def test_true3m_contract_ineligibility_leaves_59_and_freezes_blocked(self):
+        self.assert_contract_feasibility_block("TRUE-3MFact")
 
 
 if __name__ == "__main__":
